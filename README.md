@@ -197,11 +197,3 @@ uv run python -m longline.eval --type e2e --case-file evals/e2e.jsonl --model de
 ```bash
 uv run pytest tests/unit/eval/ -v
 ```
-
-## 交流
-
-对 CC 源码还原或 Agent Runtime 感兴趣可以扫二维码，进 CC 讨论群：
-
-<img src="assets/wechat.png" width="300">
-
-# end
