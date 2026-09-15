@@ -6,25 +6,48 @@ Usage examples:
 
     # only e2e, cheap model, quick smoke (first 3 cases)
     uv run python -m longline.eval --type e2e --model claude-haiku-4-5-20251001 --max-cases 3
+
+    # formal run: named suite, 3 repeats, results under evals/results/<run_id>/
+    uv run python -m longline.eval --suite e2e --repeats 3 --run-id 2026-09-15_smoke
+
+All legacy flags (`--type`, `--model`, `--case-file`, `--fixtures-dir`,
+`--max-cases`, `--out-dir`, `--md`) keep their exact previous behaviour.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import platform
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from longline.eval.report import aggregate, render_markdown
-from longline.eval.runner import run_suite
+from longline.eval.report import aggregate, paired_report_delta, render_markdown
+from longline.eval.runner import CaseResult, run_suite
 from longline.eval.types import E2ECase, EvalCase, ToolCallCase, load_cases
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Filenames inside `evals/results/<run_id>/` (evals/README.md §3).
+RAW_NAME = "raw.jsonl"
+SUMMARY_NAME = "summary.json"
+REPORT_NAME = "report.md"
+
+# `--suite` presets: suite -> (case file, layer filter).
+SUITES: dict[str, tuple[str, str]] = {
+    "tool_calls": ("tool_calls.jsonl", "tool_call"),
+    "e2e": ("e2e.jsonl", "e2e"),
+    "all": ("tool_calls.jsonl", "all"),
+}
 
 
 def _load_env_file() -> dict[str, str]:
@@ -79,6 +102,13 @@ def _apply_base_url() -> None:
     os.environ["ANTHROPIC_BASE_URL"] = base
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {parsed}")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="python -m longline.eval", description="Run the agent evaluation suite.")
     p.add_argument("--type", choices=["tool_call", "e2e", "all"], default="all")
@@ -89,7 +119,71 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-cases", type=int, default=None, help="Cap the number of cases (smoke mode).")
     p.add_argument("--out-dir", default=str(PROJECT_ROOT / "evals" / "results"))
     p.add_argument("--md", action="store_true", help="Also write a .md report alongside the .json.")
+    # --- Task 1 additions ---
+    p.add_argument(
+        "--suite", choices=sorted(SUITES), default=None,
+        help="Named suite preset; selects the case file and layer. "
+             "An explicit --case-file/--type still wins.",
+    )
+    p.add_argument(
+        "--variant", default=None,
+        help="Variant label recorded on every result (baseline/candidate, "
+             "compression_off/compression_on, ...).",
+    )
+    p.add_argument(
+        "--repeats", type=_positive_int, default=1,
+        help="Run the selected cases N times, recording repeat_index. "
+             "All runs are kept in raw.jsonl; none is averaged away.",
+    )
+    p.add_argument(
+        "--run-id", default=None,
+        help=f"Write to <out-dir>/<run-id>/{{{RAW_NAME},{SUMMARY_NAME},{REPORT_NAME}}}. "
+             "When omitted, the legacy flat <model>-<n>.json output is used.",
+    )
+    p.add_argument(
+        "--keep-sandbox-on-failure", action="store_true",
+        help="Leave a failed case's temp sandbox on disk and record its path. "
+             "Successful cases are always cleaned up.",
+    )
+    p.add_argument(
+        "--tag", default=None,
+        help="Only run cases carrying this tag.",
+    )
     return p.parse_args(argv)
+
+
+_ORIGINAL_ARGV: list[str] | None = None
+
+
+def _explicit(name: str, argv: Sequence[str] | None) -> bool:
+    """True if `--<name>` appears in argv (used to detect explicit flags).
+
+    `parse_args(None)` reads the real `sys.argv`, so when no argv is passed the
+    process argv is consulted. That is what lets `main()` call
+    `parse_args(None)` and still know which flags the user actually typed.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    return any(a == f"--{name}" or a.startswith(f"--{name}=") for a in argv)
+
+
+def _apply_suite(args: argparse.Namespace, argv: Sequence[str] | None = None) -> None:
+    """Resolve `--suite` into --case-file/--type without overriding explicit flags.
+
+    Compatibility rule: an explicit `--case-file` or `--type` always wins, so
+    the legacy invocations are byte-for-byte unaffected.
+
+    Note: when `parse_args` was called with an explicit argv, that same argv
+    must be threaded through here — otherwise the explicit-flag check would
+    consult the real process argv and get the wrong answer.
+    """
+    if args.suite is None:
+        return
+    case_file, type_filter = SUITES[args.suite]
+    if not _explicit("case-file", argv):
+        args.case_file = str(PROJECT_ROOT / "evals" / case_file)
+    if not _explicit("type", argv):
+        args.type = type_filter
 
 
 def split_cases(cases: list[EvalCase]) -> tuple[list[ToolCallCase], list[E2ECase]]:
@@ -106,8 +200,137 @@ def _select_cases(cases: list[EvalCase], type_filter: str) -> list[EvalCase]:
     return [c for c in cases if isinstance(c, wanted)]
 
 
-async def _run(argv: Sequence[str] | None = None) -> None:
+def _select_by_tag(cases: list[EvalCase], tag: str | None) -> list[EvalCase]:
+    """Filter cases by tag; no tag means no filtering."""
+    if tag is None:
+        return cases
+    return [c for c in cases if tag in c.tags]
+
+
+def make_run_id(model: str, suite: str) -> str:
+    """Build a default run id: `<model>_<suite>_<timestamp>-<pid>`.
+
+    No '/' or ':' so it is a safe single directory name on Windows and POSIX.
+    The pid keeps two runs started in the same second from colliding, and
+    microseconds keep it unique within a process.
+    """
+    now = time.time()
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
+    micros = int((now % 1) * 1_000_000)
+    safe_model = model.replace("/", "__").replace(" ", "-")
+    return f"{safe_model}_{suite}_{stamp}{micros:06d}_{os.getpid()}"
+
+
+def _git_sha() -> str | None:
+    """Current commit, or None outside a git checkout."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha or None
+
+
+def _sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_metadata(
+    *,
+    run_id: str,
+    suite: str,
+    variant: str | None,
+    model: str,
+    case_file: Path,
+    repeat_index: int,
+    repeats_completed: int,
+) -> dict[str, object]:
+    """The per-run metadata block required by evals/README.md §2.1."""
+    return {
+        "run_id": run_id,
+        "suite": suite,
+        "variant": variant,
+        "model": model,
+        "git_sha": _git_sha(),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "case_file_sha256": _sha256(case_file),
+        "repeat_index": repeat_index,
+        "repeats_completed": repeats_completed,
+    }
+
+
+def _write_jsonl(path: Path, results: list[CaseResult]) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        for r in results:
+            fh.write(json.dumps(r.to_raw_dict(), ensure_ascii=False) + "\n")
+
+
+def _write_run_dir(
+    *,
+    run_dir: Path,
+    results: list[CaseResult],
+    metadata: dict[str, object],
+    baseline_results: list[CaseResult] | None = None,
+    baseline_label: str | None = None,
+) -> None:
+    """Write raw.jsonl / summary.json / report.md for one run."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(run_dir / RAW_NAME, results)
+
+    report = aggregate(results, variant=metadata.get("variant"))  # type: ignore[arg-type]
+    summary: dict[str, object] = {
+        "metadata": metadata,
+        "metrics": report.to_dict(),
+    }
+    if baseline_results is not None:
+        summary["paired_vs_baseline"] = paired_report_delta(baseline_results, results)
+
+    (run_dir / SUMMARY_NAME).write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    baseline_report = aggregate(baseline_results) if baseline_results is not None else None
+    (run_dir / REPORT_NAME).write_text(
+        render_markdown(report, baseline=baseline_report, baseline_label=baseline_label),
+        encoding="utf-8",
+    )
+
+
+def _load_jsonl_results(path: Path) -> list[CaseResult]:
+    """Re-hydrate CaseResults from a raw.jsonl produced by a previous run."""
+    out: list[CaseResult] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        d = json.loads(line)
+        out.append(CaseResult(
+            case_id=str(d["case_id"]),
+            case_type=str(d["case_type"]),
+            passed=bool(d["passed"]),
+            turns=int(d.get("num_rounds", 0)),
+            input_tokens=int(d.get("input_tokens", 0)),
+            output_tokens=int(d.get("output_tokens", 0)),
+            errors=[str(e) for e in d.get("errors", [])],
+            tags=[str(t) for t in d.get("tags", [])],
+            duration_ms=d.get("duration_ms"),
+            variant=d.get("variant"),
+            repeat_index=int(d.get("repeat_index", 0)),
+            error_type=d.get("error_type"),
+        ))
+    return out
+
+
+async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    _apply_suite(args, argv)
     _apply_base_url()  # adopt OpenCode gateway if configured (no native key)
     api_key = _load_api_key()
     case_file = Path(args.case_file)
@@ -122,22 +345,62 @@ async def _run(argv: Sequence[str] | None = None) -> None:
         cases = _select_cases(cases, "tool_call")
     elif args.type == "e2e":
         cases = _select_cases(cases, "e2e")
+    cases = _select_by_tag(cases, args.tag)
     if args.max_cases is not None:
         cases = cases[: args.max_cases]
     if not cases:
-        raise SystemExit("no cases selected — check --type / --case-file")
+        raise SystemExit("no cases selected — check --type / --case-file / --tag")
 
-    results = await run_suite(cases, model=args.model, api_key=api_key, fixtures_dir=fixtures)
-    report = aggregate(results)
+    run_id: str = args.run_id or make_run_id(args.model, args.suite or args.type)
+    suite = args.suite or args.type
 
+    all_results: list[CaseResult] = []
+    for repeat_index in range(args.repeats):
+        all_results.extend(await run_suite(
+            cases,
+            model=args.model,
+            api_key=api_key,
+            fixtures_dir=fixtures,
+            variant=args.variant,
+            repeat_index=repeat_index,
+            run_id=run_id,
+            keep_sandbox_on_failure=args.keep_sandbox_on_failure,
+        ))
+
+    report = aggregate(all_results, variant=args.variant)
     verb = "Tool accuracy" if report.l1_tool_accuracy is not None else "E2E pass@1"
     value = report.l1_tool_accuracy if report.l1_tool_accuracy is not None else report.l2_pass1
     if value is not None:
-        print(f"[eval] {len(results)} cases | {verb}: {value * 100:.1f}%")
+        ratio = report.l1_ratio if report.l1_tool_accuracy is not None else report.l2_ratio
+        print(f"[eval] {len(all_results)} case-runs | {verb}: "
+              f"{value * 100:.1f}% ({ratio.numerator}/{ratio.denominator})")
     else:
-        print(f"[eval] {len(results)} cases")
+        print(f"[eval] {len(all_results)} case-runs")
 
-    stem = f"{args.model.replace('/', '__')}-{len(results)}"
+    metadata = run_metadata(
+        run_id=run_id, suite=suite, variant=args.variant, model=args.model,
+        case_file=case_file, repeat_index=args.repeats - 1, repeats_completed=args.repeats,
+    )
+
+    if args.run_id is not None:
+        # Explicit run id -> the contract layout evals/results/<run_id>/.
+        run_dir = out_dir / run_id
+        baseline_file = out_dir / "baseline" / RAW_NAME
+        baseline_results = (
+            _load_jsonl_results(baseline_file) if baseline_file.is_file() else None
+        )
+        _write_run_dir(
+            run_dir=run_dir, results=all_results, metadata=metadata,
+            baseline_results=baseline_results, baseline_label="baseline",
+        )
+        print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+        print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+        print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+        return 0
+
+    # Legacy path: unchanged flat output. Not a durable data source; use
+    # --run-id for anything a report or baseline will cite.
+    stem = f"{args.model.replace('/', '__')}-{len(all_results)}"
     json_path = out_dir / f"{stem}.json"
     json_path.write_text(json.dumps({
         "model": args.model,
@@ -153,11 +416,13 @@ async def _run(argv: Sequence[str] | None = None) -> None:
         md_path = out_dir / f"{stem}.md"
         md_path.write_text(render_markdown(report), encoding="utf-8")
         print(f"[eval] markdown -> {md_path}")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    asyncio.run(_run(argv))
+    raise SystemExit(asyncio.run(_run(argv)))
 
 
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "RAW_NAME", "REPORT_NAME", "SUITES", "SUMMARY_NAME", "main", "parse_args", "split_cases",
+]
