@@ -308,6 +308,16 @@ def paired_report_delta(
     Cases are matched by (case_id, repeat_index) and both runs must cover the
     same set; a mismatch raises rather than silently dropping cases, because a
     silently-shrunk denominator is a wrong number that looks right.
+
+    Unmeasured values are handled by **exclusion, not coercion**. A
+    `duration_ms` of None means "not measured" — substituting 0.0 would drag
+    the paired mean toward zero while looking like a real observation, which is
+    the exact failure mode `Ratio.value` and `percentile` are built to avoid. A
+    pair is dropped only when one of its two durations is missing; the dropped
+    count is reported as `n_pairs_duration_excluded` so the denominator
+    difference is visible rather than implied.
+
+    `turns` needs no such handling: it is a plain int that is always known.
     """
     def _index(results: list[CaseResult]) -> dict[tuple[str, int], CaseResult]:
         return {(r.case_id, r.repeat_index): r for r in results}
@@ -321,11 +331,16 @@ def paired_report_delta(
             f"paired runs are not aligned: only in baseline={only_b}, only in candidate={only_c}"
         )
     keys = sorted(b_idx)
+
+    timed = [
+        k for k in keys
+        if b_idx[k].duration_ms is not None and c_idx[k].duration_ms is not None
+    ]
     durations = paired_delta(
-        [b_idx[k].duration_ms or 0.0 for k in keys],
-        [c_idx[k].duration_ms or 0.0 for k in keys],
-        baseline_ids=[k[0] for k in keys],
-        candidate_ids=[k[0] for k in keys],
+        [b_idx[k].duration_ms for k in timed],  # type: ignore[misc]
+        [c_idx[k].duration_ms for k in timed],  # type: ignore[misc]
+        baseline_ids=[k[0] for k in timed],
+        candidate_ids=[k[0] for k in timed],
     )
     turns = paired_delta(
         [float(b_idx[k].turns) for k in keys],
@@ -333,6 +348,8 @@ def paired_report_delta(
     )
     return {
         "n_pairs": len(keys),
+        "n_pairs_duration": len(timed),
+        "n_pairs_duration_excluded": len(keys) - len(timed),
         "duration_ms": durations.to_dict(),
         "turns": turns.to_dict(),
     }

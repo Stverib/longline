@@ -272,3 +272,70 @@ def test_paired_delta_on_aligned_runs() -> None:
     out = paired_report_delta(baseline, candidate)
     assert out["n_pairs"] == 2
     assert out["duration_ms"]["per_case"][0]["case_id"] == "e2e-001"
+
+
+def test_paired_delta_excludes_unmeasured_duration_not_zero() -> None:
+    """A None duration means "not measured" and must NOT be counted as 0.0.
+
+    Coercing it to zero would drag the paired mean toward zero while looking
+    like a real observation.
+    """
+    from longline.eval.report import paired_report_delta
+
+    baseline = _fake_results()   # durations 12.5 and 30.0
+    candidate = _fake_results()
+    baseline[1].duration_ms = None  # case e2e-002 was never timed
+
+    out = paired_report_delta(baseline, candidate)
+    assert out["n_pairs"] == 2
+    assert out["n_pairs_duration"] == 1
+    assert out["n_pairs_duration_excluded"] == 1
+    # Only the timed pair survives, and its delta is the real one.
+    assert out["duration_ms"]["per_case"] == [{"case_id": "e2e-001", "delta": 0.0}]
+    assert out["duration_ms"]["n_pairs"] == 1
+
+
+def test_paired_delta_unmeasured_duration_does_not_bias_the_mean() -> None:
+    """The excluded pair must not pull the mean toward zero."""
+    from longline.eval.report import paired_report_delta
+
+    baseline = _fake_results()
+    candidate = _fake_results()
+    # candidate case 0 is 100ms slower; case 1 was never timed on either side
+    candidate[0].duration_ms = 112.5
+    baseline[1].duration_ms = None
+    candidate[1].duration_ms = None
+
+    out = paired_report_delta(baseline, candidate)
+    # With the None coerced to 0.0 the mean would be (100.0 + 0.0) / 2 = 50.0.
+    assert out["duration_ms"]["mean"] == pytest.approx(100.0)
+    assert out["n_pairs_duration_excluded"] == 1
+
+
+def test_paired_delta_all_durations_unmeasured_is_not_zero() -> None:
+    """If nothing was timed, the duration delta is unmeasured — not 0.0."""
+    from longline.eval.report import paired_report_delta
+
+    baseline = _fake_results()
+    candidate = _fake_results()
+    for r in [*baseline, *candidate]:
+        r.duration_ms = None
+
+    out = paired_report_delta(baseline, candidate)
+    assert out["n_pairs_duration"] == 0
+    assert out["n_pairs_duration_excluded"] == 2
+    assert out["duration_ms"]["mean"] is None
+    assert out["duration_ms"]["per_case"] == []
+
+
+def test_paired_delta_turns_unaffected_by_missing_duration() -> None:
+    """`turns` is always known, so it is never excluded."""
+    from longline.eval.report import paired_report_delta
+
+    baseline = _fake_results()
+    candidate = _fake_results()
+    for r in [*baseline, *candidate]:
+        r.duration_ms = None
+
+    out = paired_report_delta(baseline, candidate)
+    assert out["turns"]["n_pairs"] == 2
