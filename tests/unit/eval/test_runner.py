@@ -26,7 +26,7 @@ class FakeTool:
 def _fake_engine_factory(events: list[Any], *, raises: BaseException | None = None) -> Any:
     """Bootstrap a fake build_engine replacement via monkeypatch."""
 
-    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _build_engine(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         registry = SimpleNamespace(list_tools=lambda: [FakeTool()])
         system = "test"
 
@@ -75,7 +75,12 @@ async def test_run_tool_call_case_fails_on_missing_tool(monkeypatch: pytest.Monk
     case = ToolCallCase(id="tc-002", task="grep then read", expect_tools=["Read"])
     result = await run_case(case, model="m", api_key="k", fixtures_dir=Path("does-not-exist"))
     assert result.passed is False
-    assert result.detail["tool_subsequence_ok"] is False
+    # 逐步骤结果单独可查,而不是塌缩成一个布尔(契约 §5.2).
+    assert result.detail["steps"]["all_steps_matched"] is False  # type: ignore[index]
+    assert result.steps_completed is False
+    # 那次 Grep 谁也没匹配上,计为额外调用 —— precision 的分母要看到它.
+    assert result.num_extra_tool_calls == 1
+    assert result.num_matched_tool_calls == 0
 
 
 async def test_run_e2e_case_copies_fixture_and_judges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,7 +265,7 @@ async def test_build_engine_failure_propagates(monkeypatch: pytest.MonkeyPatch) 
     """
     import longline.eval.runner as mod
 
-    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _boom(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         raise RuntimeError("no harness")
 
     monkeypatch.setattr(mod, "build_engine", _boom)
@@ -277,7 +282,7 @@ async def test_build_engine_failure_leaves_no_sandbox_behind(
 
     created: list[str] = []
 
-    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _boom(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         created.append(sandbox)
         raise RuntimeError("no harness")
 
@@ -307,7 +312,7 @@ async def test_suite_continues_after_a_midrun_failure(monkeypatch: pytest.Monkey
 
     calls = {"n": 0}
 
-    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _build_engine(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         calls["n"] += 1
         fail = calls["n"] == 2
 
@@ -336,7 +341,7 @@ async def test_suite_aborts_on_infra_failure(monkeypatch: pytest.MonkeyPatch) ->
     """An infra fault aborts the whole suite rather than degrading the rate."""
     import longline.eval.runner as mod
 
-    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _boom(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         raise RuntimeError("no harness")
 
     monkeypatch.setattr(mod, "build_engine", _boom)
@@ -357,7 +362,7 @@ async def test_keyboard_interrupt_propagates_not_recorded(monkeypatch: pytest.Mo
     """
     import longline.eval.runner as mod
 
-    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _build_engine(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         class _FakeEngine:
             async def submit(self, user_input: str, **kwargs: Any) -> Any:
                 raise KeyboardInterrupt
@@ -380,7 +385,7 @@ async def test_cancelled_error_propagates_not_recorded(monkeypatch: pytest.Monke
 
     import longline.eval.runner as mod
 
-    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _build_engine(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         class _FakeEngine:
             async def submit(self, user_input: str, **kwargs: Any) -> Any:
                 raise asyncio.CancelledError
@@ -403,7 +408,7 @@ async def test_cancellation_still_cleans_sandbox(monkeypatch: pytest.MonkeyPatch
 
     seen: list[str] = []
 
-    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+    def _build_engine(*, sandbox: str, model: str, api_key: str, tool_profile: str = "core") -> Any:
         seen.append(sandbox)
 
         class _FakeEngine:

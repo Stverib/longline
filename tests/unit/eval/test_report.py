@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from longline.eval.metrics import Ratio
 from longline.eval.report import aggregate, render_markdown
 from longline.eval.runner import CaseResult
 from longline.eval.trajectory import ToolExecution
@@ -176,3 +177,83 @@ def test_render_markdown_renders_pp_delta_not_percent() -> None:
 def test_render_markdown_no_baseline_no_pp_line() -> None:
     md = render_markdown(aggregate([_res("a", "e2e", True)]))
     assert "pp" not in md
+
+
+# --- Task 2: four tool-calling metrics in summary.json / report.md ---
+
+
+def _tool_res(
+    cid: str,
+    *,
+    tags: list[str] | None = None,
+    calls: int = 1,
+    extra: int = 0,
+    steps_ok: bool = True,
+    arg_calls: tuple[int, int] = (0, 0),
+    arg_fields: tuple[int, int] = (0, 0),
+) -> CaseResult:
+    """A tool_call CaseResult carrying the Task 2 detail counters."""
+    return CaseResult(
+        case_id=cid,
+        case_type="tool_call",
+        passed=steps_ok and arg_calls[0] == arg_calls[1],
+        tags=list(tags if tags is not None else ["blind"]),
+        tool_calls=[("Read", {}) for _ in range(calls)],
+        detail={
+            "steps": {"all_steps_matched": steps_ok, "num_extra_calls": extra},
+            "args": {
+                "correct_calls": arg_calls[0], "checked_calls": arg_calls[1],
+                "correct_fields": arg_fields[0], "checked_fields": arg_fields[1],
+            },
+        },
+    )
+
+
+class TestFourMetricsInReport:
+    def test_blind_cases_only_in_selection_denominator(self) -> None:
+        rep = aggregate([
+            _tool_res("b1", tags=["blind"], steps_ok=True),
+            _tool_res("b2", tags=["blind"], steps_ok=False),
+            _tool_res("i1", tags=["instruction-following"], steps_ok=True),
+        ])
+        assert rep.tool_selection_case_accuracy == Ratio(1, 2)
+        # instruction-following 单独展示,不混进主数字
+        assert rep.instruction_following_case_accuracy == Ratio(1, 1)
+
+    def test_precision_counts_extra_calls_in_denominator(self) -> None:
+        rep = aggregate([_tool_res("b1", calls=4, extra=1)])
+        assert rep.tool_call_precision == Ratio(3, 4)
+
+    def test_argument_metrics_are_separate(self) -> None:
+        rep = aggregate([_tool_res("b1", arg_calls=(2, 3), arg_fields=(5, 9))])
+        assert rep.argument_call_accuracy == Ratio(2, 3)
+        assert rep.argument_field_accuracy == Ratio(5, 9)
+
+    def test_summary_dict_has_all_four_with_denominators(self) -> None:
+        rep = aggregate([_tool_res("b1", calls=2, extra=1, arg_calls=(1, 1), arg_fields=(2, 3))])
+        d = rep.to_dict()
+        tc = d["tool_calling"]
+        assert set(tc) >= {  # type: ignore[arg-type]
+            "tool_selection_case_accuracy", "tool_call_precision",
+            "argument_call_accuracy", "argument_field_accuracy",
+            "execution_success_rate", "instruction_following_case_accuracy",
+        }
+        for key in ("tool_selection_case_accuracy", "tool_call_precision",
+                    "argument_call_accuracy", "argument_field_accuracy"):
+            block = tc[key]  # type: ignore[index]
+            assert {"numerator", "denominator", "value", "ci95_wilson"} <= set(block)
+
+    def test_markdown_renders_all_four_rows(self) -> None:
+        rep = aggregate([_tool_res("b1", calls=2, extra=1, arg_calls=(1, 1), arg_fields=(2, 3))])
+        md = render_markdown(rep)
+        for label in ("ToolSelectionCaseAccuracy", "ToolCallPrecision",
+                      "ArgumentCallAccuracy", "ArgumentFieldAccuracy",
+                      "ExecutionSuccessRate", "InstructionFollowingCaseAccuracy"):
+            assert label in md
+        assert "(1/2)" in md  # selection
+        assert "(1/2)" in md  # precision — same fraction, different denominator source
+
+    def test_markdown_omits_section_when_no_tool_cases(self) -> None:
+        rep = aggregate([_res("e", "e2e", True)])
+        md = render_markdown(rep)
+        assert "ToolSelectionCaseAccuracy" not in md

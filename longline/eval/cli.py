@@ -43,11 +43,23 @@ SUMMARY_NAME = "summary.json"
 REPORT_NAME = "report.md"
 
 # `--suite` presets: suite -> (case file, layer filter).
+#
+# `tool_selection` is the Task 2 suite: 48 blind + 12 instruction-following
+# cases whose main number is ToolSelectionCaseAccuracy over the blind half.
+# `tool_calls` stays pointed at the retired legacy file so old invocations keep
+# reproducing their old case set exactly.
 SUITES: dict[str, tuple[str, str]] = {
     "tool_calls": ("tool_calls.jsonl", "tool_call"),
+    "tool_selection": ("tool_selection.jsonl", "tool_call"),
     "e2e": ("e2e.jsonl", "e2e"),
     "all": ("tool_calls.jsonl", "all"),
 }
+
+# Case tags that partition the tool-selection suite. `--blind` / `--instruction`
+# are sugar over `--tag`, kept as flags because the two halves must never be
+# silently merged into one reported number.
+BLIND_TAG = "blind"
+INSTRUCTION_FOLLOWING_TAG = "instruction-following"
 
 
 def _load_env_file() -> dict[str, str]:
@@ -149,6 +161,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--tag", default=None,
         help="Only run cases carrying this tag.",
     )
+    # --- Task 2 additions ---
+    p.add_argument(
+        "--tool-profile", default="core",
+        help="Which tool families the eval registry offers: core (default), "
+             "web, notebook, task, or all. Web tools are offline stand-ins "
+             "whose schema matches production, so tool selection is measured "
+             "without network flakiness (evals/README.md §5.2).",
+    )
+    p.add_argument(
+        "--tool-profile-by-tag", action="store_true",
+        help="Pick the tool profile per case from its family tag "
+             "(read/write/edit/glob-grep/bash/web/notebook/task/multi). "
+             "Overrides --tool-profile for those cases.",
+    )
+    p.add_argument(
+        "--blind-only", action="store_true",
+        help="Run only cases tagged 'blind' — the ones that feed the "
+             "resume-facing ToolSelectionCaseAccuracy.",
+    )
+    p.add_argument(
+        "--instruction-only", action="store_true",
+        help="Run only cases tagged 'instruction-following'. Reported "
+             "separately and never mixed into the blind number.",
+    )
     return p.parse_args(argv)
 
 
@@ -205,6 +241,31 @@ def _select_by_tag(cases: list[EvalCase], tag: str | None) -> list[EvalCase]:
     if tag is None:
         return cases
     return [c for c in cases if tag in c.tags]
+
+
+# Family tag -> the tool profile that must be registered for the case to be
+# answerable at all. A case tagged `web` run against the core registry could
+# never pass, and its failure would look like a model error.
+_PROFILE_BY_TAG: dict[str, str] = {
+    "read": "core", "write": "core", "edit": "core",
+    "glob": "core", "grep": "core", "bash": "core",
+    "web": "web", "notebook": "notebook", "task": "task",
+    "multi": "all",
+}
+
+
+def profile_for_case(case: EvalCase, default: str) -> str:
+    """The tool profile a single case needs, or `default` when unspecified.
+
+    When several family tags are present the most capable profile wins, because
+    a multi-tool case needs every family it touches to be available at once.
+    """
+    wanted = [_PROFILE_BY_TAG[t] for t in case.tags if t in _PROFILE_BY_TAG]
+    if not wanted:
+        return default
+    if "all" in wanted:
+        return "all"
+    return wanted[0]
 
 
 def make_run_id(model: str, suite: str) -> str:
@@ -328,6 +389,43 @@ def _load_jsonl_results(path: Path) -> list[CaseResult]:
     return out
 
 
+def _fmt_ratio(ratio: object) -> str:
+    """`66.7% (2/3)`, or `not measured (0/0)` — a rate needs its denominator."""
+    num = getattr(ratio, "numerator", 0)
+    den = getattr(ratio, "denominator", 0)
+    value = getattr(ratio, "value", None)
+    if value is None:
+        return f"not measured ({num}/{den})"
+    return f"{value * 100:.1f}% ({num}/{den})"
+
+
+def _print_run_summary(report: object, num_case_runs: int) -> None:
+    """Print the headline numbers, one line per metric.
+
+    The four tool-calling metrics are printed on their own lines with their own
+    fractions. Collapsing them into a single "tool accuracy" line is what made
+    the legacy number impossible to audit, so the console output refuses to do
+    it either.
+    """
+    l1 = report.l1_ratio  # type: ignore[attr-defined]
+    l2 = report.l2_ratio  # type: ignore[attr-defined]
+    sel = report.tool_selection_case_accuracy  # type: ignore[attr-defined]
+    if sel.denominator:
+        print(f"[eval] {num_case_runs} case-runs")
+        print(f"[eval]   ToolSelectionCaseAccuracy (blind) : {_fmt_ratio(sel)}")
+        print(f"[eval]   ToolCallPrecision                 : {_fmt_ratio(report.tool_call_precision)}")  # type: ignore[attr-defined]
+        print(f"[eval]   ArgumentCallAccuracy              : {_fmt_ratio(report.argument_call_accuracy)}")  # type: ignore[attr-defined]
+        print(f"[eval]   ArgumentFieldAccuracy             : {_fmt_ratio(report.argument_field_accuracy)}")  # type: ignore[attr-defined]
+        print(f"[eval]   ExecutionSuccessRate              : {_fmt_ratio(report.tool_execution_rate)}")  # type: ignore[attr-defined]
+        instr = report.instruction_following_case_accuracy  # type: ignore[attr-defined]
+        if instr.denominator:
+            print(f"[eval]   InstructionFollowing (separate)   : {_fmt_ratio(instr)}")
+    elif l2.value is not None:
+        print(f"[eval] {num_case_runs} case-runs | E2E pass@1: {_fmt_ratio(l2)}")
+    else:
+        print(f"[eval] {num_case_runs} case-runs | Tool accuracy: {_fmt_ratio(l1)}")
+
+
 async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args, argv)
@@ -346,6 +444,10 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     elif args.type == "e2e":
         cases = _select_cases(cases, "e2e")
     cases = _select_by_tag(cases, args.tag)
+    if args.blind_only:
+        cases = _select_by_tag(cases, BLIND_TAG)
+    if args.instruction_only:
+        cases = _select_by_tag(cases, INSTRUCTION_FOLLOWING_TAG)
     if args.max_cases is not None:
         cases = cases[: args.max_cases]
     if not cases:
@@ -365,17 +467,15 @@ async def _run(argv: Sequence[str] | None = None) -> int:
             repeat_index=repeat_index,
             run_id=run_id,
             keep_sandbox_on_failure=args.keep_sandbox_on_failure,
+            tool_profile=args.tool_profile,
+            profile_for_case=(
+                (lambda case: profile_for_case(case, args.tool_profile))
+                if args.tool_profile_by_tag else None
+            ),
         ))
 
     report = aggregate(all_results, variant=args.variant)
-    verb = "Tool accuracy" if report.l1_tool_accuracy is not None else "E2E pass@1"
-    value = report.l1_tool_accuracy if report.l1_tool_accuracy is not None else report.l2_pass1
-    if value is not None:
-        ratio = report.l1_ratio if report.l1_tool_accuracy is not None else report.l2_ratio
-        print(f"[eval] {len(all_results)} case-runs | {verb}: "
-              f"{value * 100:.1f}% ({ratio.numerator}/{ratio.denominator})")
-    else:
-        print(f"[eval] {len(all_results)} case-runs")
+    _print_run_summary(report, len(all_results))
 
     metadata = run_metadata(
         run_id=run_id, suite=suite, variant=args.variant, model=args.model,

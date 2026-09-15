@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from longline.eval.engine_factory import build_engine
-from longline.eval.judges import check_args, check_tools, judge_case
+from longline.eval.judges import judge_case, judge_case_args, judge_steps
 from longline.eval.metrics import Ratio
 from longline.eval.trajectory import ToolCall, ToolExecution, extract_trajectory, infer_error_type
 from longline.eval.types import EvalCase, ToolCallCase
@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
     from longline.eval.trajectory import Trajectory
+
+# Resolves a per-case tool profile; `None` means "use the suite-level default".
+ProfileForCase = "Callable[[EvalCase], str]"
 
 
 @dataclass
@@ -87,6 +90,69 @@ class CaseResult:
         """ExecutionSuccessRate: is_error=false executions / executions."""
         return Ratio(self.num_successful_tool_calls, self.num_tool_calls_executed)
 
+    # --- Task 2: the four tool-calling metrics, denominator by denominator ---
+    #
+    # Each of these reads its counters out of `detail` and owns its own
+    # numerator and denominator. `to_raw_dict()` writes the same counters to
+    # raw.jsonl, so an aggregate can be recomputed without this object — which
+    # is the contract's definition of a valid number (`evals/README.md` §3).
+
+    def _detail_section(self, section: str) -> dict[str, object]:
+        value = self.detail.get(section)
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def _step_detail(self) -> dict[str, object]:
+        return self._detail_section("steps")
+
+    @property
+    def _arg_detail(self) -> dict[str, object]:
+        return self._detail_section("args")
+
+    @property
+    def steps_completed(self) -> bool:
+        """True when every expected decision step was satisfied, in order."""
+        return bool(self._step_detail.get("all_steps_matched", False))
+
+    @staticmethod
+    def _count(detail: dict[str, object], key: str) -> int:
+        """Read an integer counter out of a `judge_detail` section.
+
+        The detail dict is `dict[str, object]` because it also carries lists and
+        strings, so the type has to be narrowed before the value is used as a
+        ratio numerator or denominator. A missing or non-integer entry reads as
+        0, which keeps `Ratio` constructible; a genuinely absent counter shows
+        up as an unmeasured ratio rather than a crash mid-report.
+        """
+        value = detail.get(key, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @property
+    def num_extra_tool_calls(self) -> int:
+        """Calls that matched no expected step (precision's invalid half)."""
+        return self._count(self._step_detail, "num_extra_calls")
+
+    @property
+    def num_matched_tool_calls(self) -> int:
+        """Calls that satisfied a step. Derived, never stored twice."""
+        return self.num_tool_calls - self.num_extra_tool_calls
+
+    @property
+    def num_arg_checked_calls(self) -> int:
+        return self._count(self._arg_detail, "checked_calls")
+
+    @property
+    def num_arg_correct_calls(self) -> int:
+        return self._count(self._arg_detail, "correct_calls")
+
+    @property
+    def num_arg_checked_fields(self) -> int:
+        return self._count(self._arg_detail, "checked_fields")
+
+    @property
+    def num_arg_correct_fields(self) -> int:
+        return self._count(self._arg_detail, "correct_fields")
+
     def to_raw_dict(self) -> dict[str, object]:
         """The per-case row written to `raw.jsonl` (metric contract §2.2).
 
@@ -144,15 +210,40 @@ def _prepare_sandbox(fixtures_dir: Path, fixture: str | None) -> str:
 
 
 def _judge_l1(calls: list[ToolCall], case: ToolCallCase) -> dict[str, object]:
-    tools_ok = check_tools(calls, case.expect_tools)
-    args_ok = check_args(calls, case.expect_args)
-    detail: dict[str, object] = {
-        "expect_tools": case.expect_tools,
+    """Per-step and per-field detail for a tool-call case.
+
+    Every count the four metrics need is recorded here, separately. The old
+    shape fused tool selection and argument correctness into one boolean, which
+    is exactly why the legacy `l1_tool_accuracy` could not be split into
+    independent denominators (`evals/README.md` §2).
+
+    `matched_calls` is derived rather than stored: it is
+    `num_tool_calls - num_extra_calls`, and storing the same fact twice is how
+    the two copies eventually disagree.
+    """
+    steps = judge_steps(calls, case.accepted_tool_steps)
+    args = judge_case_args(calls, case.expect_args)
+    return {
+        "accepted_tool_steps": case.accepted_tool_steps,
+        "max_extra_calls": case.max_extra_calls,
         "expect_args": case.expect_args,
-        "tool_subsequence_ok": tools_ok,
-        "args_ok": args_ok,
+        "steps": steps.to_detail(),
+        "args": args.to_detail(),
     }
-    return detail
+
+
+def _tool_case_passed(detail: dict[str, object]) -> bool:
+    """Case-level pass: every expected decision step completed AND args correct.
+
+    Note this is *not* the same question as any single metric: the case boolean
+    still exists for triage, but every reported number is read off the separate
+    counts in `detail`, so extra calls move precision without silently rewriting
+    the case outcome.
+    """
+    steps = detail["steps"]
+    args = detail["args"]
+    assert isinstance(steps, dict) and isinstance(args, dict)
+    return bool(steps["all_steps_matched"]) and bool(args["all_calls_correct"])
 
 
 def _empty_trajectory() -> Trajectory:
@@ -205,6 +296,7 @@ async def run_case(
     run_id: str | None = None,
     keep_sandbox_on_failure: bool = False,
     clock: Callable[[], int] = time.perf_counter_ns,
+    tool_profile: str = "core",
 ) -> CaseResult:
     """Run one case and return its CaseResult.
 
@@ -242,7 +334,9 @@ async def run_case(
     # re-raises, so it cannot swallow a cancellation — it just ensures Ctrl-C
     # during engine construction does not leave a temp dir behind.
     try:
-        engine = build_engine(sandbox=sandbox, model=model, api_key=api_key)
+        engine = build_engine(
+            sandbox=sandbox, model=model, api_key=api_key, tool_profile=tool_profile,
+        )
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
         raise
@@ -264,7 +358,7 @@ async def run_case(
         if isinstance(case, ToolCallCase):
             detail = _judge_l1(traj.tool_calls, case)
             result.detail = detail
-            passed = bool(detail["tool_subsequence_ok"]) and bool(detail["args_ok"])
+            passed = _tool_case_passed(detail)
         else:  # E2ECase
             judge_conf = case.judge
             fn = str(judge_conf["fn"])
@@ -358,11 +452,17 @@ async def run_suite(
     run_id: str | None = None,
     keep_sandbox_on_failure: bool = False,
     clock: Callable[[], int] = time.perf_counter_ns,
+    tool_profile: str = "core",
+    profile_for_case: Callable[[EvalCase], str] | None = None,
 ) -> list[CaseResult]:
     """Run a batch of cases serially.
 
     Serial by contract (`evals/README.md` §4.6): parallel quality runs trip API
     rate limits and contaminate each other's latency.
+
+    `profile_for_case` lets one suite mix families — a web case and a notebook
+    case need different registries, and running either against the wrong one
+    would score an unsatisfiable task as a model error.
     """
     results: list[CaseResult] = []
     for trial, case in enumerate(cases):
@@ -378,6 +478,9 @@ async def run_suite(
                 run_id=run_id,
                 keep_sandbox_on_failure=keep_sandbox_on_failure,
                 clock=clock,
+                tool_profile=(
+                    profile_for_case(case) if profile_for_case is not None else tool_profile
+                ),
             )
         )
     return results

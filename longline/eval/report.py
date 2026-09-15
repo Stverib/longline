@@ -18,6 +18,13 @@ from longline.eval.metrics import Ratio, mean, paired_delta, percentage_points, 
 if TYPE_CHECKING:
     from longline.eval.runner import CaseResult
 
+# Case tags that decide the ToolSelectionCaseAccuracy denominator. A blind case
+# is one whose task text does not name or hint at the expected tool; an
+# instruction-following case names it outright and is therefore a regression
+# check on following orders, not a measurement of tool *selection*.
+BLIND_TAG = "blind"
+INSTRUCTION_FOLLOWING_TAG = "instruction-following"
+
 
 @dataclass
 class GroupSummary:
@@ -59,6 +66,15 @@ class EvalReport:
     l1_ratio: Ratio = field(default_factory=lambda: Ratio(0, 0))
     l2_ratio: Ratio = field(default_factory=lambda: Ratio(0, 0))
     tool_execution_rate: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    # --- Task 2: the four tool-calling metrics, each with its own denominator ---
+    # `tool_selection_case_accuracy` is the resume-facing number and excludes
+    # instruction-following cases by construction (see `aggregate`).
+    tool_selection_case_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    tool_call_precision: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    argument_call_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    argument_field_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    # Reported separately, never folded into the number above.
+    instruction_following_case_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
     mean_duration_ms: float | None = None
     p50_duration_ms: float | None = None
     p95_duration_ms: float | None = None
@@ -80,6 +96,17 @@ class EvalReport:
             "l1_tool_accuracy": self.l1_ratio.to_dict(),
             "l2_pass1": self.l2_ratio.to_dict(),
             "tool_execution_rate": self.tool_execution_rate.to_dict(),
+            # Task 2: four metrics, four independent denominators.
+            "tool_calling": {
+                "tool_selection_case_accuracy": self.tool_selection_case_accuracy.to_dict(),
+                "tool_call_precision": self.tool_call_precision.to_dict(),
+                "argument_call_accuracy": self.argument_call_accuracy.to_dict(),
+                "argument_field_accuracy": self.argument_field_accuracy.to_dict(),
+                "execution_success_rate": self.tool_execution_rate.to_dict(),
+                "instruction_following_case_accuracy": (
+                    self.instruction_following_case_accuracy.to_dict()
+                ),
+            },
             "avg_turns": self.avg_turns,
             "avg_input_tokens": self.avg_input_tokens,
             "avg_output_tokens": self.avg_output_tokens,
@@ -127,6 +154,42 @@ def _failure_type_counts(results: list[CaseResult]) -> dict[str, int]:
     return counts
 
 
+def _tool_calling_totals(
+    results: list[CaseResult],
+) -> dict[str, Ratio]:
+    """The four tool-calling ratios, summed over tool-call cases.
+
+    Reading order matters here: `select` counts **cases**, the other three count
+    **calls** or **fields**. They are summed separately on purpose — a single
+    loop that accumulated one "score" per case is what fused the legacy metric
+    and made its denominator unrecoverable.
+    """
+    blind = [r for r in results if BLIND_TAG in r.tags]
+    instruction = [r for r in results if INSTRUCTION_FOLLOWING_TAG in r.tags]
+
+    # Denominator: blind tool-call cases only (contract §5.2 exclusion rule).
+    select_num = sum(1 for r in blind if r.steps_completed)
+    # Denominator: EVERY requested call, extras included.
+    calls = sum(r.num_tool_calls for r in results)
+    matched = sum(r.num_matched_tool_calls for r in results)
+    # Denominator: matched calls whose arguments the case declares.
+    arg_calls_checked = sum(r.num_arg_checked_calls for r in results)
+    arg_calls_ok = sum(r.num_arg_correct_calls for r in results)
+    # Denominator: declared argument fields that were actually checked.
+    arg_fields_checked = sum(r.num_arg_checked_fields for r in results)
+    arg_fields_ok = sum(r.num_arg_correct_fields for r in results)
+
+    return {
+        "tool_selection_case_accuracy": Ratio(select_num, len(blind)),
+        "tool_call_precision": Ratio(matched, calls),
+        "argument_call_accuracy": Ratio(arg_calls_ok, arg_calls_checked),
+        "argument_field_accuracy": Ratio(arg_fields_ok, arg_fields_checked),
+        "instruction_following_case_accuracy": Ratio(
+            sum(1 for r in instruction if r.steps_completed), len(instruction)
+        ),
+    }
+
+
 def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalReport:
     """Summarize a batch of CaseResults by layer, category, variant and latency."""
     l1 = [r for r in results if r.case_type == "tool_call"]
@@ -170,6 +233,8 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
     for r in results:
         variants.setdefault(r.variant or "unspecified", []).append(r)
 
+    tool_metrics = _tool_calling_totals(l1)
+
     return EvalReport(
         total_cases=len(results),
         l1_tool_accuracy=l1_ratio.value,
@@ -181,6 +246,11 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         l1_ratio=l1_ratio,
         l2_ratio=l2_ratio,
         tool_execution_rate=Ratio(successful, executed),
+        tool_selection_case_accuracy=tool_metrics["tool_selection_case_accuracy"],
+        tool_call_precision=tool_metrics["tool_call_precision"],
+        argument_call_accuracy=tool_metrics["argument_call_accuracy"],
+        argument_field_accuracy=tool_metrics["argument_field_accuracy"],
+        instruction_following_case_accuracy=tool_metrics["instruction_following_case_accuracy"],
         mean_duration_ms=mean(durations),
         p50_duration_ms=percentile(durations, 50) if durations else None,
         p95_duration_ms=percentile(durations, 95) if durations else None,
@@ -210,6 +280,20 @@ def _fmt_ci(ratio: Ratio) -> str:
 
 def _fmt_ms(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}ms"
+
+
+def _metric_row(label: str, ratio: Ratio, definition: str) -> str:
+    """One markdown row: value, CI, and the fraction the value came from.
+
+    The definition column carries the numerator/denominator wording so a reader
+    can tell which of the four ratios they are looking at without opening the
+    contract — the four names are similar and the whole point of the split is
+    that they are *not* interchangeable.
+    """
+    return (
+        f"| {label} | {_fmt_pct(ratio)} | {_fmt_ci(ratio)} | "
+        f"{definition} = {ratio.numerator}/{ratio.denominator} |"
+    )
 
 
 def render_markdown(
@@ -243,6 +327,39 @@ def render_markdown(
         f"input={report.total_input_tokens}, output={report.total_output_tokens}, "
         f"total={report.total_tokens}",
     ]
+
+    if report.tool_selection_case_accuracy.denominator or report.tool_call_precision.denominator:
+        lines += [
+            "",
+            "## Tool calling (four metrics, independent denominators)",
+            "",
+            "| metric | value | 95% Wilson CI | numerator / denominator |",
+            "|---|---|---|---|",
+            _metric_row(
+                "ToolSelectionCaseAccuracy (blind only)",
+                report.tool_selection_case_accuracy, "完成全部决策步骤的盲测用例 / 盲测用例",
+            ),
+            _metric_row(
+                "ToolCallPrecision",
+                report.tool_call_precision, "匹配有效步骤的调用 / 全部工具调用",
+            ),
+            _metric_row(
+                "ArgumentCallAccuracy",
+                report.argument_call_accuracy, "参数整体正确的调用 / 需校验参数的调用",
+            ),
+            _metric_row(
+                "ArgumentFieldAccuracy",
+                report.argument_field_accuracy, "正确参数字段 / 被检查参数字段",
+            ),
+            _metric_row(
+                "ExecutionSuccessRate",
+                report.tool_execution_rate, "is_error=false 的执行 / 实际执行",
+            ),
+            _metric_row(
+                "InstructionFollowingCaseAccuracy (separate, not in the number above)",
+                report.instruction_following_case_accuracy, "显式指定工具的用例 / 该类用例",
+            ),
+        ]
 
     if baseline is not None:
         label = baseline_label or "baseline"

@@ -1,0 +1,5 @@
+{
+  "name": "tool-repo",
+  "port": 3000,
+  "debug": true
+}

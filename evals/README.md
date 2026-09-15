@@ -16,10 +16,39 @@
 | 路径 | 状态 | 说明 |
 |---|---|---|
 | `evals/tool_calls.jsonl` | **legacy** | 30 条工具调用用例。instruction-following 数据，**不进入简历主数字**。 |
+| `evals/tool_selection.jsonl` | **生效** | 60 条工具调用用例（48 盲测 + 12 instruction-following），Task 2 产物。 |
 | `evals/e2e.jsonl` | **待扩充** | 10 条端到端用例。**尚未标 legacy**，见下方说明。 |
 | `evals/fixtures/` | 生效 | 沙箱起始状态。 |
 | `evals/results/` | 生效 | 运行产物，布局见 §3。 |
 | `evals/baselines/` | 生效 | 冻结基线，格式见 `evals/baselines/README.md`。 |
+
+### 关于 `tool_selection.jsonl`（Task 2 新增）
+
+主评测集。**60 条 = 48 条盲测 + 12 条 instruction-following**，按族拆分：
+
+| 工具族 | 数量 |
+|---|---:|
+| Read / Write / Edit | 16 |
+| Glob / Grep | 12 |
+| Bash | 6 |
+| WebSearch / WebFetch | 8 |
+| NotebookEdit | 4 |
+| TaskCreate / TaskGet / TaskList / TaskUpdate / TaskStop | 6 |
+| 多工具路径 | 8 |
+
+- 每条用例带 `tags: ["blind"]` 或 `["instruction-following"]`，**二选一，不重叠**。
+- 每条盲测用例必须带 `blind_rationale`，一句话说明「任务文本为什么没有点名或暗示工具」。
+- 族数量按**全部 60 条**统计（instruction-following 也带族标签），
+  因此每族都同时贡献盲测样本和回归样本，而不是在 60 条之外再加 12 条。
+- fixture 分配：`simple_repo`（**沿用旧集，文件列表冻结不可改**）、
+  `tool_repo`（Task 2 专用，带 assets/、utils.py、多变量 version.py）、
+  `notebook_repo`、`workspace_repo`。
+
+**泄漏检查是可执行的**，见 `tests/unit/eval/leakage.py` 与
+`tests/unit/eval/test_tool_selection_cases.py`。重要限制：英文工具名用词边界扫描（精确），
+中文提示词表（`TOOL_HINT_WORDS`）**只是启发式**，覆盖不了新奇的改写。
+`blind_rationale` 才是人工复核的依据；**不要**把绿色测试当成「已证明不泄漏」。
+
 
 **关于 `tool_calls.jsonl`**：已通过逐行 `tags` 数组追加 `"legacy"` 标记（`tags` 本就是
 `longline/eval/types.py` 支持的字段，`from_dict` 对未知顶层键也会忽略，因此加载器行为不变）。
@@ -224,6 +253,18 @@ ExecutionSuccessRate       = is_error=false 的实际执行数 / 实际执行数
 | ArgumentCallAccuracy | 参数整体正确的匹配调用数 | **需要校验参数**的匹配调用数 | 不校验参数的调用不计入分母 |
 | ArgumentFieldAccuracy | 正确参数字段数 | **被检查**参数字段数 | 未声明的字段不计入分母 |
 | ExecutionSuccessRate | `is_error=false` 的实际执行数 | **实际执行数**（已下发到工具的次数） | 未执行的调用不计入分母 |
+
+**实现口径补充**（与上述公式等价，消除歧义）：
+
+- **分步骤匹配**：每个决策步骤消费**最早**一个尚未被消费、且工具名在该步候选集合里的调用。
+  没匹配上的步骤**不推进游标**，因此不会连累后面的步骤；
+  而游标一旦推进就不再回退，顺序因此仍然有意义。
+- **参数分母**：只统计 `expect_args` 中**声明了的工具**且有实际调用的那些。
+  声明了但没调用 = 步骤层的缺失，不在参数分母里重复扣分。
+- **同名工具的多次调用取最好的一次**：一次参数写错后重写正确，算「最终传对了」。
+- **未测到即 `null`**：任何分母为 0 的比例输出 `null`（不是 `0.0`），
+  与 `longline/eval/metrics.py::Ratio` 的约定一致。
+
 
 **关键规则**：额外调用**不再完全免费**。它不一定让任务级选择失败，但**必须**降低 `ToolCallPrecision`。
 
@@ -494,6 +535,12 @@ E2E pass@1      ~70–90%（平均 3.4 轮）
       > （`tc-003`、`tc-004`、`tc-006`、`tc-011`、`tc-012`、`tc-015`、`tc-018`、`tc-019`、
       > `tc-028`、`tc-029`），这正是它被标为 legacy 的原因之一；
       > `e2e.jsonl` **0 条**泄漏，因此不标 legacy。
+      > **`tool_selection.jsonl` 的这条规则已可执行**：
+      > `tests/unit/eval/test_tool_selection_cases.py::TestNoLeakageInBlindCases`
+      > 会扫描工具名（词边界、精确）与中文提示词表（**启发式**）。
+      > 绿色不等于已证明不泄漏——每条盲测用例的 `blind_rationale` 才是人工复核的依据。
+      > 词表在 `tests/unit/eval/leakage.py::TOOL_HINT_WORDS`，
+      > 复核发现新泄漏措辞时**必须**把那个词补进去。
 - [ ] 任务描述的是**目标**（「在仓库里找出所有 TODO」），而不是**手段**（「用 Grep 找出…」）。
 - [ ] 显式指定工具的用例被正确打上 instruction-following 标签，且**不进入主数字**。
 
@@ -537,7 +584,10 @@ E2E pass@1      ~70–90%（平均 3.4 轮）
 # 旧用例仍可被现有 loader 加载（预期输出：30 10）
 uv run --extra dev python -c "from pathlib import Path; from longline.eval.types import load_cases; print(len(load_cases(Path('evals/tool_calls.jsonl'))), len(load_cases(Path('evals/e2e.jsonl'))))"
 
-# 评测单测
+# 新工具选择集：总量与盲测/回归拆分（预期输出：60 48 12）
+uv run --extra dev python -c "from pathlib import Path; from longline.eval.types import load_cases; cs=load_cases(Path('evals/tool_selection.jsonl')); print(len(cs), sum('blind' in c.tags for c in cs), sum('instruction-following' in c.tags for c in cs))"
+
+# 评测单测（含泄漏检查与数据集契约）
 uv run --extra dev pytest tests/unit/eval -q
 ```
 

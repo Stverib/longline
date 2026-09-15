@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from longline.eval import cli
+from longline.eval.types import ToolCallCase
 
 
 def test_parse_known_args_defaults(tmp_path: Path) -> None:
@@ -339,3 +340,55 @@ def test_paired_delta_turns_unaffected_by_missing_duration() -> None:
 
     out = paired_report_delta(baseline, candidate)
     assert out["turns"]["n_pairs"] == 2
+
+
+# --- Task 2: suite / profile / blind-vs-instruction split ---
+
+
+class TestToolSelectionSuiteWiring:
+    def test_tool_selection_suite_selects_its_case_file(self) -> None:
+        args = cli.parse_args(["--suite", "tool_selection"])
+        cli._apply_suite(args, ["--suite", "tool_selection"])
+        assert args.case_file.endswith("tool_selection.jsonl")
+        assert args.type == "tool_call"
+
+    def test_legacy_tool_calls_suite_unchanged(self) -> None:
+        args = cli.parse_args(["--suite", "tool_calls"])
+        cli._apply_suite(args, ["--suite", "tool_calls"])
+        assert args.case_file.endswith("tool_calls.jsonl")
+
+    def test_blind_only_selects_blind_tagged_cases(self) -> None:
+        cases: list[ToolCallCase] = [
+            ToolCallCase(id="a", task="t", tags=["blind"]),
+            ToolCallCase(id="b", task="t", tags=["instruction-following"]),
+            ToolCallCase(id="c", task="t", tags=["blind", "read"]),
+        ]
+        assert [c.id for c in cli._select_by_tag(cases, cli.BLIND_TAG)] == ["a", "c"]
+        assert [c.id for c in cli._select_by_tag(cases, cli.INSTRUCTION_FOLLOWING_TAG)] == ["b"]
+
+    def test_profile_for_case_maps_family_tags(self) -> None:
+        assert cli.profile_for_case(ToolCallCase(id="a", task="t", tags=["web"]), "core") == "web"
+        assert cli.profile_for_case(ToolCallCase(id="a", task="t", tags=["task"]), "core") == "task"
+        assert cli.profile_for_case(
+            ToolCallCase(id="a", task="t", tags=["notebook"]), "core"
+        ) == "notebook"
+        assert cli.profile_for_case(ToolCallCase(id="a", task="t", tags=["read"]), "core") == "core"
+
+    def test_profile_for_case_multi_tag_wins(self) -> None:
+        # 多工具路径需要所有相关族同时可用。
+        assert cli.profile_for_case(
+            ToolCallCase(id="a", task="t", tags=["read", "multi"]), "core"
+        ) == "all"
+
+    def test_profile_for_case_falls_back_to_default(self) -> None:
+        assert cli.profile_for_case(ToolCallCase(id="a", task="t", tags=["legacy"]), "web") == "web"
+        assert cli.profile_for_case(ToolCallCase(id="a", task="t"), "core") == "core"
+
+    def test_tool_profile_flag_defaults_to_core(self) -> None:
+        assert cli.parse_args([]).tool_profile == "core"
+        assert cli.parse_args(["--tool-profile", "all"]).tool_profile == "all"
+
+    def test_blind_and_instruction_flags_default_off(self) -> None:
+        args = cli.parse_args([])
+        assert args.blind_only is False
+        assert args.instruction_only is False
