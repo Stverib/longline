@@ -7,7 +7,17 @@ name = "longline"
 version = "0.1.0"
 description = "Resumable agent runtime and multi-agent orchestration for long-horizon tasks"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "Striver" }]
+keywords = ["agent", "llm", "claude", "multi-agent", "orchestration", "tool-use"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "anthropic>=0.52",
     "pydantic>=2.0",
@@ -16,6 +26,11 @@ dependencies = [
     "httpx>=0.27",
     "aiofiles>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Stverib/longline"
+Repository = "https://github.com/Stverib/longline"
+Issues = "https://github.com/Stverib/longline/issues"
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]

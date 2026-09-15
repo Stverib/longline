@@ -10,7 +10,7 @@
 - **长链路**：token 预算监控 + 自动上下文压缩，长对话不会撑爆窗口
 - **多 Agent**：Team 生命周期、Mailbox 通信、Coordinator 编排，一个 leader 带多个 teammate 并行干活
 
-内核源自对 Claude Code TypeScript 源码（1884 个文件、38 万行）的提取与翻译，因此它**不是封装 API 的 wrapper，而是一个功能对齐的完整 agent 运行时**——22 个内置工具、权限系统、hooks、MCP、skills 都是照着真实产品还原的。
+内核源自对 Claude Code TypeScript 源码（1884 个文件、38 万行）的提取与翻译，因此它**不是封装 API 的 wrapper，而是一个功能对齐的完整 agent 运行时**——26 个内置工具、权限系统、hooks、MCP、skills 都是照着真实产品还原的。
 
 ## 还原了什么
 
@@ -18,7 +18,7 @@
 |------|------|------|
 | Agent Loop（状态机） | ✅ | 多轮 tool-use 循环，流式响应，错误恢复，自动重试 |
 | 流式工具执行 | ✅ | 工具在 API 流式过程中立即开始执行，不等响应结束 |
-| 22 个内置工具 | ✅ | Bash、Read、Edit、Write、Glob、Grep、Agent、WebFetch、WebSearch、NotebookEdit、ToolSearch、AskUser、Task 系列、TodoWrite、Skill、PlanMode、Brief、LSP、TeamCreate/Delete、SendMessage |
+| 26 个内置工具 | ✅ | Bash、Read、Edit、Write、Glob、Grep、Agent、WebFetch、WebSearch、NotebookEdit、ToolSearch、AskUser、Task 系列（Create/Get/List/Update/Stop）、TodoWrite、Skill、PlanMode（Enter/Exit）、Brief、LSP、TeamCreate/Delete、SendMessage |
 | 权限系统 | ✅ | PermissionMode（bypass/acceptEdits/default）+ 规则引擎 + 非交互 fail-fast |
 | System Prompt 体系 | ✅ | 多段动态拼装，含 Memory 行为指导 + Coordinator/Teammate 提示词 |
 | CLAUDE.md 加载 | ✅ | 目录层级遍历 + `@include` 递归展开 |
@@ -41,7 +41,7 @@ longline/
 ├── api/                Anthropic API：流式调用、客户端管理、token 统计
 ├── models/             数据模型：消息类型、content blocks、API 规范化
 ├── prompts/            System Prompt：多段文本 + 动态拼装 + Coordinator/Teammate 提示词
-├── tools/              22 个工具实现 + StreamingToolExecutor + 权限门控
+├── tools/              26 个工具实现 + StreamingToolExecutor + 权限门控
 ├── permissions/        权限系统：PermissionMode + 规则引擎 + 非交互语义
 ├── swarm/              Agent Teams：身份、Mailbox、TeamFile、InProcessTeammate、Coordinator
 ├── compact/            上下文压缩：token 预算监控、摘要生成
@@ -54,7 +54,7 @@ longline/
 ├── ui/                 终端渲染：Rich 流式输出
 └── main.py             入口：REPL 循环、模块组装、inbox polling
 
-tests/                  498 个测试用例
+tests/                  541 个测试用例（534 单元 + 7 集成/E2E）
 ```
 
 ### 核心数据流
@@ -163,7 +163,7 @@ LONGLINE_COORDINATOR_MODE=1 uv run python -m longline
 ### 测试
 
 ```bash
-# 全量单元测试（498 个）
+# 全量单元测试（534 个）
 uv run pytest tests/unit/ -v
 
 # 集成测试（需要 API key + 网络）
