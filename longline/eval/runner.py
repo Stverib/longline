@@ -208,22 +208,42 @@ async def run_case(
 ) -> CaseResult:
     """Run one case and return its CaseResult.
 
-    A failure inside the case — a raised exception, or an `ErrorEvent` from the
-    query loop — is recorded on the result rather than propagated: the runner
-    is expected to walk a whole suite, and a single model/runtime failure must
-    not abort the run or vanish from the denominator. The only thing raised out
-    of here is a fixture misconfiguration, which cannot be remedied mid-suite.
+    Failure handling is deliberately **layered**, because the two kinds of
+    fault mean different things for the numbers:
+
+    - **Infrastructure faults propagate.** If `build_engine` cannot construct a
+      harness, nothing about the case was measured. Recording that as a case
+      failure would put an unmeasured case into the denominator and quietly
+      depress the success rate. A broken harness must abort loudly so the run
+      is discarded, not resumed with a corrupted rate.
+    - **Case faults are recorded.** Once the engine exists and the case is
+      actually running, an exception is a fact about this case: it is recorded
+      on the `CaseResult` with `error_type="runtime_error"` and the suite
+      continues. The plan's §5.1 rule — a case whose baseline failed still
+      counts in the denominator — requires that such a case be kept in the
+      data rather than dropped.
+
+    The sandbox is cleaned on every path, including the propagating one.
 
     build_engine is monkeypatchable so unit tests stay offline; `clock` is
     injectable so latency assertions are deterministic.
     """
     fixture = case.fixture  # both ToolCallCase and E2ECase carry fixture
     sandbox = _prepare_sandbox(fixtures_dir, fixture)
+
+    # Infra layer: built OUTSIDE the recording try, so a failure here
+    # propagates. Only the sandbox is guaranteed cleaned up.
+    try:
+        engine = build_engine(sandbox=sandbox, model=model, api_key=api_key)
+    except BaseException:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise
+
     marked = _MarkingClock(clock)
     result: CaseResult | None = None
 
+    # Case layer: from here on, failures are recorded, not propagated.
     try:
-        engine = build_engine(sandbox=sandbox, model=model, api_key=api_key)
         traj = await extract_trajectory(
             engine.submit(case.task, max_turns=case.max_turns), clock=marked,
         )
@@ -246,7 +266,7 @@ async def run_case(
 
         result.passed = passed
         result.error_type = infer_error_type(traj, passed=passed)
-    except BaseException as exc:  # harness failure: record it, never abort the suite
+    except BaseException as exc:  # case failure: record it, never abort the suite
         result = _result_from_trajectory(
             case,
             _empty_trajectory(),
@@ -258,7 +278,9 @@ async def run_case(
         result.errors = [*result.errors, f"{type(exc).__name__}: {exc}"]
     finally:
         outcome = result
-        assert outcome is not None  # assigned on every path above
+        # Assigned on both the success and the recorded-failure path; the infra
+        # path raised out above and never reaches this finally.
+        assert outcome is not None
         if outcome.duration_ms is None:
             outcome.duration_ms = (marked.last() - marked.first()) / 1_000_000.0
         keep = keep_sandbox_on_failure and not outcome.passed
@@ -278,9 +300,9 @@ class _MarkingClock:
     extractor sampled the clock, which is what lets tests inject a plain
     sequence of ticks and still get an exact duration.
 
-    `first()`/`final()` reuse the values the trajectory already sampled rather
+    `first()`/`last()` reuse the values the trajectory already sampled rather
     than taking fresh ones, so an injected finite tick sequence is never
-    over-consumed. If nothing was sampled (the engine blew up before yielding),
+    over-consumed. If nothing was sampled (the case raised before yielding),
     the clock is read once on each side.
     """
 

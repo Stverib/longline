@@ -249,6 +249,102 @@ async def test_exception_path_cleans_sandbox_by_default(monkeypatch: pytest.Monk
     assert r.sandbox_kept is False
 
 
+# --- layered failure semantics: infra propagates, case is recorded ---
+
+
+async def test_build_engine_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An infra fault means nothing was measured, so it must abort loudly.
+
+    Recording it as a case failure would push an unmeasured case into the
+    denominator and silently depress the success rate.
+    """
+    import longline.eval.runner as mod
+
+    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+        raise RuntimeError("no harness")
+
+    monkeypatch.setattr(mod, "build_engine", _boom)
+    case = ToolCallCase(id="tc-infra", task="t")
+    with pytest.raises(RuntimeError, match="no harness"):
+        await run_case(case, model="m", api_key="k", fixtures_dir=Path("x"))
+
+
+async def test_build_engine_failure_leaves_no_sandbox_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The propagating path must still clean up its temp dir."""
+    import longline.eval.runner as mod
+
+    created: list[str] = []
+
+    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+        created.append(sandbox)
+        raise RuntimeError("no harness")
+
+    monkeypatch.setattr(mod, "build_engine", _boom)
+    case = ToolCallCase(id="tc-infra-clean", task="t")
+    with pytest.raises(RuntimeError):
+        await run_case(case, model="m", api_key="k", fixtures_dir=tmp_path)
+    assert len(created) == 1
+    assert not Path(created[0]).exists()
+
+
+async def test_midrun_failure_is_recorded_not_propagated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the engine exists, a fault is a fact about the case, not the run."""
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([], raises=RuntimeError("kaboom")))
+    case = ToolCallCase(id="tc-mid", task="t")
+    r = await run_case(case, model="m", api_key="k", fixtures_dir=Path("x"))
+    assert r.passed is False
+    assert r.error_type == "runtime_error"
+    assert any("kaboom" in e for e in r.errors)
+
+
+async def test_suite_continues_after_a_midrun_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The failed case stays in the results (and therefore the denominator)."""
+    import longline.eval.runner as mod
+
+    calls = {"n": 0}
+
+    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+        calls["n"] += 1
+        fail = calls["n"] == 2
+
+        class _FakeEngine:
+            async def submit(self, user_input: str, **kwargs: Any) -> Any:
+                if fail:
+                    raise RuntimeError("case 2 blew up")
+                yield TurnComplete(stop_reason="end_turn", usage=Usage())
+
+        return SimpleNamespace(
+            registry=SimpleNamespace(list_tools=lambda: [FakeTool()]),
+            system_prompt="test", model=model, submit=_FakeEngine().submit,
+        )
+
+    monkeypatch.setattr(mod, "build_engine", _build_engine)
+    cases = [ToolCallCase(id=f"c{i}", task="t", expect_tools=[]) for i in range(3)]
+    results = await run_suite(cases, model="m", api_key="k", fixtures_dir=Path("x"))
+
+    assert [r.case_id for r in results] == ["c0", "c1", "c2"]
+    assert results[1].passed is False
+    assert results[1].error_type == "runtime_error"
+    assert results[0].passed is True
+
+
+async def test_suite_aborts_on_infra_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An infra fault aborts the whole suite rather than degrading the rate."""
+    import longline.eval.runner as mod
+
+    def _boom(*, sandbox: str, model: str, api_key: str) -> Any:
+        raise RuntimeError("no harness")
+
+    monkeypatch.setattr(mod, "build_engine", _boom)
+    cases = [ToolCallCase(id="c0", task="t"), ToolCallCase(id="c1", task="t")]
+    with pytest.raises(RuntimeError, match="no harness"):
+        await run_suite(cases, model="m", api_key="k", fixtures_dir=Path("x"))
+
+
 async def test_exception_path_keeps_sandbox_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     import longline.eval.runner as mod
 
