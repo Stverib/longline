@@ -1,0 +1,36 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 工具缓存/产物目录（不入库）
+.boss/
+.claude/
+.codegraph/
+.playwright-mcp/
+evals/results/
+
+# 本地草稿 / 临时产物
+.tmp/
+
+# 私人材料与内部文档：简历、面试准备、内部设计文档（绝不入库）
+docs/
+docs/简历*.md
+docs/简历*.docx
+docs/~$*
+interview/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地实验性仓库（见 .gitignore 说明）
+longline-preview/
