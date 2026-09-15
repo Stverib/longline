@@ -14,7 +14,9 @@ build/
 .claude/
 .codegraph/
 .playwright-mcp/
-evals/results/
+
+# 评测结果：全部入库，保证计划 §7「每个正式数字可回溯到 raw result」可从仓库独立审计。
+# 指标契约见 evals/README.md；冻结基线见 evals/baselines/。
 
 # 本地草稿 / 临时产物
 .tmp/
