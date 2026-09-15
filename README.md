@@ -176,10 +176,18 @@ uv run mypy longline/
 
 ### Agent 评测
 
+> **指标口径已冻结（2026-09-15）。** 正式的公式、分母、排除条件和统计口径见
+> [`evals/README.md`](evals/README.md)。本文档「Agent 评测」一节现存的两组数字
+> 均为 **legacy exploratory**（历史探索性数据，模型 `deepseek-v4-flash`），
+> 它们是「多次运行取稳定区间」的目测结果，**没有分子/分母，也没有 95% CI**，
+> 且所用工具用例存在标签泄漏（任务文本直接点名工具）——**不可与新口径混用**。
+
 内置两层确定性评测（不依赖 LLM 主观打分）：
 
-- **工具调用准确率**：`evals/tool_calls.jsonl`（30 条）校验 Agent 是否按序选择正确工具、参数是否匹配正则（Read/Grep/Glob/Write/Edit/Bash）。
-- **端到端任务成功率（pass@1）**：`evals/e2e.jsonl`（10 条）在临时沙箱内跑真实任务，用文件内容/命令退出码判分。
+- **工具调用准确率**（legacy）：`evals/tool_calls.jsonl`（30 条，已标 `legacy`）校验 Agent 是否按序选择正确工具、参数是否匹配正则（Read/Grep/Glob/Write/Edit/Bash）。
+- **端到端任务成功率（pass@1）**：`evals/e2e.jsonl`（10 条）在临时沙箱内跑真实任务，用文件内容/命令退出码判分。该文件**未标 legacy**，将由计划 Task 3 扩充至 40 条。
+
+<!-- legacy exploratory: 以下数字保留仅为记录历史，不进入正式报告或简历。详见 evals/README.md §7 -->
 
 实测（deepseek-v4-flash，均多次运行取稳定区间）：工具调用准确率 **~97–100%**（平均 2.7 轮），E2E pass@1 **~70–90%**（平均 3.4 轮）。报告含逐用例工具轨迹（tool_calls）便于失败归因。
 
