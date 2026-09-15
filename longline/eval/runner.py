@@ -217,13 +217,18 @@ async def run_case(
       depress the success rate. A broken harness must abort loudly so the run
       is discarded, not resumed with a corrupted rate.
     - **Case faults are recorded.** Once the engine exists and the case is
-      actually running, an exception is a fact about this case: it is recorded
+      actually running, an `Exception` is a fact about this case: it is recorded
       on the `CaseResult` with `error_type="runtime_error"` and the suite
       continues. The plan's §5.1 rule — a case whose baseline failed still
       counts in the denominator — requires that such a case be kept in the
       data rather than dropped.
+    - **Cancellation propagates.** `KeyboardInterrupt` and
+      `asyncio.CancelledError` are statements about the *run*, not the case.
+      Recording them would turn Ctrl-C into a case failure and let the suite
+      march on, so the recording arm catches `Exception` only and lets these
+      through to propagate.
 
-    The sandbox is cleaned on every path, including the propagating one.
+    The sandbox is cleaned on every path, including the propagating ones.
 
     build_engine is monkeypatchable so unit tests stay offline; `clock` is
     injectable so latency assertions are deterministic.
@@ -232,7 +237,10 @@ async def run_case(
     sandbox = _prepare_sandbox(fixtures_dir, fixture)
 
     # Infra layer: built OUTSIDE the recording try, so a failure here
-    # propagates. Only the sandbox is guaranteed cleaned up.
+    # propagates. Only the sandbox is guaranteed cleaned up. BaseException is
+    # right here (unlike the recording path below): this arm only cleans up and
+    # re-raises, so it cannot swallow a cancellation — it just ensures Ctrl-C
+    # during engine construction does not leave a temp dir behind.
     try:
         engine = build_engine(sandbox=sandbox, model=model, api_key=api_key)
     except BaseException:
@@ -266,7 +274,12 @@ async def run_case(
 
         result.passed = passed
         result.error_type = infer_error_type(traj, passed=passed)
-    except BaseException as exc:  # case failure: record it, never abort the suite
+    except Exception as exc:  # case failure: record it, never abort the suite
+        # Only Exception is a statement about this case. KeyboardInterrupt and
+        # asyncio.CancelledError are statements about the RUN — recording them
+        # here would turn Ctrl-C into a "case failure" and let the suite march
+        # on, so an operator could never actually stop it. They fall through to
+        # the finally (sandbox cleanup) and then propagate.
         result = _result_from_trajectory(
             case,
             _empty_trajectory(),
@@ -278,18 +291,21 @@ async def run_case(
         result.errors = [*result.errors, f"{type(exc).__name__}: {exc}"]
     finally:
         outcome = result
-        # Assigned on both the success and the recorded-failure path; the infra
-        # path raised out above and never reaches this finally.
-        assert outcome is not None
-        if outcome.duration_ms is None:
-            outcome.duration_ms = (marked.last() - marked.first()) / 1_000_000.0
-        keep = keep_sandbox_on_failure and not outcome.passed
-        if keep:
-            outcome.sandbox_kept = True
-            outcome.errors = [*outcome.errors, f"sandbox kept for inspection: {sandbox}"]
-        else:
+        if outcome is None:
+            # Cancellation path: no result to annotate, but the sandbox must
+            # still go, so Ctrl-C does not litter temp dirs.
             shutil.rmtree(sandbox, ignore_errors=True)
+        else:
+            if outcome.duration_ms is None:
+                outcome.duration_ms = (marked.last() - marked.first()) / 1_000_000.0
+            keep = keep_sandbox_on_failure and not outcome.passed
+            if keep:
+                outcome.sandbox_kept = True
+                outcome.errors = [*outcome.errors, f"sandbox kept for inspection: {sandbox}"]
+            else:
+                shutil.rmtree(sandbox, ignore_errors=True)
 
+    assert result is not None  # unreachable when cancelled; the raise above wins
     return result
 
 

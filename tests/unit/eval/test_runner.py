@@ -345,6 +345,85 @@ async def test_suite_aborts_on_infra_failure(monkeypatch: pytest.MonkeyPatch) ->
         await run_suite(cases, model="m", api_key="k", fixtures_dir=Path("x"))
 
 
+# --- cancellation is not a case failure ---
+
+
+async def test_keyboard_interrupt_propagates_not_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl-C must abort, not be laundered into a case failure.
+
+    Only Exception is a statement about the case; KeyboardInterrupt and
+    CancelledError are statements about the run, and recording them would
+    prevent the operator from actually stopping the suite.
+    """
+    import longline.eval.runner as mod
+
+    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+        class _FakeEngine:
+            async def submit(self, user_input: str, **kwargs: Any) -> Any:
+                raise KeyboardInterrupt
+                yield  # pragma: no cover
+
+        return SimpleNamespace(
+            registry=SimpleNamespace(list_tools=lambda: [FakeTool()]),
+            system_prompt="test", model=model, submit=_FakeEngine().submit,
+        )
+
+    monkeypatch.setattr(mod, "build_engine", _build_engine)
+    case = ToolCallCase(id="tc-kb", task="t")
+    with pytest.raises(KeyboardInterrupt):
+        await run_case(case, model="m", api_key="k", fixtures_dir=Path("x"))
+
+
+async def test_cancelled_error_propagates_not_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """asyncio cancellation must propagate so the task can actually cancel."""
+    import asyncio
+
+    import longline.eval.runner as mod
+
+    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+        class _FakeEngine:
+            async def submit(self, user_input: str, **kwargs: Any) -> Any:
+                raise asyncio.CancelledError
+                yield  # pragma: no cover
+
+        return SimpleNamespace(
+            registry=SimpleNamespace(list_tools=lambda: [FakeTool()]),
+            system_prompt="test", model=model, submit=_FakeEngine().submit,
+        )
+
+    monkeypatch.setattr(mod, "build_engine", _build_engine)
+    case = ToolCallCase(id="tc-cancel", task="t")
+    with pytest.raises(asyncio.CancelledError):
+        await run_case(case, model="m", api_key="k", fixtures_dir=Path("x"))
+
+
+async def test_cancellation_still_cleans_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Propagating a cancellation must not leak the temp sandbox."""
+    import longline.eval.runner as mod
+
+    seen: list[str] = []
+
+    def _build_engine(*, sandbox: str, model: str, api_key: str) -> Any:
+        seen.append(sandbox)
+
+        class _FakeEngine:
+            async def submit(self, user_input: str, **kwargs: Any) -> Any:
+                raise KeyboardInterrupt
+                yield  # pragma: no cover
+
+        return SimpleNamespace(
+            registry=SimpleNamespace(list_tools=lambda: [FakeTool()]),
+            system_prompt="test", model=model, submit=_FakeEngine().submit,
+        )
+
+    monkeypatch.setattr(mod, "build_engine", _build_engine)
+    case = ToolCallCase(id="tc-kb-clean", task="t")
+    with pytest.raises(KeyboardInterrupt):
+        await run_case(case, model="m", api_key="k", fixtures_dir=tmp_path)
+    assert len(seen) == 1
+    assert not Path(seen[0]).exists()
+
+
 async def test_exception_path_keeps_sandbox_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     import longline.eval.runner as mod
 
