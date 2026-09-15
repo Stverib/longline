@@ -185,7 +185,7 @@ uv run mypy longline/
 内置两层确定性评测（不依赖 LLM 主观打分）：
 
 - **工具调用准确率**（legacy）：`evals/tool_calls.jsonl`（30 条，已标 `legacy`）校验 Agent 是否按序选择正确工具、参数是否匹配正则（Read/Grep/Glob/Write/Edit/Bash）。
-- **端到端任务成功率（pass@1）**（legacy）：`evals/e2e.jsonl`（10 条，已标 `legacy`）在临时沙箱内跑真实任务，用文件内容/命令退出码判分。
+- **端到端任务成功率（pass@1）**：`evals/e2e.jsonl`（10 条）在临时沙箱内跑真实任务，用文件内容/命令退出码判分。该文件**未标 legacy**，将由计划 Task 3 扩充至 40 条。
 
 <!-- legacy exploratory: 以下数字保留仅为记录历史，不进入正式报告或简历。详见 evals/README.md §7 -->
 

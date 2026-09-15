@@ -27,29 +27,32 @@
 
 文件必须包含**完整运行元数据**（计划 §3.1），否则不构成有效基线：
 
+> **以下仅为字段格式示例，所有数值都是占位符，不是任何真实运行的结果。**
+> 本仓库当前**尚无**基线文件（见 §1）。禁止复制示例中的 `metrics` 数值当作实测数据。
+
 ```json
 {
   "run_id": "2026-09-20T10-00-00_claude-sonnet-4-20250514_e2e",
   "suite": "e2e",
   "variant": "baseline",
-  "model": "claude-sonnet-4-20250514",
+  "model": "<model-id>",
   "git_sha": "<40-hex>",
   "started_at": "2026-09-20T10:00:00+08:00",
-  "platform": "Windows-11-10.0.26200",
-  "python_version": "3.12.x",
+  "platform": "<platform>",
+  "python_version": "<py-version>",
   "case_file_sha256": "<64-hex>",
   "repeat_index": 0,
   "repeats_completed": 3,
 
   "metrics": {
     "task_success_rate": {
-      "numerator": 34,
-      "denominator": 40,
-      "value": 0.85,
-      "ci95_wilson": [0.705, 0.931]
+      "numerator": "<int>",
+      "denominator": "<int>",
+      "value": "<float>",
+      "ci95_wilson": ["<lo>", "<hi>"]
     },
     "by_category": {
-      "文件操作": {"numerator": 8, "denominator": 8, "value": 1.0, "ci95_wilson": [0.676, 1.0]}
+      "<category>": {"numerator": "<int>", "denominator": "<int>", "value": "<float>", "ci95_wilson": ["<lo>", "<hi>"]}
     }
   },
   "raw_results": [
@@ -58,7 +61,8 @@
     "evals/results/<run_id-3>/raw.jsonl"
   ],
   "failure_attribution": {
-    "model": 3, "runtime": 1, "tool": 1, "judge": 0, "fixture": 0, "infra": 1
+    "model": "<int>", "runtime": "<int>", "tool": "<int>",
+    "judge": "<int>", "fixture": "<int>", "infra": "<int>"
   }
 }
 ```
@@ -118,7 +122,8 @@
 ### 4.2 成熟阶段：硬化
 
 **积累 3 个版本**之后，CI 波动范围已经稳定，再把门槛**固定为硬阈值**
-（例如「Task Success Rate 不得低于基线 2 pp」）。
+（例如「Task Success Rate 不得低于基线 X pp」，具体 `X` 由届时的 CI 宽度决定，
+不预先写死）。
 硬化时必须**同时更新**本文件的 §4.1 描述和 baseline 文件，避免两处口径冲突。
 
 ### 4.3 CI 与运行频率

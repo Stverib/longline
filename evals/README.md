@@ -16,14 +16,22 @@
 | 路径 | 状态 | 说明 |
 |---|---|---|
 | `evals/tool_calls.jsonl` | **legacy** | 30 条工具调用用例。instruction-following 数据，**不进入简历主数字**。 |
-| `evals/e2e.jsonl` | **legacy** | 10 条端到端用例。仅为历史基线，**不进入简历主数字**。 |
+| `evals/e2e.jsonl` | **待扩充** | 10 条端到端用例。**尚未标 legacy**，见下方说明。 |
 | `evals/fixtures/` | 生效 | 沙箱起始状态。 |
 | `evals/results/` | 生效 | 运行产物，布局见 §3。 |
 | `evals/baselines/` | 生效 | 冻结基线，格式见 `evals/baselines/README.md`。 |
 
-两个 `.jsonl` 已通过逐行 `tags` 数组追加 `"legacy"` 标记（`tags` 本就是
+**关于 `tool_calls.jsonl`**：已通过逐行 `tags` 数组追加 `"legacy"` 标记（`tags` 本就是
 `longline/eval/types.py` 支持的字段，`from_dict` 对未知顶层键也会忽略，因此加载器行为不变）。
-标记后经 `load_cases()` 实测仍返回 **30 / 10** 条。
+标记后经 `load_cases()` 实测仍返回 **30 / 10** 条。计划 §5 Task 0 只授权标记这一个文件，
+因此 `e2e.jsonl` **保持原样**。
+
+**关于 `e2e.jsonl`**：这 10 条当前**不算 legacy**——它们没有工具名泄漏
+（全库扫描：`e2e.jsonl` 0 条，`tool_calls.jsonl` 10 条），任务文本只描述目标不指定手段，
+judge 也都检查最终产物。它们的缺陷是**样本量与覆盖面**（10 条不足以支撑 ±3% 的结论，
+且偏简单文件创建/修改），而这由计划 §5 Task 3 **扩充到 40 条**来解决，不是靠打 legacy 标记。
+Task 3 落地时，这 10 条应作为**正式用例**保留并归入对应类别；
+若届时判定其中某条不适用，再单独剔除。
 
 ### 为什么 legacy 数据不能当主数字
 
@@ -421,9 +429,11 @@ FalsePositiveRate = 被 DENY 或 ASK 门控的正常操作数 / 正常操作总�
 | `evals/tool_calls.jsonl` | 30 | 7344 | `cba5b42e6110f278755473bc89cd65579abf66856cdca3e801165c6d698760d8` |
 | `evals/e2e.jsonl` | 10 | 2640 | `dfcf06924784e37cd257fbe190722ce96d5f737a24bd6dab6bb5002445644cf1` |
 
-> **注意**：上述哈希对应**打 legacy 标记之前**的原始文件。打标记后两个文件分别为 7673 / 2749 字节，
-> 用例内容除 `tags` 新增 `"legacy"` 外**完全未变**，`load_cases()` 仍返回 30 / 10。
-> 本表数值作为「冻结时的原始数据指纹」保留。
+> **注意**：`tool_calls.jsonl` 的 sha256 对应**打 legacy 标记之前**的原始文件。
+> 打标记后该文件为 7673 字节（原 7344），用例内容除 `tags` 新增 `"legacy"` 外**完全未变**，
+> `load_cases()` 仍返回 30 条。本表数值作为「冻结时的原始数据指纹」保留。
+>
+> `e2e.jsonl` **未被标记**，当前仍与 `8855503` 完全一致（sha256 可直接校验）。
 
 ### 6.3 唯一一次原始结果
 
@@ -480,10 +490,10 @@ E2E pass@1      ~70–90%（平均 3.4 轮）
 - [ ] **任务文本不出现任何工具名**（针对盲测集）。搜索 `Read`、`Write`、`Edit`、`Glob`、`Grep`、
       `Bash`、`WebSearch`、`WebFetch`、`NotebookEdit`、`TaskCreate` 等词，以及「用 grep」「用 glob」
       这类中文表述。出现即**泄漏**，必须改写。
-      > 注：现有 legacy 数据中 **10 条**（`tc-003`、`tc-004`、`tc-006`、`tc-011`、`tc-012`、
-      > `tc-015`、`tc-018`、`tc-019`、`tc-028`、`tc-029`）直接点名工具
-      > （如「用 grep…」「用 glob…」「都用 Read」），正是反例，故整体标为 legacy。
-      > `e2e.jsonl` 未发现工具名泄漏。
+      > 注：全库扫描结果——`tool_calls.jsonl` 有 **10 条**泄漏
+      > （`tc-003`、`tc-004`、`tc-006`、`tc-011`、`tc-012`、`tc-015`、`tc-018`、`tc-019`、
+      > `tc-028`、`tc-029`），这正是它被标为 legacy 的原因之一；
+      > `e2e.jsonl` **0 条**泄漏，因此不标 legacy。
 - [ ] 任务描述的是**目标**（「在仓库里找出所有 TODO」），而不是**手段**（「用 Grep 找出…」）。
 - [ ] 显式指定工具的用例被正确打上 instruction-following 标签，且**不进入主数字**。
 
