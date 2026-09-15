@@ -98,7 +98,9 @@ def test_wilson_ci_widens_as_n_shrinks() -> None:
 def test_ratio_value_is_none_when_denominator_zero() -> None:
     r = Ratio(numerator=0, denominator=0)
     assert r.value is None
-    assert r.ci95_wilson() == (0.0, 1.0)
+    # Not (0.0, 1.0): a full-width interval would read as "measured, spans
+    # everything", which is exactly as wrong as reporting 0.0.
+    assert r.ci95_wilson() is None
 
 
 def test_ratio_value_and_ci_when_denominator_positive() -> None:
@@ -131,7 +133,16 @@ def test_ratio_to_dict_zero_denominator_uses_null_value() -> None:
     assert d["numerator"] == 0
     assert d["denominator"] == 0
     assert d["value"] is None
-    assert d["ci95_wilson"] == [0.0, 1.0]
+    # The interval must be null for the same reason the value is, and the key
+    # must stay present so a dashboard's shape does not change with the data.
+    assert "ci95_wilson" in d
+    assert d["ci95_wilson"] is None
+
+
+def test_ratio_to_dict_zero_denominator_value_and_ci_agree() -> None:
+    """`value` and `ci95_wilson` are null together, never one without the other."""
+    d = Ratio(0, 0).to_dict()
+    assert (d["value"] is None) == (d["ci95_wilson"] is None)
 
 
 def test_ratio_rejects_negative_counts() -> None:

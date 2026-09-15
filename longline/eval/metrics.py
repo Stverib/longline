@@ -89,18 +89,31 @@ class Ratio:
             return None
         return self.numerator / self.denominator
 
-    def ci95_wilson(self) -> tuple[float, float]:
-        """95% Wilson interval; (0.0, 1.0) when the denominator is 0."""
+    def ci95_wilson(self) -> tuple[float, float] | None:
+        """The 95% Wilson interval, or None when nothing was measured.
+
+        `wilson_ci` answers `(0.0, 1.0)` for a zero denominator, which is a
+        defensible answer to "the interval covering everything" — but as a
+        *report* it is a lie of the same size as `0.0`: it says an interval was
+        measured, and that it spans 0-100%. Nothing was measured. The rule for
+        `value` applies here too, so the interval cannot drift away from it.
+        """
+        if self.denominator == 0:
+            return None
         return wilson_ci(self.numerator, self.denominator)
 
     def to_dict(self) -> dict[str, object]:
-        """JSON-ready form: numerator, denominator, value, ci95_wilson."""
-        lo, hi = self.ci95_wilson()
+        """JSON-ready form: numerator, denominator, value, ci95_wilson.
+
+        The key is always present, null when not measured, so a reader's shape
+        does not change between a measured and an unmeasured ratio.
+        """
+        ci = self.ci95_wilson()
         return {
             "numerator": self.numerator,
             "denominator": self.denominator,
             "value": self.value,
-            "ci95_wilson": [lo, hi],
+            "ci95_wilson": None if ci is None else [ci[0], ci[1]],
         }
 
     @classmethod

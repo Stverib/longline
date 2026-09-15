@@ -200,9 +200,11 @@ def _fmt_pct(ratio: Ratio) -> str:
 
 
 def _fmt_ci(ratio: Ratio) -> str:
-    lo, hi = ratio.ci95_wilson()
-    if ratio.denominator == 0:
+    """`[10.8-60.3%]`, or `n/a` when the ratio was not measured."""
+    ci = ratio.ci95_wilson()
+    if ci is None:
         return "n/a"
+    lo, hi = ci
     return f"[{lo * 100:.1f}-{hi * 100:.1f}%]"
 
 
