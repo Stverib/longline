@@ -451,9 +451,20 @@ Process Kill 由真实子进程 kill + 新解释器 resume 实现。恢复路径
 新增 keyword-only 的 `report=` 出参（`TranscriptRepairReport`），默认 `None`，
 所有既有调用方行为不变；恢复用例据此逐例记录该字段。
 
-**验收对照**：`query_loop` 的重试上限与截断恢复上限改为参数（默认即原常量），
-`disable_recovery=True` 时传 0，因此**关闭恢复策略后对应故障不再恢复**——
-这是计划 §4.4 验收条件的可执行形式，两个方向都有测试。
+**验收对照**：`query_loop` 的三条恢复路径各有**独立预算参数**，默认值即原生产常量：
+
+| 参数 | 默认 | 管的路径 |
+|---|---:|---|
+| `max_retry` | 5 | 429/529 等瞬时错误的重试（指数退避） |
+| `max_max_output_recovery` | 3 | `max_tokens` 截断（先提额、后追加续写） |
+| `max_reactive_compaction` | 1 | 413 / `prompt_too_long`（响应式压缩） |
+
+三者**必须彼此独立**。若让一个预算去 gate 另一条路径（例如用截断预算去判断要不要压缩），
+生产行为就会改变：一旦截断恢复次数用尽，之后的 413 即使与截断毫无关系也会**无法自救而变成终态错误**。
+`drive_query_loop(disable_recovery=True)` 只归零重试与截断两个预算；
+413 那一条用 `disable_reactive_compaction=True` 单独关闭——**控制变量只关掉被测路径本身**。
+`test_faults.TestBudgetsAreIndependent` 用矩阵锁住这条性质：每个故障在其它两个预算归零时
+仍能恢复，只有自己的预算归零时才不恢复。
 
 **不得夸大的部分**：`duplicate_persisted_tool_calls` 只检查**已落盘的完整工具结果**
 是否被重复执行。落在「工具已产生副作用、结果尚未落盘」窗口内的 kill 归类为

@@ -335,7 +335,16 @@ class TestSideEffectClassification:
 
 
 class TestDriveQueryLoop:
-    """These run the production `query_loop` against a scripted injector."""
+    """These run the production `query_loop` against a scripted injector.
+
+    These use `disable_recovery`, which zeroes the RETRY and TRUNCATION budgets
+    together. That is a coarser control than `TestAcceptanceControl` uses, and it
+    is sound here only because each test asserts on one fault and the two
+    budgets are independent -- which
+    `test_each_budget_zeroes_only_its_own_arm` pins as a table. If that ever
+    stopped holding, these tests would be turning off a path they are not
+    measuring, and the table is what would notice.
+    """
 
     async def _drive(self, fault: str, *, indices: tuple[int, ...], disable: bool) -> tuple[Any, Any]:
         """Drive the loop with the back-off recorder injected, not monkeypatched.
@@ -530,3 +539,124 @@ def test_faults_module_has_no_path_to_the_users_home() -> None:
     assert "Path.home()" not in source
     assert '.claude' not in source
     assert "longline-recovery-claude" not in source
+
+
+# --- the eval-only engine seams stay eval-only ---
+
+
+class TestEngineSeamsAreEvalOnly:
+    """`QueryEngine` declares three attributes for the eval harness to write.
+
+    The claim is that production never writes them. If `core/` ever started
+    writing one, it would be a genuine problem -- an attribute that looks
+    eval-only but carries production state. This pins the claim so a future
+    edit cannot quietly make it false.
+    """
+
+    _SEAMS = ("injection_record", "fault_wrapper", "sleep_fn")
+
+    def _repo_root(self) -> Path:
+        return Path(faults.__file__).resolve().parents[2]
+
+    def test_no_production_module_writes_an_eval_seam(self) -> None:
+        writes: list[str] = []
+        for path in (self._repo_root() / "longline").rglob("*.py"):
+            if "eval" in path.parts:
+                continue
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                for seam in self._SEAMS:
+                    # A write is `<something>.<seam> = ...`; a read-through or a
+                    # declaration is not.
+                    if f".{seam} =" in stripped or f".{seam}=" in stripped:
+                        writes.append(f"{path.relative_to(self._repo_root())}:{lineno}")
+        assert writes == [], (
+            "production code writes an eval-only engine seam: "
+            f"{writes}"
+        )
+
+    def test_the_eval_harness_is_what_writes_them(self) -> None:
+        """The other half: something must write them, or the check above is vacuous."""
+        src = (self._repo_root() / "longline" / "eval" / "faults.py").read_text(
+            encoding="utf-8"
+        )
+        for seam in self._SEAMS:
+            assert f"engine.{seam} =" in src, seam
+
+    def test_query_engine_declares_all_three(self) -> None:
+        src = (self._repo_root() / "longline" / "core" / "query_engine.py").read_text(
+            encoding="utf-8"
+        )
+        for seam in self._SEAMS:
+            assert f"self.{seam}" in src, seam
+
+
+class TestBudgetsAreIndependent:
+    """One control knob must turn off exactly one recovery arm.
+
+    A negative control that zeroes a neighbouring budget is not testing what it
+    claims: the fault would fail to recover for a reason unrelated to the arm
+    under test. This asserts the whole matrix, so a future change that couples
+    two budgets is caught here rather than silently weakening every control.
+    """
+
+    async def _recovered(self, fault: str, messages: list[Any], **kwargs: Any) -> bool:
+        from longline.core.query_loop import query_loop
+        from longline.eval.recovery_runner import _scripted_compact_fn
+        from longline.tools.base import ToolRegistry
+
+        inj = ModelFaultInjector(
+            fault=fault, answer="marker=alpha-7f3c", at_call_indices=(1,),
+        )
+        async for _ in query_loop(
+            messages=list(messages), system_prompt="t", tools=ToolRegistry(),
+            call_model=inj, max_turns=10, auto_compact_fn=_scripted_compact_fn(),
+            sleep=_no_sleep, **kwargs,
+        ):
+            pass
+        return inj.recovered_at_call_index is not None
+
+    def _overflow_messages(self) -> list[Any]:
+        from longline.eval.recovery import load_recovery_cases
+        from longline.eval.recovery_runner import seed_messages
+
+        path = Path(faults.__file__).resolve().parents[2] / "evals" / "recovery.jsonl"
+        case = next(
+            c for c in load_recovery_cases(path) if c.fault == CONTEXT_OVERFLOW
+        )
+        return seed_messages(case)
+
+    @pytest.mark.parametrize(
+        ("fault", "own_budget"),
+        [
+            (RATE_LIMIT, "max_retry"),
+            (OUTPUT_TRUNCATE, "max_max_output_recovery"),
+            (CONTEXT_OVERFLOW, "max_reactive_compaction"),
+        ],
+    )
+    async def test_each_budget_zeroes_only_its_own_arm(
+        self, fault: str, own_budget: str,
+    ) -> None:
+        from longline.models.messages import UserMessage
+
+        messages = (
+            self._overflow_messages() if fault == CONTEXT_OVERFLOW
+            else [UserMessage(content="go")]
+        )
+        budgets = ("max_retry", "max_max_output_recovery", "max_reactive_compaction")
+        for budget in budgets:
+            kwargs = {budget: 0}
+            recovered = await self._recovered(fault, messages, **kwargs)
+            if budget == own_budget:
+                assert recovered is False, (
+                    f"zeroing {budget} must stop the {fault} recovery"
+                )
+            else:
+                assert recovered is True, (
+                    f"zeroing {budget} must NOT interfere with the {fault} "
+                    "recovery -- a control that does is testing the wrong path"
+                )

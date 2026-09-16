@@ -698,15 +698,23 @@ async def drive_query_loop(
     auto_compact_fn: Callable[..., Any] | None = None,
     max_turns: int = 10,
     disable_recovery: bool = False,
+    disable_reactive_compaction: bool = False,
     sleep: Any | None = None,
 ) -> LoopOutcome:
     """Run the production `query_loop` in-process over a scripted injector.
 
-    `disable_recovery=True` is the acceptance control (plan §4.4): it passes
-    `max_retry=0` and `max_max_output_recovery=0`, which are the two knobs that
-    turn the retry / truncation / overflow paths off. With the control on, the
-    corresponding fault must **not** recover. With it off, every argument is
-    `query_loop`'s own default, so the run is production behaviour.
+    Two independent controls, each turning off exactly the path under test:
+
+    - `disable_recovery=True` passes `max_retry=0` and
+      `max_max_output_recovery=0`, which are the retry and truncation budgets.
+      It deliberately does NOT touch `max_reactive_compaction`: a control that
+      switched off a neighbouring path would make the corresponding fault look
+      handled (or not) for a reason unrelated to the path being measured.
+    - `disable_reactive_compaction=True` passes `max_reactive_compaction=0`,
+      which is the 413 / prompt_too_long compaction arm.
+
+    With both unset, every argument is `query_loop`'s own default, so the run is
+    production behaviour.
 
     `sleep` is passed through to `query_loop`'s back-off parameter. Its default
     is None, which means the loop's own `asyncio.sleep` -- so a 429 retry here
@@ -725,6 +733,8 @@ async def drive_query_loop(
     if disable_recovery:
         kwargs["max_retry"] = 0
         kwargs["max_max_output_recovery"] = 0
+    if disable_reactive_compaction:
+        kwargs["max_reactive_compaction"] = 0
     if sleep is not None:
         kwargs["sleep"] = sleep
 

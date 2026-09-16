@@ -595,12 +595,20 @@ class TestAcceptanceControl:
     come from the fault simply not firing.
     """
 
-    async def _drive(self, case: RecoveryCase, *, disable: bool) -> Any:
+    async def _drive(
+        self, case: RecoveryCase, *, disable: bool, disable_compaction: bool = False,
+    ) -> Any:
         """Drive the loop with the back-off recorder injected, not monkeypatched.
 
         `sleep=_no_sleep` is a `query_loop` parameter. Patching `asyncio.sleep`
         would be process-global -- that name lives on the shared `asyncio`
         module -- and would leak into unrelated coroutines in the same process.
+
+        The two controls are SEPARATE budgets. `context_overflow` is turned off
+        with `max_reactive_compaction=0` (its own arm); the others with the retry
+        and truncation budgets. A single shared knob would disable a path the
+        case does not exercise, which is how a control stops testing what it
+        claims to.
         """
         from longline.eval.faults import ModelFaultInjector, drive_query_loop
         from longline.eval.recovery_runner import _scripted_compact_fn, seed_messages
@@ -612,13 +620,28 @@ class TestAcceptanceControl:
         return inj, await drive_query_loop(
             inj, messages=seed_messages(case),
             auto_compact_fn=_scripted_compact_fn(),
-            disable_recovery=disable, sleep=_no_sleep,
+            disable_recovery=disable,
+            disable_reactive_compaction=disable_compaction,
+            sleep=_no_sleep,
         )
+
+    def _control_kwargs(self, case: RecoveryCase) -> dict[str, bool]:
+        """Which budget turns THIS case's recovery path off.
+
+        Named per class so the control disables the arm under test rather than
+        a neighbour. `context_overflow` is the only class whose path is
+        compaction; everything else is retry or truncation.
+        """
+        if case.fault == CONTEXT_OVERFLOW:
+            return {"disable_compaction": True}
+        return {}
 
     @pytest.mark.parametrize("case_id", ["rec-429", "rec-truncate", "rec-overflow"])
     async def test_disabled_recovery_prevents_recovery(self, case_id: str) -> None:
         case = _case(case_id)
-        inj_off, out_off = await self._drive(case, disable=True)
+        inj_off, out_off = await self._drive(
+            case, disable=True, **self._control_kwargs(case),
+        )
         assert inj_off.injected is True, "the fault must still fire with recovery off"
         assert inj_off.recovered_at_call_index is None
         assert case.answer not in out_off.text
@@ -630,6 +653,44 @@ class TestAcceptanceControl:
         assert inj_on.injected is True
         assert inj_on.recovered_at_call_index is not None
         assert case.answer in out_on.text
+
+    async def test_overflow_is_terminal_when_only_its_own_budget_is_zero(self) -> None:
+        """The 413 control turns off compaction, not the retry/truncation budgets.
+
+        Pins the direction of the fix: `max_reactive_compaction=0` alone must be
+        enough to stop the overflow recovery, so the control is disabling the
+        arm the case actually exercises.
+        """
+        case = _case("rec-overflow")
+        inj, out = await self._drive(case, disable=False, disable_compaction=True)
+        assert inj.injected is True
+        assert out.compact_events == 0
+        assert case.answer not in out.text
+        assert out.error_events, "the loop must surface the 413, not fail silently"
+
+    async def test_truncation_budget_zero_does_not_close_the_compaction_arm(self) -> None:
+        """The regression guard for the defect this fix removes.
+
+        `max_max_output_recovery=0` disables truncation recovery only. A 413 in
+        the same run must still compact its way out -- the two budgets govern
+        unrelated faults, and previously the truncation budget also gated the
+        compaction arm, so a 413 could go terminal merely because a truncation
+        had used up its retries.
+        """
+        case = _case("rec-overflow")
+        inj, out = await self._drive(case, disable=True)
+        assert inj.injected is True
+        assert out.compact_events == 1, "the 413 must still compact its way out"
+        assert inj.recovered_at_call_index is not None
+        assert case.answer in out.text
+
+    async def test_compaction_budget_zero_does_not_close_the_truncation_arm(self) -> None:
+        """The mirror direction: zeroing compaction must not stop truncation."""
+        case = _case("rec-truncate")
+        inj, out = await self._drive(case, disable=False, disable_compaction=True)
+        assert inj.injected is True
+        assert inj.recovered_at_call_index is not None
+        assert case.answer in out.text
 
 
 # --- Process Kill, end to end ---
@@ -670,14 +731,45 @@ class TestProcessKillEndToEnd:
         assert any("exactly-once is NOT claimed" in n for n in run.notes)
 
     async def test_the_temp_claude_dir_is_removed(self) -> None:
+        """This run's claude_dir must be gone when the case returns.
+
+        Compares against the directories that appeared DURING the run, not the
+        whole set before and after. Each run uses a fresh random name, so a
+        set-equality check would fail whenever any other test in the process
+        happened to leave one behind -- a red result that says nothing about
+        this run.
+        """
         import tempfile
 
         from longline.eval.recovery_runner import CLAUDE_DIR_PREFIX
 
-        before = set(Path(tempfile.gettempdir()).glob(f"{CLAUDE_DIR_PREFIX}*"))
+        pattern = f"{CLAUDE_DIR_PREFIX}*"
+        tmp = Path(tempfile.gettempdir())
+        before = {p.name for p in tmp.glob(pattern)}
         await run_recovery_case(_case("rec-kill"), api_key="offline", fixtures_dir=FIXTURES)
-        after = set(Path(tempfile.gettempdir()).glob(f"{CLAUDE_DIR_PREFIX}*"))
-        assert after == before, "the harness leaked a claude_dir"
+        after = {p.name for p in tmp.glob(pattern)}
+        created = after - before
+        assert created == set(), f"this run leaked claude_dir(s): {sorted(created)}"
+
+    async def test_the_case_removes_its_claude_dir_even_when_it_fails(self) -> None:
+        """The cleanup lives in a `finally`, so a failed case must not leak either."""
+        import tempfile
+
+        from longline.eval.recovery_runner import CLAUDE_DIR_PREFIX
+
+        # A case that cannot succeed: the judge asserts on a value nothing produces.
+        case = RecoveryCase(
+            id="rec-kill-mutated", task=_case("rec-kill").task, fault=PROCESS_KILL,
+            answer="marker=alpha-7f3c", max_turns=8,
+            checks=[{"fn": "file_content", "args": {
+                "path": "answer.txt", "contains": r"a value that never appears"}}],
+        )
+        pattern = f"{CLAUDE_DIR_PREFIX}*"
+        tmp = Path(tempfile.gettempdir())
+        before = {p.name for p in tmp.glob(pattern)}
+        run = await run_recovery_case(case, api_key="offline", fixtures_dir=FIXTURES)
+        assert run.passed is False
+        assert {p.name for p in tmp.glob(pattern)} - before == set()
 
 
 def test_the_recovery_worker_is_runnable_as_a_module() -> None:

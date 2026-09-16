@@ -89,6 +89,7 @@ logger = logging.getLogger(__name__)
 # === 错误恢复常量（对应 TS: query.ts 中的同名常量） ===
 MAX_RETRY = 5                        # 429/529 等可恢复错误的默认重试上限（防止无限重试）
 MAX_OUTPUT_TOKENS_RECOVERY = 3       # max_tokens 截断后最多重试 3 次（追加 "请继续" 消息）
+MAX_REACTIVE_COMPACTION = 1          # 413 / prompt_too_long 后最多响应式压缩 1 次
 ESCALATED_MAX_TOKENS = 65536         # 第一次 max_tokens 截断时，将限制从 16K 提升到 64K
 DEFAULT_CONTEXT_WINDOW = 200_000     # Claude 3.5 的上下文窗口大小，用于 auto-compact 阈值计算
 
@@ -106,6 +107,7 @@ async def query_loop(
     permission_checker: Callable[..., object] | None = None,  # P2a wiring
     max_retry: int = MAX_RETRY,
     max_max_output_recovery: int = MAX_OUTPUT_TOKENS_RECOVERY,
+    max_reactive_compaction: int = MAX_REACTIVE_COMPACTION,
     sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> AsyncIterator[QueryEvent]:
     """Execute the core conversation loop.
@@ -117,13 +119,26 @@ async def query_loop(
     - T5.4: Auto-compact integration (token threshold detection)
     - Hooks: passed through to run_tools() for pre/post tool execution
 
-    `max_retry` and `max_max_output_recovery` are the two recovery budgets, and
-    they are parameters rather than module constants so a test can turn the
-    recovery path OFF and assert that the fault does not recover
-    (`tests/unit/eval/test_recovery_runner.py`). Both default to the production
-    constants, so every existing caller passes no argument and behaves exactly
-    as before. Turning a budget off makes the corresponding error terminal, not
-    silently absent: the loop still yields the ErrorEvent it always yielded.
+    `max_retry`, `max_max_output_recovery` and `max_reactive_compaction` are the
+    three recovery budgets, and they are parameters rather than module constants
+    so a test can turn a recovery path OFF and assert that the fault does not
+    recover. Each defaults to the production constant, so every existing caller
+    passes no argument and behaves exactly as before. Turning a budget off makes
+    the corresponding error terminal, not silently absent: the loop still yields
+    the ErrorEvent it always yielded.
+
+    The three are SEPARATE budgets because they govern three unrelated recovery
+    paths, and one path's budget must never gate another's:
+
+    - `max_retry` -- transient errors (429/529), the exponential-back-off arm;
+    - `max_max_output_recovery` -- max_tokens truncation, the escalate-then-
+      continue arm;
+    - `max_reactive_compaction` -- a 413 / prompt_too_long response, the
+      summarise-then-retry arm.
+
+    Coupling any two of these changes production behaviour: once the truncation
+    budget were exhausted, a later 413 could no longer compact its way out even
+    though compaction has nothing to do with truncation retries.
 
     `sleep` is the retry back-off, injected rather than read from the module.
     The default is `asyncio.sleep`, i.e. production behaviour; a caller may pass
@@ -232,9 +247,15 @@ async def query_loop(
             # 恢复策略 1: prompt_too_long (HTTP 413) → 响应式压缩
             # 与 Phase 1 的主动压缩不同，这里是 API 已经拒绝了请求后的被动应对
             if "413" in error_event.message or "prompt_too_long" in error_event.message:
+                # Gated on its OWN budget, not on the truncation one. Reactive
+                # compaction answers a context-length rejection; truncation
+                # recovery answers a max_tokens cutoff. They are unrelated
+                # faults, and letting one budget close the other's path would
+                # mean a 413 could go terminal merely because an earlier
+                # truncation had used up its retries.
                 if (
                     not has_attempted_reactive_compact
-                    and max_max_output_recovery > 0
+                    and max_reactive_compaction > 0
                     and auto_compact_fn is not None
                 ):
                     has_attempted_reactive_compact = True  # 只尝试一次，避免压缩-重试-压缩死循环
