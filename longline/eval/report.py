@@ -145,6 +145,33 @@ def _summarize_group(results: list[CaseResult]) -> GroupSummary:
     )
 
 
+def category_metrics(
+    results: list[CaseResult],
+    category: str,
+    *,
+    case_type: str | None = "e2e",
+) -> GroupSummary:
+    """Per-category aggregates, over the cases whose tags name this category.
+
+    The contract (§5.1) asks for each E2E category's success rate, average
+    rounds, tool calls, tokens, duration and failure types. `aggregate` already
+    buckets by **first tag**, which is right for the reporting layout but wrong
+    for a suite where a case can legitimately carry more than one tag: a case
+    tagged `["file-ops", "create"]` would then be invisible to a `create` query,
+    and one tagged in the other order would appear twice across two queries.
+
+    So this helper selects on *any* tag and ignores the bucket layout, which
+    makes the per-category numbers independent of tag order. `case_type` keeps
+    an E2E query from silently picking up tool-call cases that happen to share
+    a tag; pass None to search every case type.
+    """
+    selected = [
+        r for r in results
+        if category in r.tags and (case_type is None or r.case_type == case_type)
+    ]
+    return _summarize_group(selected)
+
+
 def _failure_type_counts(results: list[CaseResult]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for r in results:

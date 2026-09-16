@@ -12,15 +12,78 @@ Two case kinds, discriminated by the JSON `type` field:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterable
+
+
+# Tags that name an E2E reporting category rather than an incidental property
+# of the case. This tuple is the single source of the category vocabulary: the
+# loader validates against it, `report.category_metrics` is keyed by it, and
+# the dataset contract tests count against it. A free-form tag would let a typo
+# ("fileops") create a silent 7-case category that still sums to 40.
+E2E_CATEGORY_TAGS: tuple[str, ...] = (
+    "file-ops",
+    "code",
+    "retrieval",
+    "multi-tool",
+    "long-chain",
+)
 
 
 class CaseParseError(ValueError):
     """Raised when a case line is malformed or fails schema validation."""
+
+
+def resolve_fixture(
+    fixtures_root: Path,
+    name: str,
+    *,
+    case_id: str = "<unknown>",
+) -> Path:
+    """Resolve a case's `fixture` name to a directory inside `fixtures_root`.
+
+    Returns the **unresolved** ``fixtures_root / name`` path, because that is
+    what gets copied into a sandbox: resolving first would dereference a
+    fixture that is itself a symlink, and the sandbox would then be a copy of
+    an arbitrary directory somewhere else on disk. Containment is checked on
+    the resolved paths, so symlinks and ``..`` are both caught.
+
+    Raises CaseParseError rather than returning None: a fixture that escapes
+    the root is a data bug that would silently change what a case measures, and
+    it must fail at load time, not at the end of a paid run.
+    """
+    if not name or name in (os.curdir, os.pardir):
+        raise CaseParseError(f"{case_id}: empty or dot fixture name {name!r}")
+
+    candidate = fixtures_root / name
+    root = fixtures_root.resolve()
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise CaseParseError(
+            f"{case_id}: fixture {name!r} escapes the fixtures root "
+            f"({resolved} is not under {root})"
+        )
+    return candidate
+
+
+def validate_fixtures(
+    cases: Iterable[EvalCase],
+    fixtures_root: Path,
+) -> None:
+    """Check every referenced fixture stays inside `fixtures_root`.
+
+    Split out from the loader so it can run against any case file with any
+    fixtures root, and called from `load_cases` so the dataset contract holds
+    for every loader, not just the CLI's.
+    """
+    for case in cases:
+        if case.fixture is not None:
+            resolve_fixture(fixtures_root, case.fixture, case_id=case.id)
 
 
 @dataclass
@@ -172,43 +235,136 @@ class ToolCallCase(_CaseBase):
 
 @dataclass
 class E2ECase(_CaseBase):
-    """Layer-2 case: sandbox task with a deterministic judge.
+    """Layer-2 case: sandbox task with one or more deterministic checks.
 
     fixture: name of a subdirectory under evals/fixtures/ to copy into the
         sandbox as the starting state (optional).
-    judge: {"fn": <judge name>, "args": {...}}. Judge functions live in
-        longline/eval/judges.py and each receives (sandbox: Path, args: dict).
+    checks: the authoritative judge list — a list of ``{"fn": ..., "args": ...}``
+        entries. **All of them must pass** for the case to pass (contract §5.1).
+        A case that checks only its final artifact can be satisfied by a wrong
+        route, so multi-step tasks assert the final artifact *and* the key
+        intermediate state.
+    checks_mode: "all" (default) or "any". "any" exists for the genuinely
+        disjunctive case — an artifact that may legitimately be written in one
+        of two file formats, say. It is NOT a loosening knob: an "any" case is
+        satisfied by whichever single check hits, so the other checks are
+        redundant by construction. Build "all" unless the task really has
+        mutually exclusive success shapes.
+    judge: LEGACY single-check alias for ``checks``. When given on input it is
+        expanded to a one-element ``checks`` list, so every downstream reader
+        has exactly one shape to handle. This is the mirror image of
+        ToolCallCase.expect_tools: a *derived, input-only* view, never
+        back-filled from ``checks``.
     """
 
     fixture: str | None = None
+    checks: list[dict[str, Any]] = field(default_factory=list)
+    checks_mode: str = "all"
     judge: dict[str, Any] = field(default_factory=dict)
+
+    VALID_CHECKS_MODES = ("all", "any")
+
+    def __post_init__(self) -> None:
+        """Normalise the legacy single-judge form into a `checks` list.
+
+        Direct construction (tests, programmatic callers) must behave exactly
+        like `from_dict`: a case built with only ``judge`` would otherwise carry
+        an EMPTY checks list, which a lenient caller could read as "no
+        assertions", i.e. pass everything. The same reasoning as
+        ``ToolCallCase.__post_init__``.
+        """
+        if not self.checks and self.judge:
+            self.checks = [dict(self.judge)]
+        if self.checks_mode not in self.VALID_CHECKS_MODES:
+            raise CaseParseError(
+                f"checks_mode must be one of {list(self.VALID_CHECKS_MODES)}, "
+                f"got {self.checks_mode!r}"
+            )
+
+    @property
+    def num_checks(self) -> int:
+        return len(self.checks)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> E2ECase:
+        """Parse a case line, resolving `judge`/`checks` exactly once.
+
+        Setting both is an error rather than a silent precedence rule — the two
+        could name different judges, and "which one did the number come from"
+        must not depend on argument order in a dict.
+        """
         base = _CaseBase.from_dict(d)
         judge = d.get("judge")
-        if not isinstance(judge, dict):
-            raise CaseParseError(f"e2e case requires dict 'judge', got {d!r}")
+        checks = d.get("checks")
+        mode = d.get("checks_mode", "all")
+
+        if judge is not None and checks is not None:
+            raise CaseParseError(
+                f"e2e case must set either 'checks' or the legacy 'judge', not both: got {d!r}"
+            )
+        if judge is None and checks is None:
+            raise CaseParseError(f"e2e case requires 'checks' (or legacy 'judge'), got {d!r}")
+        if checks is None:
+            if not isinstance(judge, dict):
+                raise CaseParseError(f"e2e case requires dict 'judge', got {d!r}")
+            checks = [judge]
+        if not isinstance(checks, list) or not checks:
+            raise CaseParseError(f"e2e case requires a non-empty list 'checks', got {checks!r}")
+        if not isinstance(mode, str):
+            raise CaseParseError(f"checks_mode must be a str, got {mode!r}")
+
+        parsed: list[dict[str, Any]] = []
+        for entry in checks:
+            if not isinstance(entry, dict) or not isinstance(entry.get("fn"), str):
+                raise CaseParseError(
+                    f"each check must be a dict with a string 'fn', got {entry!r}"
+                )
+            parsed.append(entry)
+
         fixture = d.get("fixture")
         if fixture is not None and not isinstance(fixture, str):
             raise CaseParseError(f"fixture must be str or null, got {fixture!r}")
+
         return E2ECase(
             id=base.id,
             task=base.task,
             max_turns=base.max_turns,
             tags=base.tags,
             fixture=fixture,
-            judge=judge,
+            checks=parsed,
+            checks_mode=mode,
+            judge={} if judge is None else judge,
         )
+
+    def category_tag(self) -> str | None:
+        """The E2E reporting category this case belongs to, if any.
+
+        Returns None for an ad-hoc case built by a test or a CLI `--case-file`
+        that carries no category tag; such a case still counts toward
+        TaskSuccessRate (the contract excludes nothing) but is not reported
+        under a category heading.
+        """
+        for tag in E2E_CATEGORY_TAGS:
+            if tag in self.tags:
+                return tag
+        return None
 
 
 EvalCase = ToolCallCase | E2ECase
 
 
-def load_cases(path: Path) -> list[EvalCase]:
+def load_cases(path: Path, *, fixtures_root: Path | None = None) -> list[EvalCase]:
     """Load case definitions from a JSONL file, one case per line.
 
-    Raises CaseParseError on the first malformed or unknown line.
+    Raises CaseParseError on the first malformed or unknown line. When
+    `fixtures_root` is given, every case's fixture is additionally checked to
+    resolve inside it (see `validate_fixtures`).
+
+    `fixtures_root` defaults to ``<case file's directory>/fixtures``, which is
+    the layout `evals/` actually uses. Defaulting to None (i.e. "skip the
+    check") would mean the containment rule only applied to callers that
+    remembered to opt in, and the one caller that matters — the CLI load — is
+    exactly the one nobody remembers to update.
     """
     cases: list[EvalCase] = []
     for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -228,4 +384,7 @@ def load_cases(path: Path) -> list[EvalCase]:
             cases.append(E2ECase.from_dict(d))
         else:
             raise CaseParseError(f"{path}:{lineno}: unknown case type {ctype!r}")
+
+    root = Path(path).parent / "fixtures" if fixtures_root is None else fixtures_root
+    validate_fixtures(cases, root)
     return cases

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import pytest
 
 from longline.eval.judges import (
+    case_passed,
     check_args,
     check_tools,
     judge_case,
@@ -62,14 +64,23 @@ class TestLayer2Judges:
         assert judge_case("file_exists", tmp_path, {"path": "missing.py"}) is False
 
     def test_command_ok_exit_zero(self, tmp_path: Path) -> None:
-        assert judge_case("command_ok", tmp_path, {"command": "exit 0"}) is True
+        # 命令现在是参数列表 + allowlist,不再是 shell 字符串(见 TestLayer2CommandSecurity).
+        assert judge_case(
+            "command_ok", tmp_path,
+            {"command": ["python", "-c", "pass"], "allowed_commands": ["python"]},
+        ) is True
 
     def test_command_ok_exit_nonzero(self, tmp_path: Path) -> None:
-        assert judge_case("command_ok", tmp_path, {"command": "exit 2"}) is False
+        assert judge_case(
+            "command_ok", tmp_path,
+            {"command": ["python", "-c", "raise SystemExit(2)"], "allowed_commands": ["python"]},
+        ) is False
 
     def test_command_output_contains(self, tmp_path: Path) -> None:
         assert judge_case(
-            "command_output_contains", tmp_path, {"command": "echo success", "contains": "success"}
+            "command_output_contains", tmp_path,
+            {"command": ["python", "-c", "print('success')"], "contains": "success",
+             "allowed_commands": ["python"]},
         ) is True
 
     def test_unknown_judge_raises(self, tmp_path: Path) -> None:
@@ -220,3 +231,385 @@ class TestJudgeCaseArgs:
     def test_undeclared_tool_does_not_move_check_args(self) -> None:
         # 与 test_untested_tool_is_not_in_the_denominator 同一条规则在布尔层的表现.
         assert check_args([("Bash", {})], {"Read": {"file_path": r".*"}}) is True
+
+class TestLayer2CommandSecurity:
+    """命令判分必须走参数列表且受 allowlist 约束(契约 §8.4).
+
+    旧实现是 `subprocess.run(str(args["command"]), shell=True, ...)`,命令字符串
+    直接来自 `evals/*.jsonl`。任何能改那个文件的人(包括未来的 Agent)就能在宿主
+    上执行任意命令。下面这些测试钉住的就是那条通道已经关闭。
+    """
+
+    def test_argv_list_is_accepted(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "command_ok", tmp_path,
+            {"command": ["python", "-c", "raise SystemExit(0)"], "allowed_commands": ["python"]},
+        ) is True
+
+    def test_nonzero_exit_fails(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "command_ok", tmp_path,
+            {"command": ["python", "-c", "raise SystemExit(2)"], "allowed_commands": ["python"]},
+        ) is False
+
+    def test_shell_substitution_is_not_expanded(self, tmp_path: Path) -> None:
+        """`$(...)`/反引号/`%VAR%` 不再被 shell 展开,而是原样传给被调程序.
+
+        这是旧实现最直接的漏洞:`shell=True` 下命令字符串里任何位置都能塞进
+        `$(touch pwned)`,由 cmd.exe / /bin/sh 展开执行。现在没有 shell 参与,
+        整串作为 argv 的一个元素传给 python,而 python 只是把它当字符串打印。
+        """
+        for payload in ("$(echo hi)", "`echo hi`", "%PATH%", "&&", "|"):
+            proc = judge_case(
+                "command_output_contains", tmp_path,
+                {
+                    "command": ["python", "-c", "import sys; print(repr(sys.argv[1]))", payload],
+                    "contains": re.escape(payload),
+                    "allowed_commands": ["python"],
+                },
+            )
+            assert proc is True, f"{payload!r} was not passed through literally"
+        assert not (tmp_path / "hi").exists()
+
+    def test_metacharacter_after_a_valid_program_is_not_a_new_command(self, tmp_path: Path) -> None:
+        """`&&` 后面的内容不能变成第二条命令 —— 它只是被调程序的一个参数.
+
+        这里的判据是**副作用**,不是退出码:python 会忽略 `-c <code>` 之后多余的
+        argv,所以进程正常退出(returncode 0)。真正说明问题的是 `&&` 右侧的
+        `touch pwned` 没有被执行 —— 用户目录里没有多出文件。
+        """
+        marker = tmp_path / "pwned"
+        judge_case(
+            "command_ok", tmp_path,
+            {
+                "command": ["python", "-c", "pass", "&&", "touch", "pwned"],
+                "allowed_commands": ["python"],
+            },
+        )
+        assert not marker.exists(), "a second command was executed"
+
+    def test_undeclared_command_is_rejected(self, tmp_path: Path) -> None:
+        # 没有声明 allowlist 就把命令交给系统 = allowlist 形同虚设.
+        with pytest.raises(ValueError, match="allowed_commands"):
+            judge_case("command_ok", tmp_path, {"command": ["python", "-c", "pass"]})
+
+    def test_command_outside_the_allowlist_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not in the case's declared"):
+            judge_case(
+                "command_ok", tmp_path,
+                {"command": ["curl", "http://x"], "allowed_commands": ["python"]},
+            )
+
+    def test_path_shaped_program_is_rejected(self, tmp_path: Path) -> None:
+        # `./evil` 放在 fixture 里就能绕过 allowlist 的名字检查,必须按形状拒绝.
+        for prog in ("./evil", "/usr/bin/python", "C:\\tmp\\python.exe"):
+            with pytest.raises(ValueError, match="bare executable name"):
+                judge_case(
+                    "command_ok", tmp_path,
+                    {"command": [prog], "allowed_commands": ["python"]},
+                )
+
+    def test_basename_matching_allows_versioned_interpreter(self, tmp_path: Path) -> None:
+        # 声明 python 就该放行 python3.12 / python.exe,但不放行 pythonx.
+        assert judge_case(
+            "command_ok", tmp_path,
+            {"command": ["python3.12", "-c", "pass"], "allowed_commands": ["python"]},
+        ) is True
+        with pytest.raises(ValueError):
+            judge_case(
+                "command_ok", tmp_path,
+                {"command": ["pythonx", "-c", "pass"], "allowed_commands": ["python"]},
+            )
+
+    def test_string_command_is_shlex_split_not_shell_interpreted(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "command_output_contains", tmp_path,
+            {"command": "python -c print(42)", "contains": "42", "allowed_commands": ["python"]},
+        ) is True
+
+    def test_empty_command_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="empty command"):
+            judge_case("command_ok", tmp_path, {"command": [], "allowed_commands": ["python"]})
+
+
+class TestJsonValue:
+    def test_top_level_key(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text('{"app": "demo"}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["app"], "equals": "demo"}
+        ) is True
+
+    def test_nested_key_and_index(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text(
+            '{"servers": [{"port": 8000}, {"port": 9000}]}', encoding="utf-8"
+        )
+        assert judge_case(
+            "json_value", tmp_path,
+            {"path": "c.json", "key_path": ["servers", 1, "port"], "equals": 9000},
+        ) is True
+
+    def test_wrong_value_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text('{"port": 3000}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["port"], "equals": 8000}
+        ) is False
+
+    def test_int_and_string_are_not_interchangeable(self, tmp_path: Path) -> None:
+        # `"8000"` 不是 `8000`:宽松比较会放过任何严格下游都会拒绝的产物.
+        (tmp_path / "c.json").write_text('{"port": "8000"}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["port"], "equals": 8000}
+        ) is False
+
+    def test_float_and_int_compare_equal(self, tmp_path: Path) -> None:
+        # JSON 只有一个数字类型,写 80.0 并没有改变值.
+        (tmp_path / "c.json").write_text('{"n": 80.0}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["n"], "equals": 80}
+        ) is True
+
+    def test_bool_is_not_one(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text('{"flag": true}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["flag"], "equals": 1}
+        ) is False
+
+    def test_unparseable_json_fails_without_raising(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text("{not json", encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["a"], "equals": 1}
+        ) is False
+
+    def test_missing_file_fails(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "json_value", tmp_path, {"path": "nope.json", "key_path": ["a"], "equals": 1}
+        ) is False
+
+    def test_missing_path_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text('{"a": 1}', encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": ["b"], "equals": 1}
+        ) is False
+
+    def test_out_of_range_index_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "c.json").write_text("[1]", encoding="utf-8")
+        assert judge_case(
+            "json_value", tmp_path, {"path": "c.json", "key_path": [5], "equals": 1}
+        ) is False
+
+
+class TestLineSetEquals:
+    def test_exact_set_matches_regardless_of_order(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("b\na\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "f.txt", "equals": ["a", "b"]}
+        ) is True
+
+    def test_extra_line_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "f.txt", "equals": ["a", "b"]}
+        ) is False
+
+    def test_missing_line_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("a\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "f.txt", "equals": ["a", "b"]}
+        ) is False
+
+    def test_blank_lines_and_whitespace_are_ignored(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("\n  a  \n\n b \n\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "f.txt", "equals": ["a", "b"]}
+        ) is True
+
+    def test_not_contains_rejects_junk(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("a\nb\nDEBUG: leftover\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path,
+            {"path": "f.txt", "equals": ["a", "b", "DEBUG: leftover"], "not_contains": "DEBUG"},
+        ) is False
+
+    def test_duplicates_allowed_by_default(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("a\na\nb\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "f.txt", "equals": ["a", "b"]}
+        ) is True
+
+    def test_duplicates_rejected_when_disallowed(self, tmp_path: Path) -> None:
+        (tmp_path / "f.txt").write_text("a\na\nb\n", encoding="utf-8")
+        assert judge_case(
+            "line_set_equals", tmp_path,
+            {"path": "f.txt", "equals": ["a", "b"], "duplicates_allowed": False},
+        ) is False
+
+    def test_missing_file_fails(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "line_set_equals", tmp_path, {"path": "nope.txt", "equals": []}
+        ) is False
+
+
+class TestDirectorySnapshot:
+    def test_exact_file_set(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.txt").write_text("y", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path, {"path": ".", "equals": ["a.txt", "sub/b.txt"]}
+        ) is True
+
+    def test_stray_file_fails_exact_mode(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "scratch.tmp").write_text("junk", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path, {"path": ".", "equals": ["a.txt"]}
+        ) is False
+
+    def test_files_contains_is_the_weaker_form(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "scratch.tmp").write_text("junk", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path,
+            {"path": ".", "files_contains": ["a.txt"], "files_exact": False},
+        ) is True
+
+    def test_missing_required_file_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path,
+            {"path": ".", "files_contains": ["a.txt", "b.txt"], "files_exact": False},
+        ) is False
+
+    def test_min_size_rejects_an_empty_file(self, tmp_path: Path) -> None:
+        """`file_exists` 挡不住的「创建了但没写内容」必须被尺寸下限挡下."""
+        (tmp_path / "out.txt").write_text("", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path,
+            {"path": ".", "files_contains": ["out.txt"], "files_exact": False,
+             "min_sizes": {"out.txt": 1}},
+        ) is False
+        (tmp_path / "out.txt").write_text("done", encoding="utf-8")
+        assert judge_case(
+            "directory_snapshot", tmp_path,
+            {"path": ".", "files_contains": ["out.txt"], "files_exact": False,
+             "min_sizes": {"out.txt": 1}},
+        ) is True
+
+    def test_directories_are_ignored(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "empty_dir").mkdir()
+        assert judge_case(
+            "directory_snapshot", tmp_path, {"path": ".", "equals": ["a.txt"]}
+        ) is True
+
+    def test_missing_root_fails(self, tmp_path: Path) -> None:
+        assert judge_case(
+            "directory_snapshot", tmp_path, {"path": "nope", "equals": []}
+        ) is False
+
+
+class TestPythonTest:
+    def test_passing_test_succeeds(self, tmp_path: Path) -> None:
+        (tmp_path / "test_ok.py").write_text("def test_a():\n    assert 1 == 1\n", encoding="utf-8")
+        assert judge_case(
+            "python_test", tmp_path,
+            {"command": ["python", "-m", "pytest", "test_ok.py", "-q"],
+             "allowed_commands": ["python"]},
+        ) is True
+
+    def test_failing_test_fails(self, tmp_path: Path) -> None:
+        (tmp_path / "test_bad.py").write_text("def test_a():\n    assert 1 == 2\n", encoding="utf-8")
+        assert judge_case(
+            "python_test", tmp_path,
+            {"command": ["python", "-m", "pytest", "test_bad.py", "-q"],
+             "allowed_commands": ["python"]},
+        ) is False
+
+    def test_argv_only_no_shell(self, tmp_path: Path) -> None:
+        # 与 command_ok 共用同一条受控路径:命令字符串必须仍被 allowlist 拦下.
+        with pytest.raises(ValueError, match="not in the case's declared"):
+            judge_case(
+                "python_test", tmp_path,
+                {"command": ["rm", "-rf", "/"], "allowed_commands": ["python"]},
+            )
+
+    def test_declared_metadata_is_carried_in_args(self, tmp_path: Path) -> None:
+        # path/test/scope 只作报告用,不改变判定;它们必须存在且不报错.
+        (tmp_path / "test_ok.py").write_text("def test_a():\n    pass\n", encoding="utf-8")
+        assert judge_case(
+            "python_test", tmp_path,
+            {"command": ["python", "-m", "pytest", "-q"], "allowed_commands": ["python"],
+             "path": "test_ok.py", "test": "a", "scope": "sandbox"},
+        ) is True
+
+
+class TestCasePassed:
+    """复合 checks 默认全部通过才算成功(契约 §5.1)."""
+
+    def test_all_checks_must_pass(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+        passed, detail = case_passed(
+            [
+                {"fn": "file_exists", "args": {"path": "a.txt"}},
+                {"fn": "file_content", "args": {"path": "a.txt", "contains": "hello"}},
+            ],
+            tmp_path,
+        )
+        assert passed is True
+        assert [d["passed"] for d in detail] == [True, True]
+
+    def test_one_failing_check_fails_the_case(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+        passed, detail = case_passed(
+            [
+                {"fn": "file_exists", "args": {"path": "a.txt"}},
+                {"fn": "file_content", "args": {"path": "a.txt", "contains": "nope"}},
+            ],
+            tmp_path,
+        )
+        assert passed is False
+        # 逐条明细必须保留,失败报告要能指出是哪一条断言断的.
+        assert [d["passed"] for d in detail] == [True, False]
+        assert detail[1]["fn"] == "file_content"
+
+    def test_empty_checks_list_is_vacuously_passed(self, tmp_path: Path) -> None:
+        # 空列表在 all() 下为真 —— 但 E2ECase 在加载期就禁止空 checks,
+        # 所以这是「不该发生的输入」,这里只钉住函数本身的行为.
+        passed, detail = case_passed([], tmp_path)
+        assert passed is True
+        assert detail == []
+
+    def test_any_mode_passes_on_one_hit(self, tmp_path: Path) -> None:
+        (tmp_path / "a.json").write_text('{"k": 1}', encoding="utf-8")
+        passed, _ = case_passed(
+            [
+                {"fn": "file_exists", "args": {"path": "a.yaml"}},
+                {"fn": "file_exists", "args": {"path": "a.json"}},
+            ],
+            tmp_path,
+            mode="any",
+        )
+        assert passed is True
+
+    def test_any_mode_still_fails_when_nothing_hits(self, tmp_path: Path) -> None:
+        passed, _ = case_passed(
+            [{"fn": "file_exists", "args": {"path": "a.yaml"}}], tmp_path, mode="any"
+        )
+        assert passed is False
+
+    def test_a_raising_check_is_recorded_not_propagated(self, tmp_path: Path) -> None:
+        """一条坏 check 不能中止整轮 40 条 —— 记成失败并留下原因."""
+        passed, detail = case_passed(
+            [
+                {"fn": "no_such_judge", "args": {}},
+                {"fn": "file_exists", "args": {"path": "missing"}},
+            ],
+            tmp_path,
+        )
+        assert passed is False
+        assert detail[0]["error"] is not None
+        assert "unknown judge fn" in str(detail[0]["error"])
+
+    def test_bad_mode_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="checks_mode"):
+            case_passed([], tmp_path, mode="most")

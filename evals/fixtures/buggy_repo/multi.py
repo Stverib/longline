@@ -1,2 +1,3 @@
 def mul(a, b):
-    return a * b
+    # BUG: multiplication was written as addition.
+    return a + b

@@ -1,0 +1,6 @@
+region,service,requests,failures
+us-east,report,1200,3
+us-east,bulk,800,0
+eu-west,report,640,7
+eu-west,bulk,220,1
+ap-south,report,310,2

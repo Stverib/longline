@@ -468,6 +468,78 @@ async def test_missing_fixture_raises_before_sandbox_is_left_behind(tmp_path: Pa
         _prepare_sandbox(fixtures, "nope")
 
 
+async def test_fixture_escaping_the_root_is_rejected(tmp_path: Path) -> None:
+    """runner 是 fixture 名字到达文件系统之前的最后一道闸门.
+
+    `load_cases` 也会查,但编程构造的 case 不走 loader,所以这里必须独立拒绝。
+    """
+    from longline.eval.runner import _prepare_sandbox
+    from longline.eval.types import CaseParseError
+
+    fixtures = tmp_path / "fixtures"
+    (fixtures / "ok").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with pytest.raises(CaseParseError, match="escapes the fixtures root"):
+        _prepare_sandbox(fixtures, "../outside", case_id="e2e-x")
+    with pytest.raises(CaseParseError, match="escapes the fixtures root"):
+        _prepare_sandbox(fixtures, str(outside), case_id="e2e-x")
+
+
+async def test_e2e_case_with_multiple_checks_requires_all_to_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """契约 §5.1:复合 checks 默认全部通过才算成功."""
+    import longline.eval.runner as mod
+
+    fixtures = tmp_path / "fixtures"
+    (fixtures / "r").mkdir(parents=True)
+    (fixtures / "r" / "kept.txt").write_text("original\n", encoding="utf-8")
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TextDelta(text="done"),
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+
+    # 只有第一条 check 为真:整体必须判失败,且明细里能看出是哪条断的.
+    case = E2ECase(
+        id="e2e-multi", task="t", fixture="r",
+        checks=[
+            {"fn": "file_exists", "args": {"path": "kept.txt"}},
+            {"fn": "file_exists", "args": {"path": "never_created.txt"}},
+        ],
+    )
+    result = await run_case(case, model="m", api_key="k", fixtures_dir=fixtures)
+    assert result.passed is False
+    checks = result.detail["checks"]
+    assert isinstance(checks, list)
+    assert [c["passed"] for c in checks] == [True, False]
+    assert result.detail["checks_mode"] == "all"
+
+
+async def test_e2e_case_detail_keeps_the_legacy_judge_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧读者按 judge_fn/judge_args 读 detail 时仍然拿得到第一条 check."""
+    import longline.eval.runner as mod
+
+    fixtures = tmp_path / "fixtures"
+    (fixtures / "r").mkdir(parents=True)
+    (fixtures / "r" / "a.txt").write_text("hi", encoding="utf-8")
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TextDelta(text="done"), TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    case = E2ECase(
+        id="e2e-legacy", task="t", fixture="r",
+        judge={"fn": "file_content", "args": {"path": "a.txt", "contains": "hi"}},
+    )
+    result = await run_case(case, model="m", api_key="k", fixtures_dir=fixtures)
+    assert result.passed is True
+    assert result.detail["judge_fn"] == "file_content"
+    assert result.detail["judge_args"] == {"path": "a.txt", "contains": "hi"}
+
+
 async def test_run_suite_records_repeat_index(monkeypatch: pytest.MonkeyPatch) -> None:
     import longline.eval.runner as mod
 

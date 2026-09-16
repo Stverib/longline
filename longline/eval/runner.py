@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from longline.eval.engine_factory import build_engine
-from longline.eval.judges import judge_case, judge_case_args, judge_steps
+from longline.eval.judges import case_passed, judge_case_args, judge_steps
 from longline.eval.metrics import Ratio
 from longline.eval.trajectory import ToolCall, ToolExecution, extract_trajectory, infer_error_type
-from longline.eval.types import EvalCase, ToolCallCase
+from longline.eval.types import EvalCase, ToolCallCase, resolve_fixture
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -193,15 +193,21 @@ class CaseResult:
         }
 
 
-def _prepare_sandbox(fixtures_dir: Path, fixture: str | None) -> str:
+def _prepare_sandbox(fixtures_dir: Path, fixture: str | None, case_id: str = "<unknown>") -> str:
     """Create a temp sandbox, optionally seeded from a fixture copy.
+
+    The fixture name is resolved through `resolve_fixture`, which rejects
+    absolute paths and `..` escapes before anything is copied. The runner is
+    the last gate before a case's data touches the filesystem, so the check
+    lives here as well as at load time: a caller that builds cases
+    programmatically never goes through `load_cases`.
 
     On a fixture error the freshly created dir is removed before re-raising, so
     a misconfigured case cannot leak a temp dir on every run.
     """
     sandbox = Path(tempfile.mkdtemp(prefix="longline-eval-"))
     if fixture:
-        src = fixtures_dir / fixture
+        src = resolve_fixture(fixtures_dir, fixture, case_id=case_id)
         if not src.is_dir():
             shutil.rmtree(sandbox, ignore_errors=True)
             raise FileNotFoundError(f"fixture not found: {src}")
@@ -326,7 +332,7 @@ async def run_case(
     injectable so latency assertions are deterministic.
     """
     fixture = case.fixture  # both ToolCallCase and E2ECase carry fixture
-    sandbox = _prepare_sandbox(fixtures_dir, fixture)
+    sandbox = _prepare_sandbox(fixtures_dir, fixture, case_id=case.id)
 
     # Infra layer: built OUTSIDE the recording try, so a failure here
     # propagates. Only the sandbox is guaranteed cleaned up. BaseException is
@@ -360,11 +366,18 @@ async def run_case(
             result.detail = detail
             passed = _tool_case_passed(detail)
         else:  # E2ECase
-            judge_conf = case.judge
-            fn = str(judge_conf["fn"])
-            args = judge_conf.get("args", {})
-            passed = judge_case(fn, Path(sandbox), args)
-            result.detail = {"judge_fn": fn, "judge_args": args}
+            passed, check_detail = case_passed(
+                case.checks, Path(sandbox), mode=case.checks_mode,
+            )
+            result.detail = {
+                "checks_mode": case.checks_mode,
+                "checks": check_detail,
+                # Kept for readers written against the single-judge shape:
+                # the first check is the artifact assertion in every case that
+                # has more than one, and `checks` is the authoritative list.
+                "judge_fn": check_detail[0]["fn"] if check_detail else None,
+                "judge_args": check_detail[0]["args"] if check_detail else {},
+            }
 
         result.passed = passed
         result.error_type = infer_error_type(traj, passed=passed)
