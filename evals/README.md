@@ -23,6 +23,7 @@
 | `evals/e2e.jsonl` | **生效** | 40 条端到端用例，5 类 × 8，Task 3 产物。 |
 | `evals/compression.jsonl` | **生效** | 20 条长上下文用例，Task 4 产物。 |
 | `evals/recovery.jsonl` | **生效** | 6 条故障定义 × `repeat: 10` = **60 次运行**，Task 5 产物。 |
+| `evals/multi_agent.jsonl` | **生效** | 24 条单 Agent vs 多 Agent 用例（18 controlled + 6 exploratory），Task 7 产物。 |
 | `evals/fixtures/` | 生效 | 沙箱起始状态。 |
 | `evals/results/` | 生效 | 运行产物，布局见 §3。 |
 | `evals/baselines/` | 生效 | 冻结基线，格式见 `evals/baselines/README.md`。 |
@@ -541,6 +542,42 @@ TokenOverhead = (multi_tokens - single_tokens) / single_tokens
 **红线**：**必须采集所有子 Agent 的 Token 和 Tool Calls，不能只统计 leader。**
 Agent 数量固定并写入运行元数据；有文件写入的并行任务必须使用**互不重叠文件**或 **worktree 隔离**。
 
+#### 实现说明（Task 7，2026-09-17）
+
+**数据集**：`evals/multi_agent.jsonl` 共 **24 条**，分两组，**永不合并成一个数字**：
+
+| 组 | 条数 | 说明 |
+|---|---:|---|
+| `controlled` | 18 | 用例**预先声明** 4 个子任务（各写一个互不重叠的文件），`single` 由 1 个 Agent 顺序做完，`multi` 由 2–4 个 worker 并行做完再由 leader 汇总。两种 variant 做的是**同一份工作**。 |
+| `exploratory` | 6 | coordinator 自主拆解，**单独汇报**。与受控数字混在一起等于比较不同的工作。 |
+
+**子任务的 Token 与 Tool Calls 如何被采集**（红线的落点）：
+
+`InProcessTeammate._execute_with_query_loop` 自己迭代一条 `query_loop(...)`，
+只留 `TextDelta`、**丢弃 `TurnComplete.usage`**，其事件从不进入调用方的事件流。
+所以「只统计 leader」不是漏了一个字段，而是结构性的。
+
+可解之处在于 `query_loop` 的 `call_model` 类型是
+`Callable[..., AsyncIterator[QueryEvent]]`——**一个没有返回值的纯异步生成器**，
+它是本轮 usage 抵达循环的**唯一**通道。因此包住产出 `call_model` 的工厂，就把累加器
+放到了每个 Agent 每一轮的下方；没经过这个包装的 usage，循环本身也不可能看到。
+实现见 `longline/eval/child_usage.py`。
+
+**账目完整性是被检验的断言，不是假设**：`reconcile()` 比较「派生的 Agent 数」与
+「账本里有 turn 的 Agent 数」，不合就 `raise AccountingError`，而不是返回一个
+偏低却看着合理的 `TokenOverhead`。第二个独立见证是 `spawn_teammate` 写入
+`TaskRegistry` 的记录——它由派生路径产生，而不是由模型流产生，两者一致比任何
+单独一个都可信。**任何一方的分歧都会让该用例被标记
+`accounting_incomplete` 并退出比率分母，但保留在数据里**（静默缩小分母是一个看着正确的错数字）。
+
+**两个 fixture 是逐字节相同的兄弟树**（`parallel_repo_single` / `parallel_repo_multi`），
+由 loader 用 sha256 校验；不共用一棵树是因为 `_prepare_sandbox` 拷进临时沙箱，
+共用会让两条套件的改动互相牵动。**不重叠写入**同样在 loader 期拒绝。
+
+**离线与真实模型**：`model=None` 走离线协议——真实的 `QueryEngine`、真实工具、
+真实 `query_loop`、真实 `spawn_teammate`、真实判分器，只有模型传输是脚本化的。
+CLI 用 `--offline` 打开它。
+
 ### 5.7 Permission / Safety（**可选**，计划 §4.7）
 
 > **状态：可选。** 未完成前，Safety 数字不得出现在正式报告或简历中。
@@ -703,6 +740,9 @@ uv run --extra dev python -c "from pathlib import Path; from longline.eval.types
 
 # 恢复集：展开后的运行数与 50/10 分母（预期输出：60 50 10）
 uv run --extra dev python -c "from pathlib import Path; from longline.eval.recovery import load_recovery_cases; cs=load_recovery_cases(Path('evals/recovery.jsonl')); print(len(cs), sum(c.fault!='process_kill' for c in cs), sum(c.fault=='process_kill' for c in cs))"
+
+# 多 Agent 集：总数与 controlled/exploratory 拆分（预期输出：24 18 6）
+uv run --extra dev python -c "from pathlib import Path; from longline.eval.multi_agent import load_multi_agent_cases, group_of; cs=load_multi_agent_cases(Path('evals/multi_agent.jsonl')); print(len(cs), len(group_of(cs,'controlled')), len(group_of(cs,'exploratory')))"
 
 # 评测单测（含泄漏检查与数据集契约）
 uv run --extra dev pytest tests/unit/eval -q

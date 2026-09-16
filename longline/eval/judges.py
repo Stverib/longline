@@ -669,6 +669,42 @@ def judge_directory_snapshot(sandbox: Path, args: dict[str, Any]) -> bool:
     return True
 
 
+def judge_unexpected_paths(sandbox: Path, args: dict[str, Any]) -> bool:
+    """Pass when nothing was written BEYOND the declared artifact set.
+
+    The complement of `directory_snapshot`'s exact mode, for the one suite that
+    needs it: the multi-agent A/B judges a case by its declared subtask
+    artifacts, and the starting fixture legitimately contains files the task
+    does not touch. Pinning the whole tree would make the judge's expected set
+    a copy of the fixture listing rather than a statement about the task, so
+    this asserts the other half instead: the agent left no stray file behind in
+    the subtrees it was asked to write into.
+
+    `equals` is the allowed set (relative POSIX paths); `roots` are the
+    subtrees to scan (default: the sandbox root). Files the FIXTURE already
+    contained are not "unexpected" -- the case cannot know them without
+    restating the fixture -- so the caller passes the fixture's own listing in
+    `equals` alongside the declared artifacts, and only genuine strays fail.
+
+    Deliberately one-directional: it never asserts a declared path EXISTS. That
+    is `file_exists`'s job, and fusing the two would make a single check that
+    cannot say which of the two things went wrong.
+    """
+    allowed = {str(p).replace("\\", "/") for p in args.get("equals", [])}
+    roots = [str(r) for r in args.get("roots", ["."])]
+    for rel_root in roots:
+        root = sandbox / rel_root
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(sandbox).as_posix()
+            if rel not in allowed:
+                return False
+    return True
+
+
 _JUDGES: dict[str, Any] = {
     "file_content": judge_file_content,
     "file_exists": judge_file_exists,
@@ -678,6 +714,7 @@ _JUDGES: dict[str, Any] = {
     "line_set_equals": judge_line_set_equals,
     "python_test": judge_python_test,
     "directory_snapshot": judge_directory_snapshot,
+    "unexpected_paths": judge_unexpected_paths,
 }
 
 

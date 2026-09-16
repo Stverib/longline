@@ -343,6 +343,19 @@ MUTATIONS: dict[str, Mutation] = {
         # Broken: index.md was never created.
         lambda r: _write(r, "README.md", "# r\n"),
     ),
+    "unexpected_paths": (
+        {"equals": ["out/a.md", "out/b.md"], "roots": ["out"]},
+        lambda r: (_write(r, "out/a.md", "# a\n"), _write(r, "out/b.md", "# b\n")),
+        # Broken: a stray scratch file the task never asked for. The declared
+        # artifacts are all present and correct, so only the "and nothing else"
+        # half of the assertion rejects this -- which is the half this judge
+        # exists to check.
+        lambda r: (
+            _write(r, "out/a.md", "# a\n"),
+            _write(r, "out/b.md", "# b\n"),
+            _write(r, "out/scratch.tmp", "leftover\n"),
+        ),
+    ),
     "command_ok": (
         {
             "command": ["python", "-c", "import target; target.check()"],

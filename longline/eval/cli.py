@@ -28,9 +28,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from longline.eval.multi_agent import GROUPS, MAX_WORKERS, MIN_WORKERS, load_multi_agent_cases
+from longline.eval.multi_agent_runner import MULTI_AGENT_TAG
 from longline.eval.report import aggregate, paired_report_delta, render_markdown
 from longline.eval.runner import CaseResult, run_suite
 from longline.eval.types import E2ECase, EvalCase, ToolCallCase, load_cases
+from longline.models.messages import Usage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -59,24 +62,45 @@ REPORT_NAME = "report.md"
 # sanity checks and `case_file_sha256` from silently referencing nothing.
 # `tool_calls` stays pointed at the retired legacy file so old invocations keep
 # reproducing their old case set exactly.
+#
+# `multi_agent` is the Task 7 suite. Its cases carry a `group`, declared
+# subtasks and TWO sibling fixtures, none of which `EvalCase` has a field for,
+# so -- like `compression` -- it gets its own layer name rather than riding on
+# `e2e`: loading them as E2E would drop the subtask declarations and leave the
+# suite comparing two variants whose work it could no longer state.
 SUITES: dict[str, tuple[str, str]] = {
     "tool_calls": ("tool_calls.jsonl", "tool_call"),
     "tool_selection": ("tool_selection.jsonl", "tool_call"),
     "e2e": ("e2e.jsonl", "e2e"),
     "compression": ("compression.jsonl", "compression"),
     "latency": ("e2e.jsonl", "latency"),
+    "multi_agent": ("multi_agent.jsonl", "multi_agent"),
     "all": ("tool_calls.jsonl", "all"),
 }
 
-# Layer names accepted by --type. `compression` and `latency` are separate from
-# `e2e` for the reasons above.
-TYPE_CHOICES = ["tool_call", "e2e", "compression", "latency", "all"]
+# Layer names accepted by --type. `compression`, `latency` and `multi_agent` are
+# separate from `e2e` for the reasons above.
+TYPE_CHOICES = ["tool_call", "e2e", "compression", "latency", "multi_agent", "all"]
 
 # Case tags that partition the tool-selection suite. `--blind` / `--instruction`
 # are sugar over `--tag`, kept as flags because the two halves must never be
 # silently merged into one reported number.
 BLIND_TAG = "blind"
 INSTRUCTION_FOLLOWING_TAG = "instruction-following"
+
+# The per-turn usage the offline multi-agent transport reports.
+#
+# A constant, and documented as one, because a token count has to be SOMETHING
+# offline and leaving it at zero makes `TokenOverhead` permanently unmeasurable
+# (`(multi - single) / single` with `single = 0` is None) -- the headline metric
+# of the suite would silently never produce a number. It is deliberately NOT
+# tuned to flatter either arm: every agent of both variants reports the same
+# per-turn cost, so the fan-out's overhead is exactly the turns it ran, which is
+# the honest version of what a real model would show.
+#
+# A LIVE RUN MUST NOT USE THIS. `usage` is only passed when `--offline` is set;
+# with a real model the transport is the API and the usage is the API's.
+SCRIPTED_TURN_USAGE = Usage(input_tokens=1200, output_tokens=180)
 
 
 def _load_env_file() -> dict[str, str]:
@@ -235,6 +259,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "not, so lowering X shrinks the signal-to-jitter margin. See "
              "longline/eval/latency_runner.py's module docstring for the "
              "measured basis of the default.",
+    )
+    # --- Task 7 additions ---
+    p.add_argument(
+        "--group", choices=sorted(GROUPS), default=None, metavar="GROUP",
+        help="Multi-agent suite: restrict to one group. 'controlled' cases "
+             "pre-declare their independent subtasks, so both variants do the "
+             "same work; 'exploratory' cases let the coordinator decompose "
+             "freely. The two are reported separately and are never averaged "
+             "into one number (contract §5.6).",
+    )
+    p.add_argument(
+        "--offline", action="store_true",
+        help="Multi-agent suite: run the offline protocol. A real QueryEngine, "
+             "real tools, the real query_loop and a real spawn_teammate fan-out, "
+             "with the model transport scripted. Deterministic, free, and what "
+             "the committed dataset describes; the run records which mode "
+             "produced it.",
     )
     return p.parse_args(argv)
 
@@ -681,8 +722,189 @@ async def _run_latency(
     return 0
 
 
+async def _run_multi_agent(
+    args: argparse.Namespace,
+    *,
+    case_file: Path,
+    fixtures: Path,
+    out_dir: Path,
+    api_key: str,
+    run_id: str | None,
+) -> int:
+    """Run the Task 7 single- vs multi-agent A/B and write its report.
+
+    Its own body rather than the generic `_run`, for the same reason the
+    compression suite has one: one case yields TWO CaseResults (one per variant)
+    plus a usage ledger, and the headline numbers are ratios of durations and of
+    token counts rather than a pass rate. Both variants' shared tokens would be
+    meaningless if a reader averaged them into one.
+
+    The two groups are aggregated **separately** and rendered as two sections.
+    Contract §5.6 is explicit that the exploratory group is never mixed into the
+    controlled number: a controlled case pre-declares its subtasks so both arms
+    do the same work, while an exploratory case's coordinator decomposes freely,
+    and an average across the two would compare different work under one
+    heading.
+
+    `--run-id` is required for the same reason the other paired suites require
+    it: a number whose `raw.jsonl` does not exist is not a number
+    (`evals/README.md` §3), and this suite's numbers are exactly the kind that
+    get quoted without their backing.
+    """
+    from longline.eval.multi_agent import CONTROLLED, EXPLORATORY
+    from longline.eval.multi_agent_runner import (
+        aggregate_multi_agent,
+        run_multi_agent_suite,
+    )
+
+    if args.run_id is None:
+        raise SystemExit(
+            "the multi_agent suite needs --run-id: its numbers must be backed by "
+            "raw.jsonl under evals/results/<run_id>/ (evals/README.md §3)"
+        )
+
+    cases = load_multi_agent_cases(case_file)
+    if args.group is not None:
+        cases = [c for c in cases if c.group == args.group]
+    if args.tag is not None:
+        cases = [c for c in cases if args.tag in c.tags]
+    if args.max_cases is not None:
+        cases = cases[: args.max_cases]
+    if not cases:
+        raise SystemExit("no multi_agent cases selected -- check --case-file / --group / --tag")
+
+    run_id = run_id or make_run_id(args.model, "multi_agent")
+
+    runs = await run_multi_agent_suite(
+        cases, api_key=api_key, fixtures_dir=fixtures,
+        # `model=None` is the offline protocol: the transport is scripted, the
+        # engine and the fan-out are not. Either way the assertions are
+        # identical and the row records which mode produced it.
+        model=None if args.offline else args.model,
+        claude_dir=None,
+        usage=SCRIPTED_TURN_USAGE if args.offline else None,
+    )
+    summaries = [
+        aggregate_multi_agent(runs, group=group)
+        for group in (CONTROLLED, EXPLORATORY)
+        if any(r.group == group for r in runs)
+    ]
+
+    print(f"[eval] {len(runs)} multi-agent cases across {len(summaries)} group(s)")
+    for summary in summaries:
+        print(f"[eval]   group={summary.group}: {summary.num_cases} cases, "
+              f"{summary.eligible_cases} eligible, {summary.excluded_cases} excluded")
+        print(f"[eval]     SuccessRate single={_fmt_ratio(summary.single_success_rate)} "
+              f"multi={_fmt_ratio(summary.multi_success_rate)}")
+        print(f"[eval]     WallClockTime single={_fmt_ms(summary.single_wall_time_ms)} "
+              f"multi={_fmt_ms(summary.multi_wall_time_ms)}")
+        print(f"[eval]     Speedup={_fmt_ratio_value(summary.mean_speedup)} "
+              f"(ratio of durations, not pp)")
+        print(f"[eval]     TokenOverhead={_fmt_ratio_value(summary.mean_token_overhead)} "
+              f"single_total={summary.single_tokens['total_tokens']} "
+              f"multi_total={summary.multi_tokens['total_tokens']} "
+              f"multi_child={summary.multi_tokens['child_tokens']}")
+        print(f"[eval]     ToolCalls single={summary.single_tool_calls} "
+              f"multi={summary.multi_tool_calls} | agent_counts={summary.agent_counts}")
+
+    results: list[CaseResult] = []
+    for run in runs:
+        results.extend(_multi_agent_results(run))
+
+    metadata = run_metadata(
+        run_id=run_id, suite="multi_agent", variant=args.variant, model=args.model,
+        case_file=case_file, repeat_index=0, repeats_completed=1,
+    )
+    metadata["multi_agent"] = {
+        "groups": [s.group for s in summaries],
+        "agent_counts": sorted({c for s in summaries for c in s.agent_counts}),
+        "worker_range": [MIN_WORKERS, MAX_WORKERS],
+    }
+
+    # `raw.jsonl` carries BOTH row shapes, tagged so a reader can tell them
+    # apart. The paired row (one per case, both arms on one line) is what makes
+    # the summary's ratios recomputable -- `Speedup` needs both durations and
+    # `TokenOverhead` needs both token counts, and neither can be recovered from
+    # two separate per-variant rows. The per-variant CaseResults are there for
+    # the generic tables and are never a substitute for the paired row.
+    run_dir = out_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / RAW_NAME).open("w", encoding="utf-8") as fh:
+        for run in runs:
+            fh.write(json.dumps(tagged(run.to_row()), ensure_ascii=False) + "\n")
+        for result in results:
+            fh.write(json.dumps(tagged(result.to_raw_dict()), ensure_ascii=False) + "\n")
+    (run_dir / SUMMARY_NAME).write_text(
+        json.dumps(
+            {"metadata": metadata, "multi_agent": {s.group: s.to_dict() for s in summaries}},
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / REPORT_NAME).write_text(
+        render_markdown(
+            aggregate(results), multi_agent={s.group: s for s in summaries},
+        ),
+        encoding="utf-8",
+    )
+    print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+    print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+    print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+    return 0
+
+
+def tagged(row: dict[str, object]) -> dict[str, object]:
+    """Mark a raw row with the suite tag, so a reader can tell the two row
+    shapes in `raw.jsonl` apart without guessing from their keys."""
+    tags = row.get("tags")
+    row["tags"] = [MULTI_AGENT_TAG, *(tags if isinstance(tags, list) else [])]
+    return row
+
+
+def _multi_agent_results(run: object) -> list[CaseResult]:
+    """The two per-variant `CaseResult`s a multi-agent run contributes.
+
+    Returned so the generic `aggregate()` has something to summarise (the
+    per-case tables and the latency percentiles), while the suite's OWN metrics
+    come from the summary objects. The variant label is what keeps the two arms
+    from being pooled into one row there.
+    """
+    out: list[CaseResult] = []
+    for variant in (run.single, run.multi):  # type: ignore[attr-defined]
+        result = CaseResult(
+            case_id=run.case_id,  # type: ignore[attr-defined]
+            case_type="multi_agent",
+            passed=variant.passed,
+            duration_ms=variant.duration_ms,
+            input_tokens=variant.input_tokens,
+            output_tokens=variant.output_tokens,
+            variant=variant.variant,
+            tags=[MULTI_AGENT_TAG],
+            errors=list(variant.errors) + ([variant.accounting_error] if variant.accounting_error else []),
+        )
+        result.detail = {
+            "subtask_verdicts": variant.subtask_verdicts,
+            "agent_count": variant.agent_count,
+            "child_tokens": variant.ledger.child_tokens(),
+            "accounts": variant.accounts,
+            "offline": variant.offline,
+        }
+        out.append(result)
+    return out
+
+
 def _fmt_latency(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.3f}ms"
+
+
+def _fmt_ms(value: float | None) -> str:
+    """A wall-clock duration for the console, `n/a` when not measured.
+
+    Distinct from `report._fmt_ms` only because the console prints before the
+    report exists; both render None as `n/a` for the same reason -- a run whose
+    duration was never taken is not a run that took 0 ms.
+    """
+    return "n/a" if value is None else f"{value:.1f}ms"
 
 
 def _fmt_ratio_value(value: object) -> str:
@@ -719,6 +941,15 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     if args.type == "latency" or args.suite == "latency":
         return await _run_latency(
             args, case_file=case_file, out_dir=out_dir, run_id=args.run_id,
+        )
+
+    # The multi-agent suite, for the same reason: one case yields two CaseResults
+    # plus a usage ledger, and its headline numbers are a ratio of durations and
+    # a ratio of token counts rather than a pass rate.
+    if args.type == "multi_agent" or args.suite == "multi_agent":
+        return await _run_multi_agent(
+            args, case_file=case_file, fixtures=fixtures, out_dir=out_dir,
+            api_key=api_key, run_id=args.run_id,
         )
 
     cases = load_cases(case_file)

@@ -26,6 +26,7 @@ from longline.eval.types import E2E_CATEGORY_TAGS
 if TYPE_CHECKING:
     from longline.eval.compression_runner import CompressionSummary
     from longline.eval.latency_runner import LatencySummary
+    from longline.eval.multi_agent_runner import MultiAgentSummary
     from longline.eval.runner import CaseResult
 
 # Case tags that decide the ToolSelectionCaseAccuracy denominator. A blind case
@@ -444,6 +445,7 @@ def render_markdown(
     baseline_label: str | None = None,
     compression: CompressionSummary | None = None,
     latency: LatencySummary | None = None,
+    multi_agent: dict[str, MultiAgentSummary] | None = None,
 ) -> str:
     """Render the report as a compact markdown table + summary lines.
 
@@ -451,12 +453,19 @@ def render_markdown(
     `baseline` report is supplied, success-rate differences are rendered in
     **percentage points** (`-3.0 pp`), never as a relative percent.
 
-    `compression` adds the Task 4 section and `latency` the Task 6 one. They are
-    separate arguments rather than fields on `EvalReport` because neither suite's
-    metrics compose with the E2E ones: compression has its own denominators
-    (facts, eligible cases) and latency's headline number is a ratio of two
-    durations, not a rate at all. Folding either in would invite someone to
-    average across suites.
+    `compression` adds the Task 4 section, `latency` the Task 6 one and
+    `multi_agent` the Task 7 one. They are separate arguments rather than fields
+    on `EvalReport` because none of those suites' metrics compose with the E2E
+    ones: compression has its own denominators (facts, eligible cases), latency's
+    headline number is a ratio of two durations, and multi-agent's is a ratio of
+    durations plus a ratio of token counts. Folding any of them in would invite
+    someone to average across suites.
+
+    `multi_agent` is keyed by GROUP (`controlled` / `exploratory`) and rendered
+    as one section per group. Contract §5.6 requires those to be reported
+    separately -- a controlled case pre-declares its subtasks so both arms do the
+    same work, while an exploratory case's coordinator decomposes freely, so a
+    pooled number would be comparing different work under one heading.
     """
     lines = [
         "# Agent Evaluation Report",
@@ -538,6 +547,9 @@ def render_markdown(
 
     if latency is not None:
         lines += _latency_lines(latency)
+
+    if multi_agent:
+        lines += _multi_agent_lines(multi_agent)
 
     if report.by_category:
         lines += [
@@ -728,6 +740,121 @@ def _latency_lines(summary: LatencySummary) -> list[str]:
 def _fmt_pct_ratio(value: float | None) -> str:
     """A ratio rendered as a signed percent change; `pp` is never used here."""
     return "n/a" if value is None else f"{value * 100:+.1f}%"
+
+
+def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
+    """The Task 7 section: one block per group, never one pooled number.
+
+    Three things this section is careful about:
+
+    - **`Speedup` and `TokenOverhead` are ratios, not `pp` differences.** The
+      contract's `pp` unit (§4.3) belongs to success rates; a 2x speedup is
+      `+100%` of a duration ratio, and calling it "100 pp" would invent a
+      numerator and denominator that do not exist. So they are printed as signed
+      percent changes with their units named.
+    - **The child tokens are shown next to every total.** The §5.6 red line is
+      that the leader's usage alone is not the run's usage, so a reader must be
+      able to see how much of the fan-out's cost came from its children -- and a
+      bug that dropped them would show as `child=0` rather than as a total that
+      merely looks small.
+    - **The excluded cases are listed, not dropped.** A case whose accounting did
+      not reconcile leaves the ratio denominators but stays visible with its
+      reason, because a silently-shrunk denominator is a wrong number that looks
+      right -- the same rule the compression section follows.
+    """
+    lines: list[str] = [
+        "",
+        "## Single-agent vs multi-agent (paired A/B)",
+        "",
+        "> `Speedup` is `single_wall_time / multi_wall_time` and `TokenOverhead` is "
+        "`(multi - single) / single` -- both **ratios**, never differences in "
+        "percentage points (contract §5.6 / §4.3). `pp` is reserved for success "
+        "rates. Tokens include **every** sub-agent, not only the leader.",
+    ]
+
+    for group, summary in sorted(summaries.items()):
+        lines += [
+            "",
+            f"### Group: `{group}`",
+            "",
+            (
+                "> Controlled cases pre-declare their independent subtasks, so both "
+                "variants do the same work. Exploratory cases let the coordinator "
+                "decompose freely and are **not** comparable with them."
+                if group == "controlled"
+                else "> Exploratory cases let the coordinator decompose freely; the "
+                "two variants may not have done the same work, so this group is "
+                "reported on its own and never merged with the controlled number."
+            ),
+            "",
+            f"- **Cases:** {summary.num_cases} total, {summary.eligible_cases} eligible, "
+            f"{summary.excluded_cases} excluded (a variant did not complete or its "
+            "token accounting did not reconcile)",
+            f"- **Agent counts (multi arm):** {summary.agent_counts or 'n/a'}",
+            "",
+            "| metric | value | 95% Wilson CI | numerator / denominator |",
+            "|---|---|---|---|",
+            _metric_row(
+                "SuccessRate single_agent",
+                summary.single_success_rate,
+                "判分通过的单 Agent 用例 / 用例总数",
+            ),
+            _metric_row(
+                "SuccessRate multi_agent",
+                summary.multi_success_rate,
+                "判分通过的多 Agent 用例 / 用例总数",
+            ),
+            (
+                f"| Speedup | {_fmt_pct_ratio(summary.mean_speedup)} "
+                f"(ratio of durations) | n/a | mean over "
+                f"{summary.eligible_cases} per-case `single / multi` ratios |"
+            ),
+            (
+                f"| TokenOverhead | {_fmt_pct_ratio(summary.mean_token_overhead)} "
+                f"(ratio) | n/a | mean over {summary.eligible_cases} per-case "
+                "`(multi - single) / single` ratios |"
+            ),
+            "",
+            "| variant | WallClockTime | in tok | out tok | total tok | child tok | tool calls |",
+            "|---|---|---|---|---|---|---|",
+            f"| single_agent | {_fmt_ms(summary.single_wall_time_ms)} | "
+            f"{summary.single_tokens['input_tokens']} | "
+            f"{summary.single_tokens['output_tokens']} | "
+            f"{summary.single_tokens['total_tokens']} | "
+            f"{summary.single_tokens['child_tokens']} | {summary.single_tool_calls} |",
+            f"| multi_agent | {_fmt_ms(summary.multi_wall_time_ms)} | "
+            f"{summary.multi_tokens['input_tokens']} | "
+            f"{summary.multi_tokens['output_tokens']} | "
+            f"{summary.multi_tokens['total_tokens']} | "
+            f"{summary.multi_tokens['child_tokens']} | {summary.multi_tool_calls} |",
+            "",
+            "### Per-case (this group)",
+            "",
+            "| case | workers | single pass | multi pass | single ms | multi ms | "
+            "speedup | single tok | multi tok | multi child tok | excluded |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for row in summary.per_case:
+            single = row["single"]
+            multi = row["multi"]
+            assert isinstance(single, dict) and isinstance(multi, dict)
+            single_ms = _as_float(single["duration_ms"])
+            multi_ms = _as_float(multi["duration_ms"])
+            speedup = (
+                None
+                if not single_ms or not multi_ms
+                else single_ms / multi_ms
+            )
+            excluded = "yes" if row["excluded_from_denominator"] else "-"
+            if row["exclusion_reason"]:
+                excluded = f"yes ({row['exclusion_reason']})"
+            lines.append(
+                f"| {row['case_id']} | {row['workers']} | {single['passed']} | "
+                f"{multi['passed']} | {_fmt_ms(single_ms)} | {_fmt_ms(multi_ms)} | "
+                f"{_fmt_pct_ratio(speedup)} | {single['total_tokens']} | "
+                f"{multi['total_tokens']} | {multi['child_tokens']} | {excluded} |"
+            )
+    return lines
 
 
 def _fmt_num(value: float | None, digits: int) -> str:
