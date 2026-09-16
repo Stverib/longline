@@ -58,6 +58,54 @@ class TestLayer2Judges:
     def test_file_content_missing_file_fails(self, tmp_path: Path) -> None:
         assert judge_case("file_content", tmp_path, {"path": "nope.txt", "contains": "x"}) is False
 
+    # --- Anchored patterns are LINE-anchored, not whole-file anchored. ---
+    #
+    # Regression guard. `judge_file_content` used to run `re.search` without
+    # `re.MULTILINE`, so `^`/`$` bound to the whole string and an assertion like
+    # `^PORT = 3000$` only matched a file whose first and last characters were
+    # exactly that line. 25 assertions across 15 E2E cases were dead that way:
+    # a perfectly correct artifact scored zero, and nothing noticed because no
+    # test required a correct artifact to PASS — only that fixtures were not
+    # pre-satisfied.
+
+    def test_file_content_anchored_pattern_matches_an_inner_line(self, tmp_path: Path) -> None:
+        """`^PORT = 3000$` must match line 2 of a multi-line file."""
+        (tmp_path / "config.py").write_text('HOST = "x"\nPORT = 3000\nDEBUG = True\n', encoding="utf-8")
+        assert judge_case(
+            "file_content", tmp_path, {"path": "config.py", "contains": "^PORT = 3000$"}
+        ) is True
+
+    def test_file_content_anchored_pattern_rejects_a_non_matching_inner_line(self, tmp_path: Path) -> None:
+        """The same assertion must still FAIL when the line differs."""
+        (tmp_path / "config.py").write_text('HOST = "x"\nPORT = 8080\nDEBUG = True\n', encoding="utf-8")
+        assert judge_case(
+            "file_content", tmp_path, {"path": "config.py", "contains": "^PORT = 3000$"}
+        ) is False
+
+    def test_file_content_header_row_of_a_table_matches(self, tmp_path: Path) -> None:
+        """Markdown-table rows: every anchored row must match, not just the first."""
+        (tmp_path / "report.md").write_text(
+            "| stage | total |\n| alpha | 10 |\n| beta | 15 |\n", encoding="utf-8"
+        )
+        for row in (r"^\| stage \| total \|$", r"^\| alpha \| 10 \|$", r"^\| beta \| 15 \|$"):
+            assert judge_case("file_content", tmp_path, {"path": "report.md", "contains": row}) is True, row
+
+    def test_file_content_not_contains_anchored_pattern_is_effective(self, tmp_path: Path) -> None:
+        """`not_contains` with an anchor must actually detect the line.
+
+        Without MULTILINE the inner regex could not match, so the negated check
+        was unconditionally True — the assertion was not merely loose, it was
+        inert, and every artifact passed it.
+        """
+        (tmp_path / "a.txt").write_text("Status\nReviewed\nDone\n", encoding="utf-8")
+        assert judge_case(
+            "file_content", tmp_path, {"path": "a.txt", "not_contains": "^Reviewed$"}
+        ) is False
+        (tmp_path / "b.txt").write_text("Status\nPending\n", encoding="utf-8")
+        assert judge_case(
+            "file_content", tmp_path, {"path": "b.txt", "not_contains": "^Reviewed$"}
+        ) is True
+
     def test_file_exists(self, tmp_path: Path) -> None:
         (tmp_path / "x.py").write_text("", encoding="utf-8")
         assert judge_case("file_exists", tmp_path, {"path": "x.py"}) is True

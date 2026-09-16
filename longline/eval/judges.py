@@ -460,14 +460,28 @@ def paths_equivalent(program: str, interpreter: str) -> bool:
 
 
 def judge_file_content(sandbox: Path, args: dict[str, Any]) -> bool:
+    """Match `contains` / `not_contains` regexes against a file's text.
+
+    `re.MULTILINE` is on by default. A case author who writes `^PORT = 3000$`
+    means "this line is present", and that is the only reading anyone has ever
+    intended — nobody anchors a `contains` pattern to the start and end of an
+    entire file, because that would pin the file's first and last characters.
+    Without MULTILINE, `^` and `$` bind to the whole string, so every anchored
+    assertion silently became "the file begins AND ends with this" and failed
+    correct artifacts. 25 assertions across 15 cases were dead that way.
+
+    `(?m)` is still accepted in a pattern (it is a no-op here), and a pattern
+    that deliberately wants whole-file anchoring can use `\\A` / `\\Z`.
+    """
     path = sandbox / str(args["path"])
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8", errors="replace")
-    if "contains" in args and re.search(str(args["contains"]), text, re.IGNORECASE) is None:
+    flags = re.IGNORECASE | re.MULTILINE
+    if "contains" in args and re.search(str(args["contains"]), text, flags) is None:
         return False
     return not ("not_contains" in args
-                and re.search(str(args["not_contains"]), text, re.IGNORECASE) is not None)
+                and re.search(str(args["not_contains"]), text, flags) is not None)
 
 
 def judge_file_exists(sandbox: Path, args: dict[str, Any]) -> bool:
