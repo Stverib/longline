@@ -211,7 +211,13 @@ def _prepare_sandbox(fixtures_dir: Path, fixture: str | None, case_id: str = "<u
         if not src.is_dir():
             shutil.rmtree(sandbox, ignore_errors=True)
             raise FileNotFoundError(f"fixture not found: {src}")
-        shutil.copytree(src, sandbox, dirs_exist_ok=True)
+        # 忽略 __pycache__ / .pytest_cache: 在 fixtures/ 里跑过测试留下的字节码
+        # 缓存会被 copytree 原样搬进沙箱. 陈旧的 .pyc 配上比它更旧的源文件时间戳,
+        # 会让 Python 认为缓存仍然有效而不重新编译 -- 沙箱里实际执行的可能不是
+        # 当前源码. .gitignore 挡得住它们入库, 挡不住 copytree.
+        shutil.copytree(src, sandbox, dirs_exist_ok=True, ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", ".pytest_cache",
+        ))
     return str(sandbox)
 
 

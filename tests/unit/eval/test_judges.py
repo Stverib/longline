@@ -620,12 +620,14 @@ class TestCasePassed:
         assert [d["passed"] for d in detail] == [True, False]
         assert detail[1]["fn"] == "file_content"
 
-    def test_empty_checks_list_is_vacuously_passed(self, tmp_path: Path) -> None:
-        # 空列表在 all() 下为真 —— 但 E2ECase 在加载期就禁止空 checks,
-        # 所以这是「不该发生的输入」,这里只钉住函数本身的行为.
-        passed, detail = case_passed([], tmp_path)
-        assert passed is True
-        assert detail == []
+    def test_empty_checks_list_raises_instead_of_passing_vacuously(self, tmp_path: Path) -> None:
+        # 以前这里钉的是「空列表在 all() 下为真」. 那是个陷阱: E2ECase 从
+        # from_dict 进来时确实会被拒, 但直接构造 (测试、程序化调用方) 不走
+        # loader, 于是 case_passed([], ...) 返回 (True, []) -- 一个没有任何
+        # 断言的用例被报成「通过」. 静默恒真正是这套判分器一直在防的模式,
+        # 所以现在改成显式报错.
+        with pytest.raises(ValueError, match="no checks"):
+            case_passed([], tmp_path)
 
     def test_any_mode_passes_on_one_hit(self, tmp_path: Path) -> None:
         (tmp_path / "a.json").write_text('{"k": 1}', encoding="utf-8")

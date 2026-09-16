@@ -712,6 +712,13 @@ def case_passed(
     """
     if mode not in ("all", "any"):
         raise ValueError(f"checks_mode must be 'all' or 'any', got {mode!r}")
+    if not checks:
+        # 空 checks 在 "all" 下 vacuous-true, 在 "any" 下 vacuous-false.
+        # 前者会把一个「没有任何断言」的用例报成通过 -- 静默恒真正是本套
+        # 判分器一直在防的失败模式 (见 TestFixturesAreNotPreSatisfied).
+        # from_dict 已经在加载期拒绝; 这里挡住直接构造的调用方
+        # (测试、程序化构建的 case) 绕过 loader 的那条路.
+        raise ValueError("case has no checks; an empty check list cannot pass or fail")
 
     results: list[dict[str, Any]] = []
     for check in checks:

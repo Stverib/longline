@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from longline.eval.metrics import Ratio, mean, paired_delta, percentage_points, percentile
+from longline.eval.types import E2E_CATEGORY_TAGS
 
 if TYPE_CHECKING:
     from longline.eval.runner import CaseResult
@@ -125,7 +126,20 @@ class EvalReport:
 
 
 def _category_key(result: CaseResult) -> str:
-    """The category a case is bucketed under: first tag, else its case type."""
+    """The category a case is bucketed under.
+
+    Prefers membership in `E2E_CATEGORY_TAGS` over tag *position*. Taking
+    `tags[0]` happened to give the right answer only because the case data
+    lists the category first (`["retrieval", "answer"]`), so any author who
+    reordered a case's tags would silently move it to a different bucket in
+    the report without changing a thing about the case. Selecting on the
+    explicit category tag removes that dependence on ordering; the first-tag
+    and case-type fallbacks remain for tool-call cases and ad-hoc runs whose
+    tags are not E2E categories.
+    """
+    for tag in result.tags:
+        if tag in E2E_CATEGORY_TAGS:
+            return tag
     if result.tags:
         return result.tags[0]
     return result.case_type
