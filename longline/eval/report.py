@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from longline.eval.latency_runner import LatencySummary
     from longline.eval.multi_agent_runner import MultiAgentSummary
     from longline.eval.runner import CaseResult
+    from longline.eval.safety_runner import SafetySummary
 
 # Case tags that decide the ToolSelectionCaseAccuracy denominator. A blind case
 # is one whose task text does not name or hint at the expected tool; an
@@ -446,6 +447,7 @@ def render_markdown(
     compression: CompressionSummary | None = None,
     latency: LatencySummary | None = None,
     multi_agent: dict[str, MultiAgentSummary] | None = None,
+    safety: SafetySummary | None = None,
 ) -> str:
     """Render the report as a compact markdown table + summary lines.
 
@@ -453,13 +455,14 @@ def render_markdown(
     `baseline` report is supplied, success-rate differences are rendered in
     **percentage points** (`-3.0 pp`), never as a relative percent.
 
-    `compression` adds the Task 4 section, `latency` the Task 6 one and
-    `multi_agent` the Task 7 one. They are separate arguments rather than fields
-    on `EvalReport` because none of those suites' metrics compose with the E2E
-    ones: compression has its own denominators (facts, eligible cases), latency's
-    headline number is a ratio of two durations, and multi-agent's is a ratio of
-    durations plus a ratio of token counts. Folding any of them in would invite
-    someone to average across suites.
+    `compression` adds the Task 4 section, `latency` the Task 6 one,
+    `multi_agent` the Task 7 one and `safety` the Task 8 one. They are separate
+    arguments rather than fields on `EvalReport` because none of those suites'
+    metrics compose with the E2E ones: compression has its own denominators
+    (facts, eligible cases), latency's headline number is a ratio of two
+    durations, multi-agent's is a ratio of durations plus a ratio of token
+    counts, and safety's two rates trade off against each other. Folding any of
+    them in would invite someone to average across suites.
 
     `multi_agent` is keyed by GROUP (`controlled` / `exploratory`) and rendered
     as one section per group. Contract §5.6 requires those to be reported
@@ -550,6 +553,9 @@ def render_markdown(
 
     if multi_agent:
         lines += _multi_agent_lines(multi_agent)
+
+    if safety is not None:
+        lines += _safety_lines(safety)
 
     if report.by_category:
         lines += [
@@ -857,9 +863,113 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
     return lines
 
 
+def _safety_lines(summary: SafetySummary) -> list[str]:
+    """The Task 8 section: two ratios, and a matrix that locates a wrong one.
+
+    Three things this section is careful about:
+
+    - **`FalsePositiveRate` is a COST, not a defect.** A false positive is a
+      legitimate operation the gate stopped; it costs time, not safety. It is
+      printed beside the recall rather than under it, and neither number is
+      folded into a single "safety score" -- the two trade off against each
+      other, and one number could not show that.
+    - **The confusion matrix is per bucket, with both labels in every bucket.**
+      A bare `FalsePositiveRate` of 1/15 says a decision was wrong; the bucket
+      says WHICH rule or mode produced it. Buckets report `Ratio`, so a bucket
+      with no normal cases renders as "not measured" rather than as 0%.
+    - **The failures are listed.** A case that did not match its declared
+      outcome is the reason this suite exists, and a green headline over a
+      silently-dropped failure list would be unreadable.
+    """
+    lines = [
+        "",
+        "## Permission / safety (30 labelled decisions)",
+        "",
+        "> Each case declares a tool call, a `PermissionMode`, optional "
+        "settings.json rules and an interactivity flag, and a **labelled "
+        "outcome**. The runner drives the real `PermissionContext` through the "
+        "real `StreamingToolExecutor` against an **inert sentinel** registered "
+        "under the tool's name, so an `allow` verdict is witnessed by "
+        "`execute()` being entered and a gated one by it never being entered. "
+        "**No real dangerous command is ever run** (contract §5.7 / §8.4).",
+        "",
+        "| metric | value | 95% Wilson CI | numerator / denominator |",
+        "|---|---|---|---|",
+        _metric_row(
+            "DangerousRecall", summary.dangerous_recall,
+            "被 DENY 或 ASK 门控的危险操作 / 危险操作总数",
+        ),
+        _metric_row(
+            "FalsePositiveRate", summary.false_positive_rate,
+            "被 DENY 或 ASK 门控的正常操作 / 正常操作总数",
+        ),
+        "",
+        f"- **Cases:** {summary.num_cases} "
+        f"({summary.false_negatives} false negatives, "
+        f"{summary.false_positives} false positives)",
+        "- **Reading `FalsePositiveRate`:** it is a cost, not a defect -- a "
+        "legitimate operation the gate stopped. The two rates trade off and are "
+        "never combined into one score.",
+    ]
+
+    for title, axis in (
+        ("By case kind", summary.by_kind),
+        ("By PermissionMode", summary.by_mode),
+        ("By rule arm", summary.by_rule_arm),
+    ):
+        lines += [
+            "",
+            f"### {title}",
+            "",
+            "| bucket | dangerous gated | normal gated |",
+            "|---|---|---|",
+        ]
+        for bucket, counts in sorted(axis.items()):
+            lines.append(
+                f"| {bucket} | {_fmt_pct(counts['dangerous_gated'])} | "
+                f"{_fmt_pct(counts['normal_gated'])} |"
+            )
+
+    lines += [
+        "",
+        "### Confusion matrix (per case)",
+        "",
+        "| case | kind | label | declared | predicted | outcome | tool | mode | "
+        "interactive | rule arm |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in summary.confusion:
+        marker = " :warning:" if (row["false_negative"] or row["false_positive"]) else ""
+        lines.append(
+            f"| {row['case_id']} | {row['kind']} | {row['label']} | "
+            f"{row['declared']} | {row['predicted']} | {row['outcome']} | "
+            f"{row['tool']} | {row['mode']} | {row['interactive']} | "
+            f"{row['rule_arm']} |{marker}"
+        )
+
+    if summary.failures:
+        lines += ["", "### Cases that did not match their declared outcome", ""]
+        for failure in summary.failures:
+            # `notes` is `object` on the failure row (`dict[str, object]`), so the
+            # narrowing is explicit: a malformed value reads as "no notes" rather
+            # than exploding the renderer, which runs after the suite has run.
+            raw_notes = failure["notes"]
+            notes = (
+                "; ".join(str(n) for n in raw_notes)
+                if isinstance(raw_notes, list) and raw_notes
+                else "no notes"
+            )
+            lines.append(
+                f"- `{failure['case_id']}` ({failure['label']}, {failure['mode']}, "
+                f"rule arm `{failure['declared_arm']}`): decision="
+                f"{failure['decision']}, outcome={failure['outcome']}, "
+                f"executed={failure['executed']} -- {notes}"
+            )
+    return lines
+
+
 def _fmt_num(value: float | None, digits: int) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
-
 
 def paired_report_delta(
     baseline: list[CaseResult], candidate: list[CaseResult]

@@ -68,6 +68,12 @@ REPORT_NAME = "report.md"
 # so -- like `compression` -- it gets its own layer name rather than riding on
 # `e2e`: loading them as E2E would drop the subtask declarations and leave the
 # suite comparing two variants whose work it could no longer state.
+#
+# `safety` is the Task 8 suite. Its cases declare a permission scenario and a
+# LABELLED outcome, and they are never dispatched to a real tool -- the runner
+# registers an inert sentinel instead. Loading them as E2E would run the
+# declared dangerous arguments against real tools, which is the one thing the
+# contract forbids outright (`evals/README.md` §8.4).
 SUITES: dict[str, tuple[str, str]] = {
     "tool_calls": ("tool_calls.jsonl", "tool_call"),
     "tool_selection": ("tool_selection.jsonl", "tool_call"),
@@ -75,12 +81,15 @@ SUITES: dict[str, tuple[str, str]] = {
     "compression": ("compression.jsonl", "compression"),
     "latency": ("e2e.jsonl", "latency"),
     "multi_agent": ("multi_agent.jsonl", "multi_agent"),
+    "safety": ("safety.jsonl", "safety"),
     "all": ("tool_calls.jsonl", "all"),
 }
 
-# Layer names accepted by --type. `compression`, `latency` and `multi_agent` are
-# separate from `e2e` for the reasons above.
-TYPE_CHOICES = ["tool_call", "e2e", "compression", "latency", "multi_agent", "all"]
+# Layer names accepted by --type. `compression`, `latency`, `multi_agent` and
+# `safety` are separate from `e2e` for the reasons above.
+TYPE_CHOICES = [
+    "tool_call", "e2e", "compression", "latency", "multi_agent", "safety", "all",
+]
 
 # Case tags that partition the tool-selection suite. `--blind` / `--instruction`
 # are sugar over `--tag`, kept as flags because the two halves must never be
@@ -914,6 +923,95 @@ def _fmt_ratio_value(value: object) -> str:
     return f"{value * 100:+.1f}%"
 
 
+async def _run_safety(
+    args: argparse.Namespace,
+    *,
+    case_file: Path,
+    out_dir: Path,
+    run_id: str | None,
+) -> int:
+    """Run the Task 8 permission-safety suite and write its report.
+
+    No model, no API key, no network, no sandbox: a safety case is a permission
+    DECISION, and the runner drives it through the production
+    `StreamingToolExecutor` against an inert sentinel. Nothing a case declares is
+    ever handed to a real tool, which is why this suite needs no fixtures and no
+    credentials.
+
+    `--run-id` is required for the same contract reason the other Task 1+
+    suites require it: a number whose `raw.jsonl` does not exist is not a number
+    (`evals/README.md` §3), and these figures are exactly the kind that get
+    quoted without their backing.
+
+    The interactive cases patch `longline.ui.renderer.console` for the duration
+    of one call. That is why the suite runs serially: two in flight at once would
+    answer each other's prompt.
+    """
+    from longline.eval.safety import load_safety_cases
+    from longline.eval.safety_runner import aggregate_safety, run_safety_suite
+
+    if args.run_id is None:
+        raise SystemExit(
+            "the safety suite needs --run-id: its numbers must be backed by "
+            "raw.jsonl under evals/results/<run_id>/ (evals/README.md §3)"
+        )
+
+    cases = load_safety_cases(case_file)
+    if args.tag is not None:
+        cases = [c for c in cases if args.tag in c.tags]
+    if args.max_cases is not None:
+        cases = cases[: args.max_cases]
+    if not cases:
+        raise SystemExit("no safety cases selected -- check --case-file / --tag")
+
+    run_id = run_id or make_run_id(args.model, "safety")
+
+    runs = await run_safety_suite(cases)
+    summary = aggregate_safety(runs)
+
+    print(f"[eval] {len(runs)} safety cases "
+          f"({summary.false_negatives} false negatives, "
+          f"{summary.false_positives} false positives)")
+    print(f"[eval]   DangerousRecall   : {_fmt_ratio(summary.dangerous_recall)}")
+    print(f"[eval]   FalsePositiveRate : {_fmt_ratio(summary.false_positive_rate)}")
+    for axis_name, axis in (
+        ("kind", summary.by_kind), ("mode", summary.by_mode),
+        ("rule_arm", summary.by_rule_arm),
+    ):
+        for bucket, counts in sorted(axis.items()):
+            print(f"[eval]   by_{axis_name}={bucket}: "
+                  f"dangerous_gated={_fmt_ratio(counts['dangerous_gated'])} "
+                  f"normal_gated={_fmt_ratio(counts['normal_gated'])}")
+    if summary.failures:
+        # Printed, not summarised away: a case that did not match its declared
+        # outcome is the whole reason this suite exists, and burying it under a
+        # green headline would make the number unreadable.
+        print(f"[eval]   FAILURES: {[f['case_id'] for f in summary.failures]}")
+
+    metadata = run_metadata(
+        run_id=run_id, suite="safety", variant=args.variant, model=args.model,
+        case_file=case_file, repeat_index=0, repeats_completed=1,
+    )
+
+    run_dir = out_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / RAW_NAME).open("w", encoding="utf-8") as fh:
+        for run in runs:
+            fh.write(json.dumps(run.to_row(run.case), ensure_ascii=False) + "\n")
+    (run_dir / SUMMARY_NAME).write_text(
+        json.dumps({"metadata": metadata, "safety": summary.to_dict()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / REPORT_NAME).write_text(
+        render_markdown(aggregate([]), safety=summary), encoding="utf-8",
+    )
+    print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+    print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+    print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+    return 0
+
+
 async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args, argv)
@@ -950,6 +1048,14 @@ async def _run(argv: Sequence[str] | None = None) -> int:
         return await _run_multi_agent(
             args, case_file=case_file, fixtures=fixtures, out_dir=out_dir,
             api_key=api_key, run_id=args.run_id,
+        )
+
+    # The safety suite, for the same reason again: its cases declare a labelled
+    # permission outcome rather than a task, and dispatching them to real tools
+    # is exactly what the contract forbids.
+    if args.type == "safety" or args.suite == "safety":
+        return await _run_safety(
+            args, case_file=case_file, out_dir=out_dir, run_id=args.run_id,
         )
 
     cases = load_cases(case_file)
