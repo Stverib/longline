@@ -392,3 +392,61 @@ class TestToolSelectionSuiteWiring:
         args = cli.parse_args([])
         assert args.blind_only is False
         assert args.instruction_only is False
+
+
+# --- Task 4: the compression suite -----------------------------------------
+
+
+class TestCompressionSuite:
+    def test_suite_preset_selects_the_compression_case_file(self) -> None:
+        ns = cli.parse_args(["--suite", "compression"])
+        cli._apply_suite(ns, ["--suite", "compression"])
+        assert ns.case_file.endswith("compression.jsonl")
+
+    def test_compression_is_a_distinct_type_not_e2e(self) -> None:
+        """A compression case carries `history`/`key_facts`; `E2ECase` has no shape for them.
+
+        Routing it through `--type e2e` would load it as a bare E2E case and
+        silently drop the transcript, which is the only thing the suite measures.
+        """
+        ns = cli.parse_args(["--suite", "compression"])
+        cli._apply_suite(ns, ["--suite", "compression"])
+        assert ns.type == "compression"
+
+    def test_explicit_case_file_still_wins(self) -> None:
+        argv = ["--suite", "compression", "--case-file", "custom.jsonl"]
+        ns = cli.parse_args(argv)
+        cli._apply_suite(ns, argv)
+        assert ns.case_file == "custom.jsonl"
+
+    def test_compression_summary_is_written_to_summary_json(self, tmp_path: Path) -> None:
+        """Contract §3: a number that lives only in report.md is not a number."""
+        from longline.eval.compression_runner import aggregate_compression
+        from tests.unit.eval.test_report import _fake_compression_run
+
+        run = _fake_compression_run("cc-1", True, True, 1000, 500, 5)
+        summary = aggregate_compression([run])
+        cli._write_run_dir(
+            run_dir=tmp_path / "run",
+            results=[],
+            metadata={"run_id": "r", "variant": None},
+            compression=summary,
+        )
+        payload = json.loads((tmp_path / "run" / cli.SUMMARY_NAME).read_text(encoding="utf-8"))
+        assert "compression" in payload
+        assert payload["compression"]["token_units"] == "estimated"
+        assert payload["compression"]["key_info_retention"]["denominator"] == 5
+
+    def test_compression_report_lands_in_report_md(self, tmp_path: Path) -> None:
+        from longline.eval.compression_runner import aggregate_compression
+        from tests.unit.eval.test_report import _fake_compression_run
+
+        run = _fake_compression_run("cc-1", True, True, 1000, 500, 5)
+        cli._write_run_dir(
+            run_dir=tmp_path / "run",
+            results=[],
+            metadata={"run_id": "r", "variant": None},
+            compression=aggregate_compression([run]),
+        )
+        md = (tmp_path / "run" / cli.REPORT_NAME).read_text(encoding="utf-8")
+        assert "CompressionRatio" in md

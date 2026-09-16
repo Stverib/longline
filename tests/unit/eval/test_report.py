@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -257,3 +258,95 @@ class TestFourMetricsInReport:
         rep = aggregate([_res("e", "e2e", True)])
         md = render_markdown(rep)
         assert "ToolSelectionCaseAccuracy" not in md
+
+
+# --- Task 4: the compression A/B section -----------------------------------
+
+
+def _compression_summary(**overrides: Any) -> Any:
+    """A CompressionSummary with two eligible cases and one excluded."""
+    from longline.eval.compression_runner import aggregate_compression
+
+    runs = []
+    for cid, base_ok, cand_ok, before, after, retained in (
+        ("cc-1", True, True, 1000, 500, 5),
+        ("cc-2", True, False, 1200, 600, 3),
+        ("cc-3", False, True, 900, 450, 0),
+    ):
+        run = _fake_compression_run(cid, base_ok, cand_ok, before, after, retained)
+        runs.append(run)
+    summary = aggregate_compression(runs)
+    for key, value in overrides.items():
+        setattr(summary, key, value)
+    return summary
+
+
+def _fake_compression_run(case_id: str, base_ok: bool, cand_ok: bool,
+                          before: int, after: int, retained: int) -> Any:
+    from longline.eval.compression import KeyFact
+    from longline.eval.compression_runner import CompactEvidence, CompressionRun
+    from longline.eval.runner import CaseResult
+
+    base = CaseResult(case_id=case_id, case_type="compression", passed=base_ok,
+                      variant="compression_off")
+    cand = CaseResult(case_id=case_id, case_type="compression", passed=cand_ok,
+                      variant="compression_on")
+    evidence = CompactEvidence(
+        messages_before=21, messages_after=9, tokens_before=before, tokens_after=after,
+        summariser_calls=1, summary="s", compacted=True,
+    )
+    cand.detail["compression"] = evidence.to_detail()
+    facts = [
+        KeyFact(id=f"A{i}", kind="file-path", statement="s", probe="p?",
+                check={"fn": "file_exists", "args": {"path": "x"}},
+                answer=f"v{i}")
+        for i in range(1, 6)
+    ]
+    lost = [f"A{i}" for i in range(retained + 1, 6)] if base_ok else []
+    return CompressionRun(
+        case_id=case_id, baseline=base, candidate=cand,
+        key_facts=facts, retained_fact_ids=[f"A{i}" for i in range(1, retained + 1)],
+        lost_fact_ids=lost, num_facts=5, retained_facts=retained,
+        excluded_from_denominator=not base_ok,
+        exclusion_reason=None if base_ok else "baseline_failed",
+        evidence=evidence,
+    )
+
+
+class TestCompressionReport:
+    def test_section_absent_without_compression_results(self) -> None:
+        md = render_markdown(aggregate([_res("e", "e2e", True)]))
+        assert "Compression" not in md
+
+    def test_render_includes_all_four_metrics(self) -> None:
+        md = render_markdown(aggregate([]), compression=_compression_summary())
+        for label in ("CompressionRatio", "KeyInfoRetention",
+                      "PostCompressionSuccessRate", "SuccessDeltaPP"):
+            assert label in md, f"missing metric row: {label}"
+
+    def test_token_counts_are_labelled_estimated(self) -> None:
+        """Contract §5.3: the report must say the tokens are ESTIMATED."""
+        md = render_markdown(aggregate([]), compression=_compression_summary())
+        assert "estimated" in md.lower()
+
+    def test_success_delta_is_in_percentage_points_not_percent(self) -> None:
+        md = render_markdown(aggregate([]), compression=_compression_summary())
+        assert "pp" in md
+        # "下降 3%" is forbidden; a relative percent must not appear at all.
+        assert "%" not in md.split("SuccessDeltaPP")[1].split("|")[2]
+
+    def test_baseline_exclusion_is_reported_not_hidden(self) -> None:
+        """The excluded case must be visible, with its reason."""
+        md = render_markdown(aggregate([]), compression=_compression_summary())
+        assert "cc-3" in md
+        assert "baseline_failed" in md
+
+    def test_lost_facts_are_named_per_case(self) -> None:
+        """The plan's acceptance condition: trace WHICH fact was lost."""
+        md = render_markdown(aggregate([]), compression=_compression_summary())
+        assert "cc-2" in md
+        assert "A4" in md and "A5" in md  # retained=3 -> A4/A5 lost in cc-2
+
+    def test_no_section_when_summary_is_none(self) -> None:
+        md = render_markdown(aggregate([]), compression=None)
+        assert "CompressionRatio" not in md

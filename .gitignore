@@ -22,10 +22,17 @@ build/
 .tmp/
 
 # 私人材料与内部文档：简历、面试准备、内部设计文档（绝不入库）
-docs/
-docs/简历*.md
-docs/简历*.docx
-docs/~$*
+#
+# `/docs/` 是**仓库根目录**的 docs，不是任意层级的 docs。
+# 不加前导斜杠时 git 会在每一层匹配，于是 `evals/fixtures/*/docs/` 这种
+# 属于测试夹具的内容也会被静默忽略 —— 夹具在新鲜克隆里会缺文件，
+# 而断言它存在的契约测试在作者机器上却是绿的（本地文件一直都在）。
+/docs/
+/docs/简历*.md
+/docs/简历*.docx
+/docs/~$*
+# 夹具内部的 docs/ 是评测数据，必须入库。
+!evals/fixtures/**/docs/
 interview/
 
 # 编辑器 / 系统

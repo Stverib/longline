@@ -46,14 +46,23 @@ REPORT_NAME = "report.md"
 #
 # `tool_selection` is the Task 2 suite: 48 blind + 12 instruction-following
 # cases whose main number is ToolSelectionCaseAccuracy over the blind half.
+# `compression` is the Task 4 suite and gets its own layer name rather than
+# riding on `e2e`: its cases carry a scripted `history` and `key_facts` that
+# `E2ECase` has no field for, so loading them as E2E would drop the transcript
+# and leave the suite measuring an ordinary artifact check.
 # `tool_calls` stays pointed at the retired legacy file so old invocations keep
 # reproducing their old case set exactly.
 SUITES: dict[str, tuple[str, str]] = {
     "tool_calls": ("tool_calls.jsonl", "tool_call"),
     "tool_selection": ("tool_selection.jsonl", "tool_call"),
     "e2e": ("e2e.jsonl", "e2e"),
+    "compression": ("compression.jsonl", "compression"),
     "all": ("tool_calls.jsonl", "all"),
 }
+
+# Layer names accepted by --type. `compression` is separate from `e2e` for the
+# reason above.
+TYPE_CHOICES = ["tool_call", "e2e", "compression", "all"]
 
 # Case tags that partition the tool-selection suite. `--blind` / `--instruction`
 # are sugar over `--tag`, kept as flags because the two halves must never be
@@ -123,7 +132,7 @@ def _positive_int(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="python -m longline.eval", description="Run the agent evaluation suite.")
-    p.add_argument("--type", choices=["tool_call", "e2e", "all"], default="all")
+    p.add_argument("--type", choices=TYPE_CHOICES, default="all")
     p.add_argument("--model", default="claude-sonnet-4-20250514")
     p.add_argument("--case-file", default=str(PROJECT_ROOT / "evals" / "tool_calls.jsonl"),
                    help="Path to a JSONL file of cases.")
@@ -340,8 +349,15 @@ def _write_run_dir(
     metadata: dict[str, object],
     baseline_results: list[CaseResult] | None = None,
     baseline_label: str | None = None,
+    compression: object | None = None,
 ) -> None:
-    """Write raw.jsonl / summary.json / report.md for one run."""
+    """Write raw.jsonl / summary.json / report.md for one run.
+
+    `compression` is a `CompressionSummary` when the run was the Task 4 suite.
+    It goes into BOTH `summary.json` and `report.md`: a metric that exists only
+    in the rendered report is not a metric (`evals/README.md` §3), so the
+    payload is written first and the markdown is a view of it.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_jsonl(run_dir / RAW_NAME, results)
 
@@ -352,6 +368,8 @@ def _write_run_dir(
     }
     if baseline_results is not None:
         summary["paired_vs_baseline"] = paired_report_delta(baseline_results, results)
+    if compression is not None:
+        summary["compression"] = compression.to_dict()  # type: ignore[attr-defined]
 
     (run_dir / SUMMARY_NAME).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
@@ -359,7 +377,10 @@ def _write_run_dir(
 
     baseline_report = aggregate(baseline_results) if baseline_results is not None else None
     (run_dir / REPORT_NAME).write_text(
-        render_markdown(report, baseline=baseline_report, baseline_label=baseline_label),
+        render_markdown(
+            report, baseline=baseline_report, baseline_label=baseline_label,
+            compression=compression,  # type: ignore[arg-type]
+        ),
         encoding="utf-8",
     )
 
@@ -426,6 +447,82 @@ def _print_run_summary(report: object, num_case_runs: int) -> None:
         print(f"[eval] {num_case_runs} case-runs | Tool accuracy: {_fmt_ratio(l1)}")
 
 
+async def _run_compression(
+    args: argparse.Namespace,
+    *,
+    case_file: Path,
+    fixtures: Path,
+    out_dir: Path,
+    api_key: str,
+    run_id: str | None,
+) -> int:
+    """Run the Task 4 paired compression suite and write its report.
+
+    Kept separate from the generic `_run` body because the outer shape differs:
+    one case yields two CaseResults (baseline and candidate) plus a fact trace,
+    and the headline numbers are the compression metrics rather than a pass rate.
+    The `raw.jsonl` it writes is still the contract's source of truth -- every
+    number in `summary.json` is recomputable from those rows plus the case file.
+    """
+    from longline.eval.compression import load_compression_cases
+    from longline.eval.compression_runner import aggregate_compression, run_compression_suite
+
+    cases = load_compression_cases(case_file)
+    cases = [c for c in cases if args.tag is None or args.tag in c.tags]
+    if args.max_cases is not None:
+        cases = cases[: args.max_cases]
+    if not cases:
+        raise SystemExit("no compression cases selected — check --case-file / --tag")
+
+    run_id = run_id or make_run_id(args.model, "compression")
+
+    runs = await run_compression_suite(
+        cases, model=args.model, api_key=api_key, fixtures_dir=fixtures,
+    )
+    summary = aggregate_compression(runs)
+
+    # Both variants of every case, so `raw.jsonl` alone recomputes the report.
+    results: list[CaseResult] = []
+    for run in runs:
+        results.append(run.baseline)
+        results.append(run.candidate)
+
+    ratio = summary.compression_ratio
+    print(f"[eval] {summary.num_cases} compression cases "
+          f"({summary.excluded_cases} excluded from the denominator)")
+    print(f"[eval]   CompressionRatio (estimated tokens): "
+          f"{'not measured' if ratio is None else f'{ratio * 100:.1f}%'}")
+    print(f"[eval]   KeyInfoRetention                   : {_fmt_ratio(summary.key_info_retention)}")
+    print(f"[eval]   PostCompressionSuccessRate         : "
+          f"{_fmt_ratio(summary.post_compression_success_rate)}")
+    delta = summary.success_delta_pp
+    print(f"[eval]   SuccessDeltaPP                     : "
+          f"{'not measured' if delta is None else f'{delta:+.1f} pp'}")
+
+    metadata = run_metadata(
+        run_id=run_id, suite="compression", variant=args.variant, model=args.model,
+        case_file=case_file, repeat_index=0, repeats_completed=1,
+    )
+
+    if args.run_id is not None:
+        run_dir = out_dir / run_id
+        _write_run_dir(
+            run_dir=run_dir, results=results, metadata=metadata, compression=summary,
+        )
+        print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+        print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+        print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+        return 0
+
+    # Without --run-id there is no durable directory to hold the paired
+    # evidence, and a compression number whose `raw.jsonl` is missing is not a
+    # number. Refuse rather than emitting a flat file that cannot be audited.
+    raise SystemExit(
+        "the compression suite needs --run-id: its numbers must be backed by "
+        "raw.jsonl under evals/results/<run_id>/ (evals/README.md §3)"
+    )
+
+
 async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args, argv)
@@ -437,6 +534,15 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     fixtures = Path(args.fixtures_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # The compression suite is dispatched before the generic path: its cases are
+    # not `EvalCase`s (they carry a history and key facts), and it produces two
+    # CaseResults plus a fact trace per case rather than one.
+    if args.type == "compression" or args.suite == "compression":
+        return await _run_compression(
+            args, case_file=case_file, fixtures=fixtures, out_dir=out_dir,
+            api_key=api_key, run_id=args.run_id,
+        )
 
     cases = load_cases(case_file)
     if args.type == "tool_call":

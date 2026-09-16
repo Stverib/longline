@@ -24,6 +24,7 @@ from longline.eval.metrics import (
 from longline.eval.types import E2E_CATEGORY_TAGS
 
 if TYPE_CHECKING:
+    from longline.eval.compression_runner import CompressionSummary
     from longline.eval.runner import CaseResult
 
 # Case tags that decide the ToolSelectionCaseAccuracy denominator. A blind case
@@ -440,12 +441,18 @@ def render_markdown(
     *,
     baseline: EvalReport | None = None,
     baseline_label: str | None = None,
+    compression: CompressionSummary | None = None,
 ) -> str:
     """Render the report as a compact markdown table + summary lines.
 
     Every rate prints its numerator/denominator next to the percentage. If a
     `baseline` report is supplied, success-rate differences are rendered in
     **percentage points** (`-3.0 pp`), never as a relative percent.
+
+    `compression` adds the Task 4 section. It is a separate argument rather than
+    a field on `EvalReport` because the compression suite's metrics have their
+    own denominators (facts, eligible cases) that do not compose with the E2E
+    ones -- folding them in would invite someone to average across the two.
     """
     lines = [
         "# Agent Evaluation Report",
@@ -522,6 +529,9 @@ def render_markdown(
         if l1_delta is not None:
             lines.append(f"- **Tool-call accuracy vs {label}:** {l1_delta:+.1f} pp")
 
+    if compression is not None:
+        lines += _compression_lines(compression)
+
     if report.by_category:
         lines += [
             "",
@@ -561,6 +571,88 @@ def _as_float(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _compression_lines(summary: CompressionSummary) -> list[str]:
+    """The Task 4 section: four metrics, four denominators, plus the fact trace.
+
+    Two things this section deliberately does NOT do:
+
+    - It does not render `SuccessDeltaPP` as a relative percent. The contract
+      forbids "down 3%" for a 3-point drop, so the unit is printed as `pp` and
+      the two underlying rates are shown next to it.
+    - It does not drop the excluded cases. A case whose baseline failed leaves
+      the degradation denominator (contract §5.3) but is listed here with its
+      reason, because a silently-shrunk denominator is a wrong number that
+      looks right.
+    """
+    ratio = summary.compression_ratio
+    ratio_text = "not measured" if ratio is None else f"{ratio * 100:.1f}%"
+
+    lines = [
+        "",
+        "## Context compression (paired A/B, estimated tokens)",
+        "",
+        "> Token counts are **estimated** via `estimate_messages_tokens()`, not a "
+        "tokenizer's count. `CompressionRatio` is therefore a ratio between two "
+        "estimates of the same region, which is what makes it usable despite the "
+        "absolute value under-counting (system prompt and tool schemas excluded).",
+        "",
+        "| metric | value | 95% Wilson CI | numerator / denominator |",
+        "|---|---|---|---|",
+        f"| CompressionRatio | {ratio_text} | n/a (a ratio, not a proportion) | "
+        f"mean of {len(summary.compression_ratio_per_case)} per-case ratios |",
+        _metric_row(
+            "KeyInfoRetention", summary.key_info_retention,
+            "压缩后仍能正确使用的关键事实 / 关键事实总数",
+        ),
+        _metric_row(
+            "PostCompressionSuccessRate", summary.post_compression_success_rate,
+            "压缩后任务成功数 / 可计入分母的压缩任务数",
+        ),
+        (
+            f"| SuccessDeltaPP | {summary.success_delta_pp:+.1f} pp | n/a | "
+            f"candidate {_fmt_pct(summary.post_compression_success_rate)} - "
+            f"baseline {_fmt_pct(summary.baseline_success_rate)} |"
+            if summary.success_delta_pp is not None
+            else "| SuccessDeltaPP | not measured | n/a | one side unmeasured |"
+        ),
+        "",
+        f"- **Cases:** {summary.num_cases} total, {summary.eligible_cases} eligible, "
+        f"{summary.excluded_cases} excluded (baseline failed)",
+        f"- **Mean estimated tokens:** before="
+        f"{_fmt_num(summary.mean_tokens_before, 1)}, after="
+        f"{_fmt_num(summary.mean_tokens_after, 1)} "
+        f"(paired mean delta={_fmt_num(summary.paired_tokens.mean, 1)})",
+        "",
+        "### Per-case fact trace",
+        "",
+        "Each fact is scored by a follow-up question whose answer IS the fact, "
+        "never by searching the summary text: *the summary contains the path* is "
+        "not *the agent can still use the path*.",
+        "",
+        "| case | baseline | candidate | ratio | retained | lost facts | excluded |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in summary.per_case:
+        case_id = str(row["case_id"])
+        per_case_ratio = summary.compression_ratio_per_case.get(case_id)
+        ratio_cell = "n/a" if per_case_ratio is None else f"{per_case_ratio * 100:.1f}%"
+        # `lost_fact_ids` is `object` on the row dict, so the narrowing is
+        # explicit: a non-list value reads as "no facts lost" rather than
+        # exploding the renderer, which runs after a paid suite has finished.
+        lost_value = row["lost_fact_ids"]
+        lost = [str(f) for f in lost_value] if isinstance(lost_value, list) else []
+        lost_cell = ", ".join(lost) if lost else "-"
+        excluded = "yes" if row["excluded_from_denominator"] else "-"
+        if row["exclusion_reason"]:
+            excluded = f"yes ({row['exclusion_reason']})"
+        lines.append(
+            f"| {case_id} | {row['baseline_passed']} | {row['candidate_passed']} | "
+            f"{ratio_cell} | {row['retained_facts']}/{row['num_facts']} | "
+            f"{lost_cell} | {excluded} |"
+        )
+    return lines
 
 
 def _fmt_num(value: float | None, digits: int) -> str:
