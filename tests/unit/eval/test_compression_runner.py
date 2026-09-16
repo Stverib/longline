@@ -17,6 +17,7 @@ The two things these tests exist to pin, beyond "it runs":
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -638,14 +639,25 @@ def completed_agent(case: CompressionCase, *, drop_fact: str | None = None) -> A
         class _FakeEngine:
             async def submit(self, user_input: str, **kwargs: Any) -> Any:
                 root = Path(sandbox)
+                # 从 continuation_task 里解析答案, 而不是读 case.key_facts[].answer.
+                #
+                # 这不是洁癖: 原缺陷(判分器读 answer_number.txt 而题面让 agent 写
+                # 各自的 filename)之所以能活下来, 正是因为旧的 stub 直接拿内部
+                # answer 字段去喂判分器 -- 它验证的是"判分器能不能被喂饱", 而不是
+                # "照题面做能不能通过". 题面里的答案就是 agent 实际会看到的那几个
+                # 字面值, 所以从题面解析才能真正复现 agent 的处境.
+                answers = dict(re.findall(r"^(A\d)=(.*)$", case.continuation_task, re.M))
+                assert answers, "continuation_task carries no A1=... lines to parse"
                 lines = [
-                    f"{f.id}={f.answer or '是'}"
-                    for f in case.key_facts if f.id != drop_fact
+                    f"{f.id}={answers[f.id]}"
+                    for f in case.key_facts if f.id != drop_fact and f.id in answers
                 ]
                 _write(root / ANSWER_FILE, "\n".join(lines) + "\n")
-                _write(root / "answer_number.txt", f"{FIXED_PASSED}\n")
-                _write(root / "decision_note.md", "A1=x\n")
-                _write(root / "run_trace.md", "A1=x\n")
+                # 每条用例各自的记录文件名由题面决定 (cc-001 是 answer.txt,
+                # cc-002 是 result.txt ...), 也要从题面取, 不能用固定名.
+                marker_files = re.findall(r"把 `([^`]+)` 追加一行", case.continuation_task)
+                for target in marker_files:
+                    _write(root / target, f"{case.id.upper().replace('-', '')[:2]}1\n")
                 fanout = root / "multiagent" / "fanout.py"
                 text = fanout.read_text(encoding="utf-8")
                 assert _FROZEN_BUG in text, "the frozen bug is missing from the fixture"
