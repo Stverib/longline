@@ -23,7 +23,7 @@ from longline.eval.engine_factory import build_engine
 from longline.eval.judges import case_passed, judge_case_args, judge_steps
 from longline.eval.metrics import Ratio
 from longline.eval.trajectory import ToolCall, ToolExecution, extract_trajectory, infer_error_type
-from longline.eval.types import EvalCase, ToolCallCase, resolve_fixture
+from longline.eval.types import ABSTENTION_TAG, EvalCase, ToolCallCase, resolve_fixture
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -113,6 +113,29 @@ class CaseResult:
     def steps_completed(self) -> bool:
         """True when every expected decision step was satisfied, in order."""
         return bool(self._step_detail.get("all_steps_matched", False))
+
+    @property
+    def is_abstention_case(self) -> bool:
+        """True for a case whose correct action is to call NO tool.
+
+        BFCL devotes roughly a quarter of its set to this class (240 Irrelevance
+        + 882 Live Irrelevance); a suite where every case demands a call rewards
+        an agent that always calls something. Such a case declares zero expected
+        steps, which makes `all_steps_matched` vacuously true (`all([])`) and
+        would therefore pass even when the agent called a pile of irrelevant
+        tools. This property is what lets the aggregation apply the real rule.
+        """
+        return ABSTENTION_TAG in self.tags
+
+    @property
+    def abstained(self) -> bool:
+        """True when no tool was called at all -- the abstention pass condition."""
+        return self.num_tool_calls == 0
+
+    @property
+    def abstention_ok(self) -> bool:
+        """The pass condition for an abstention case: call nothing, and no extra calls."""
+        return self.steps_completed and self.abstained and self.num_extra_tool_calls == 0
 
     @staticmethod
     def _count(detail: dict[str, object], key: str) -> int:

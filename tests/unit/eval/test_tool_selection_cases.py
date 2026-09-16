@@ -48,9 +48,13 @@ FAMILY_COUNTS: dict[str, int] = {
     "multi": 8,
 }
 
-EXPECTED_BLIND = 48
 EXPECTED_INSTRUCTION_FOLLOWING = 12
-EXPECTED_TOTAL = sum(FAMILY_COUNTS.values())  # 60
+# 8 abstention cases (the correct action is to call no tool) were added after the
+# original 60. They carry no family tag -- they exercise no tool family -- so
+# FAMILY_COUNTS is unchanged and the family sum stays 60.
+EXPECTED_ABSTENTION = 8
+EXPECTED_BLIND = 48 + EXPECTED_ABSTENTION  # 56
+EXPECTED_TOTAL = sum(FAMILY_COUNTS.values()) + EXPECTED_ABSTENTION  # 68
 
 
 @pytest.fixture(scope="module")
@@ -68,16 +72,21 @@ class TestFileShape:
         ids = [c.id for c in cases]
         assert len(ids) == len(set(ids))
 
-    def test_total_is_sixty(self, cases: list[ToolCallCase]) -> None:
-        """60 = 48 blind + 12 instruction-following (plan §4.2)."""
+    def test_total_matches_the_contract(self, cases: list[ToolCallCase]) -> None:
+        """68 = 56 blind + 12 instruction-following.
+
+        The blind half is 48 tool cases + 8 abstention cases. The abstention
+        cases carry no family tag, so the family table below still sums to 60.
+        """
         assert len(cases) == EXPECTED_TOTAL
 
     def test_exact_family_breakdown(self, cases: list[ToolCallCase]) -> None:
-        """Family counts are over the whole 60 (plan §4.2's table sums to 60).
+        """Family counts are over the 60 tool cases (plan §4.2's table sums to 60).
 
         The instruction half carries family tags too, so the split of a family
         between blind and instruction-following is visible here rather than
-        being hidden by an off-by-twelve total.
+        being hidden by an off-by-twelve total. Abstention cases are excluded by
+        construction: they carry no family tag.
         """
         counts: dict[str, int] = {family: 0 for family in FAMILY_COUNTS}
         for c in cases:
@@ -85,6 +94,21 @@ class TestFileShape:
                 if family in c.tags:
                     counts[family] += 1
         assert counts == FAMILY_COUNTS
+
+    def test_abstention_cases_require_calling_nothing(self, cases: list[ToolCallCase]) -> None:
+        """The abstention class is the one BFCL devotes ~25% of its set to.
+
+        A suite where every case requires a call rewards an agent that always
+        calls something. Each abstention case must therefore declare an EMPTY
+        `accepted_tool_steps` (call nothing is the pass condition) and must not
+        be counted in any tool family.
+        """
+        abstention = [c for c in cases if "abstention" in c.tags]
+        assert len(abstention) == EXPECTED_ABSTENTION
+        for c in abstention:
+            assert c.accepted_tool_steps == [], f"{c.id}: abstention case must expect no tool step"
+            assert not (set(c.tags) & set(FAMILY_COUNTS)), f"{c.id}: abstention case carries a family tag"
+            assert BLIND_TAG in c.tags, f"{c.id}: abstention case must be blind (no tool named)"
 
     def test_each_family_contributes_to_both_halves(self, cases: list[ToolCallCase]) -> None:
         # 每个族都必须有盲测样本,否则它的选择率没有分母.

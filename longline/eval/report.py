@@ -209,7 +209,16 @@ def _tool_calling_totals(
     instruction = [r for r in results if INSTRUCTION_FOLLOWING_TAG in r.tags]
 
     # Denominator: blind tool-call cases only (contract §5.2 exclusion rule).
-    select_num = sum(1 for r in blind if r.steps_completed)
+    #
+    # Abstention cases need a different rule from ordinary cases. An ordinary
+    # case passes when every expected step was matched. An abstention case
+    # expects NO step, so `all_steps_matched` is vacuously true for it and would
+    # pass even when the agent called a pile of irrelevant tools. `abstention_ok`
+    # is the real condition: call nothing, and no extra calls.
+    select_num = sum(
+        1 for r in blind
+        if (r.abstention_ok if r.is_abstention_case else r.steps_completed)
+    )
     # Denominator: EVERY requested call, extras included.
     calls = sum(r.num_tool_calls for r in results)
     matched = sum(r.num_matched_tool_calls for r in results)

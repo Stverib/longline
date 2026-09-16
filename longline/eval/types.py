@@ -39,6 +39,17 @@ class CaseParseError(ValueError):
     """Raised when a case line is malformed or fails schema validation."""
 
 
+# Case-kind tags. Defined in production code because the judging and reporting
+# layers both need them and tests/ is not an importable target for longline/.
+BLIND_TAG = "blind"
+INSTRUCTION_FOLLOWING_TAG = "instruction-following"
+# A case whose correct action is to call NO tool. BFCL gives roughly a quarter
+# of its set to this class (240 Irrelevance + 882 Live Irrelevance); a suite
+# where every case demands a call rewards an agent that always calls something,
+# which biases ToolSelectionCaseAccuracy upward.
+ABSTENTION_TAG = "abstention"
+
+
 def resolve_fixture(
     fixtures_root: Path,
     name: str,
