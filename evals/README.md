@@ -1,13 +1,16 @@
 # Agent Runtime 评测：指标契约与数据说明
 
 > 冻结日期：2026-09-15
-> 上游计划：`docs/superpowers/plans/2026-09-15-agent-runtime-metrics.md`
 
 本文件是**指标契约（metric contract）**：所有正式数字的公式、分子、分母、排除条件和命名，
 以本文件为唯一准绳。任何报告、README 或简历数字若与本文件冲突，以本文件为准。
 
-计划文档中写的是 `cc/eval/`，本仓库真实包名是 `longline/`，两者一一对应
-（`cc/eval/` → `longline/eval/`）。本文档按真实路径书写。
+**本文件是自包含的**：它记录的是最终口径，不依赖任何外部文档就能读通、能据以实现。
+本项目另有一份内部的设计计划（当初据此实现，含排期与任务分解），但该文档属于
+不入库的内部材料，**克隆本仓库的人拿不到它，也不需要它** —— 需要的口径都已经写在这里。
+
+原先的分工说明「计划里写的是 `cc/eval/`，真实包名是 `longline/`」，只在读那份计划时才有意义，
+与本文件的读者无关，故删除。
 
 ---
 
@@ -643,7 +646,7 @@ uv run --extra dev pytest tests/unit/eval -q
 
 ## 相关文档
 
-- 上游计划（指标定义来源）：`docs/superpowers/plans/2026-09-15-agent-runtime-metrics.md`
+- 指标口径的业界出处见本文件末尾「附：指标口径的业界出处」
 - 基线格式与冻结流程：`evals/baselines/README.md`
 
 ---

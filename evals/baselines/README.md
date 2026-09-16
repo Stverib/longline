@@ -1,7 +1,6 @@
 # Baselines：冻结基线与回归门槛
 
-> 上游计划：`docs/superpowers/plans/2026-09-15-agent-runtime-metrics.md`（§9 Task 9）
-> 指标契约：`evals/README.md`
+> 指标契约：`evals/README.md`（本目录的口径以它为准）
 
 本目录存放**冻结基线**。基线的作用是给回归判定一个固定参照物，
 不是「最好的成绩单」。
@@ -137,4 +136,3 @@
 ## 相关文档
 
 - 指标契约（公式 / 分母 / 排除条件 / 统计口径）：`evals/README.md`
-- 上游计划：`docs/superpowers/plans/2026-09-15-agent-runtime-metrics.md`
