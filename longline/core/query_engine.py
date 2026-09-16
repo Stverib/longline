@@ -50,7 +50,7 @@ from longline.core.query_loop import query_loop
 from longline.models.messages import Message, UserMessage
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
     import anthropic
 
@@ -103,6 +103,19 @@ class QueryEngine:
         self._max_turns = max_turns
         self._context_window = context_window  # 用于 auto-compact 阈值判断（默认 200K 对应 Claude 3.5）
         self._messages: list[Message] = []  # 整个会话的 transcript，贯穿多轮 submit/run_turn
+        # Fault-injection handles (see `longline/eval/faults.py`). Declared here
+        # rather than poked on from outside so the harness has a real attribute
+        # to set, and so a reader can see at a glance that the engine carries
+        # two optional hooks the evaluation layer uses and production never
+        # writes. Both are None in every non-eval construction path.
+        self.injection_record: Any | None = None
+        self.fault_wrapper: Any | None = None
+        # Retry back-off passed through to query_loop. None means the loop's own
+        # default (`asyncio.sleep`), i.e. production behaviour. The eval harness
+        # sets a recorder here so the back-off is observable without waiting it
+        # out -- and without the process-global `asyncio.sleep` monkeypatch that
+        # this replaced.
+        self.sleep_fn: Any | None = None
         # token 计数器：跨轮次累计，用于 UI 显示总消耗。
         # 注意：这些字段目前只在 main.py 中通过 property 读取，
         # 实际累加逻辑在 main.py 的事件循环中（通过 TurnComplete.usage 累加），
@@ -184,6 +197,7 @@ class QueryEngine:
         *,
         max_turns: int | None = None,
         auto_compact: bool = True,
+        auto_compact_fn: Callable[..., Any] | None = None,
     ) -> AsyncIterator[QueryEvent]:
         """Submit a user message and yield events from the query loop.
 
@@ -192,12 +206,19 @@ class QueryEngine:
 
         适用场景: --print 一次性模式（单次提问 → 输出 → 退出）。
         与 run_turn() 的区别: submit() 会自动将 user_input 包装为 UserMessage 并追加到 messages。
+
+        `auto_compact_fn` overrides the summariser `submit` would otherwise build
+        from this engine's own model. It exists so an offline harness can supply
+        a scripted summary instead of reaching the API. When it is None (the
+        default) the behaviour is exactly as before — a caller that passes
+        nothing sees no change, which is every existing caller.
         """
         self._messages.append(UserMessage(content=user_input))
 
         # auto_compact_fn 使用 max_tokens=4096 的低配版 call_model，
         # 因为压缩摘要不需要长输出，省 token 且减少延迟
-        auto_compact_fn = self.make_call_model(max_tokens=4096) if auto_compact else None
+        if auto_compact_fn is None and auto_compact:
+            auto_compact_fn = self.make_call_model(max_tokens=4096)
 
         perm_checker = self._build_permission_checker()
 
@@ -211,6 +232,7 @@ class QueryEngine:
             context_window=self._context_window,
             hooks=self._hooks,
             permission_checker=perm_checker,
+            sleep=self.sleep_fn,
         ):
             yield event
 

@@ -194,7 +194,40 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run only cases tagged 'instruction-following'. Reported "
              "separately and never mixed into the blind number.",
     )
+    # --- Task 5 additions ---
+    p.add_argument(
+        "--resume", default=None, metavar="SESSION_JSON",
+        help="Resume a session saved under a temp claude_dir: loads the "
+             "transcript with the production load_session()/validate_transcript(), "
+             "restores the Task snapshot, and prints a JSON report. This is the "
+             "resume leg of the Process-Kill recovery case.",
+    )
+    p.add_argument(
+        "--emit-result", default=None, metavar="PATH",
+        help="Also write the CaseResult of the last case as JSON to PATH. "
+             "Used by the recovery runner's subprocess worker so the parent "
+             "reads the child's verdict off a file rather than stdout.",
+    )
     return p.parse_args(argv)
+
+
+def _run_resume(args: argparse.Namespace) -> int:
+    """Restore a session from `--resume` and report what came back.
+
+    Goes through the same three production calls `main.py --resume` makes, in
+    the same order. The JSON report is the subprocess worker's only channel, so
+    it is written to stdout and nothing else is printed there.
+    """
+    from longline.eval.recovery_worker import resume
+
+    spec_path = Path(args.resume)
+    if not spec_path.is_file():
+        print(json.dumps({"found": False, "error": f"spec not found: {spec_path}"}))
+        return 1
+    report = resume(json.loads(spec_path.read_text(encoding="utf-8")))
+    report["phase"] = "resume"
+    print(json.dumps(report, ensure_ascii=False))
+    return 0
 
 
 _ORIGINAL_ARGV: list[str] | None = None
@@ -582,6 +615,16 @@ async def _run(argv: Sequence[str] | None = None) -> int:
 
     report = aggregate(all_results, variant=args.variant)
     _print_run_summary(report, len(all_results))
+
+    if args.emit_result is not None and all_results:
+        # The worker's channel to its parent. Deliberately the LAST case's
+        # result and not an aggregate: a worker subprocess runs exactly one
+        # case, and an aggregate of one is the same object with more places to
+        # disagree.
+        Path(args.emit_result).write_text(
+            json.dumps(all_results[-1].to_raw_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     metadata = run_metadata(
         run_id=run_id, suite=suite, variant=args.variant, model=args.model,

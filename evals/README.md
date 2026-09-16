@@ -21,6 +21,8 @@
 | `evals/tool_calls.jsonl` | **legacy** | 30 条工具调用用例。instruction-following 数据，**不进入简历主数字**。 |
 | `evals/tool_selection.jsonl` | **生效** | 68 条工具调用用例（56 盲测 + 12 instruction-following）。盲测 = 48 工具族 + 8 弃权。 |
 | `evals/e2e.jsonl` | **生效** | 40 条端到端用例，5 类 × 8，Task 3 产物。 |
+| `evals/compression.jsonl` | **生效** | 20 条长上下文用例，Task 4 产物。 |
+| `evals/recovery.jsonl` | **生效** | 6 条故障定义 × `repeat: 10` = **60 次运行**，Task 5 产物。 |
 | `evals/fixtures/` | 生效 | 沙箱起始状态。 |
 | `evals/results/` | 生效 | 运行产物，布局见 §3。 |
 | `evals/baselines/` | 生效 | 冻结基线，格式见 `evals/baselines/README.md`。 |
@@ -407,6 +409,56 @@ Process Kill 还必须**成功加载 checkpoint**，并**通过 transcript 结�
 **不宣称 exactly-once**。若后续要证明任意中断点无重复副作用，需要另做 durable tool journal + 幂等键，
 不塞进本轮指标工程。
 
+#### 实现说明（Task 5，2026-09-16）
+
+**数据集**：`evals/recovery.jsonl` 共 **6 条定义**，每条 `repeat: 10`，由 loader 展开为
+**60 次运行**：运行时 5 类 × 10 = **50**，Process Kill **10**。分母因此正好是 `50` 与 `10`。
+每条定义只对应一个故障类；为同一类再加一条定义会把运行时分母推离 50，
+而契约固定的是 50/10 这两个数。「注入点在前两次 model call」的另一半（第二次调用）
+由单元测试覆盖，不进数据集。
+
+**每个注入器都带计数器**，`success` 由 `recovery_succeeded()` 计算而非赋值：
+
+```text
+success = fault_injected AND retry_count > 0 AND passed
+          AND (fault != process_kill OR (checkpoint_loaded AND transcript 结构合法))
+```
+
+`fault_injected` 是**成功表达式的第一项**，这条规则的作用是：**没有真正注入故障的运行
+永远不可能被计为恢复成功**——它可能是一次普通成功，但那不是恢复。未注入的运行
+**仍留在分母里**并被记入失败清单，不静默丢弃。
+
+**故障不携带答案**：`build_injection_events()` 只返回故障事件（429/529 只有 `ErrorEvent`；
+truncate 只有被截断的前半段；overflow 只有 413）。任一注入事件都不含 `answer`，
+否则「没恢复也判过」——那正是本任务要防的失败模式。单元测试逐类断言这一点。
+
+**两类注入方言**：429/529/truncate/overflow 由脚本化 model stream 注入；Tool Failure 由
+`ToolFaultWrapper` 包住**生产工具**实现（首次调用返回 `is_error=true`，之后透传）；
+Process Kill 由真实子进程 kill + 新解释器 resume 实现。恢复路径本身**全部复用**
+`query_loop` 的既有实现，注入器不重新实现任何一条。
+
+**Process Kill 的三步证据**：`prepare` 阶段把 transcript 与 Task 快照写入临时 `claude_dir`
+并回读校验稳定事实；随后对**活着的子进程**发送 kill；`resume` 在**全新解释器**里调用
+生产函数 `load_session()` → `validate_transcript()` → `load_task_snapshot()` →
+`TaskRegistry.restore()`，重新读取稳定事实并打印。非终态后台任务恢复后被标记为
+**KILLED**，因此**不得**表述为「后台任务原地续跑」。
+
+**`claude_dir` 永远是临时目录**。`get_sessions_dir(None)` 会回退到 `~/.longline`，
+所以任何一处漏传参数都会把评测会话写进用户的真实状态目录。
+单元测试与集成测试都对真实目录做**前后哈希对比**，证明其逐字节未变。
+
+**`transcript_repaired`**：生产 `validate_transcript()` 原本把「是否修复过」只写进日志。
+新增 keyword-only 的 `report=` 出参（`TranscriptRepairReport`），默认 `None`，
+所有既有调用方行为不变；恢复用例据此逐例记录该字段。
+
+**验收对照**：`query_loop` 的重试上限与截断恢复上限改为参数（默认即原常量），
+`disable_recovery=True` 时传 0，因此**关闭恢复策略后对应故障不再恢复**——
+这是计划 §4.4 验收条件的可执行形式，两个方向都有测试。
+
+**不得夸大的部分**：`duplicate_persisted_tool_calls` 只检查**已落盘的完整工具结果**
+是否被重复执行。落在「工具已产生副作用、结果尚未落盘」窗口内的 kill 归类为
+`ambiguous_side_effect`——**既不算重复，也不宣称安全**。本版本**不声称 exactly-once**。
+
 ### 5.5 Streaming Tool Latency（计划 §4.5）
 
 使用 **30～50 轮成对 A/B**，事件流和工具耗时**完全相同**：
@@ -637,6 +689,9 @@ uv run --extra dev python -c "from pathlib import Path; from longline.eval.types
 
 # 新工具选择集：总量与盲测/回归拆分（预期输出：60 48 12）
 uv run --extra dev python -c "from pathlib import Path; from longline.eval.types import load_cases; cs=load_cases(Path('evals/tool_selection.jsonl')); print(len(cs), sum('blind' in c.tags for c in cs), sum('instruction-following' in c.tags for c in cs))"
+
+# 恢复集：展开后的运行数与 50/10 分母（预期输出：60 50 10）
+uv run --extra dev python -c "from pathlib import Path; from longline.eval.recovery import load_recovery_cases; cs=load_recovery_cases(Path('evals/recovery.jsonl')); print(len(cs), sum(c.fault!='process_kill' for c in cs), sum(c.fault=='process_kill' for c in cs))"
 
 # 评测单测（含泄漏检查与数据集契约）
 uv run --extra dev pytest tests/unit/eval -q

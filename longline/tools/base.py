@@ -140,6 +140,24 @@ class ToolRegistry:
         # 调用方（orchestration）会将 None 转化为 is_error=True 的 ToolResult。
         return self._tools.get(name)
 
+    def swap(self, name: str, tool: Tool) -> Tool | None:
+        """Replace an already-registered tool, returning the one it replaced.
+
+        The counterpart to `register` for callers that need to wrap a tool
+        rather than add one -- the evaluation harness's fault injectors are the
+        case in point. It is a named method rather than direct `_tools` access
+        so the replacement is visible in the public surface, and it REFUSES an
+        unknown name: swapping a tool that was never registered would install
+        one the profile never declared, which is a silent change to what the
+        model can call. Returns None when the name was absent, so a caller that
+        means "replace if present" can say so.
+        """
+        if name not in self._tools:
+            raise KeyError(f"Tool not registered: {name}")
+        previous = self._tools[name]
+        self._tools[name] = tool
+        return previous
+
     def list_tools(self) -> list[Tool]:
         """Return all registered tools."""
         # 用于 AgentTool 构建子 registry 时遍历父 registry 的所有工具

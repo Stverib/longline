@@ -80,13 +80,14 @@ from longline.models.messages import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from longline.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 # === 错误恢复常量（对应 TS: query.ts 中的同名常量） ===
+MAX_RETRY = 5                        # 429/529 等可恢复错误的默认重试上限（防止无限重试）
 MAX_OUTPUT_TOKENS_RECOVERY = 3       # max_tokens 截断后最多重试 3 次（追加 "请继续" 消息）
 ESCALATED_MAX_TOKENS = 65536         # 第一次 max_tokens 截断时，将限制从 16K 提升到 64K
 DEFAULT_CONTEXT_WINDOW = 200_000     # Claude 3.5 的上下文窗口大小，用于 auto-compact 阈值计算
@@ -103,6 +104,9 @@ async def query_loop(
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     hooks: Sequence[object] | None = None,  # Sequence[HookConfig] at runtime
     permission_checker: Callable[..., object] | None = None,  # P2a wiring
+    max_retry: int = MAX_RETRY,
+    max_max_output_recovery: int = MAX_OUTPUT_TOKENS_RECOVERY,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> AsyncIterator[QueryEvent]:
     """Execute the core conversation loop.
 
@@ -113,15 +117,31 @@ async def query_loop(
     - T5.4: Auto-compact integration (token threshold detection)
     - Hooks: passed through to run_tools() for pre/post tool execution
 
+    `max_retry` and `max_max_output_recovery` are the two recovery budgets, and
+    they are parameters rather than module constants so a test can turn the
+    recovery path OFF and assert that the fault does not recover
+    (`tests/unit/eval/test_recovery_runner.py`). Both default to the production
+    constants, so every existing caller passes no argument and behaves exactly
+    as before. Turning a budget off makes the corresponding error terminal, not
+    silently absent: the loop still yields the ErrorEvent it always yielded.
+
+    `sleep` is the retry back-off, injected rather than read from the module.
+    The default is `asyncio.sleep`, i.e. production behaviour; a caller may pass
+    a recorder to observe the back-off without waiting it out. It is a parameter
+    specifically so that observing it does NOT require monkeypatching
+    `asyncio.sleep` -- that name lives on the shared `asyncio` module, so
+    patching it is process-global and leaks into every other coroutine.
+
     Bug fixes per check.md:
     - Recoverable errors no longer silently consume turns → tracked separately
     - Tool follow-up checks tool_use_blocks presence, not just stop_reason
     """
+    sleep_fn = sleep if sleep is not None else asyncio.sleep
     # === 状态机变量初始化 ===
     turn_count = 0                          # 有效轮次计数（成功的 API 调用才 +1）
-    retry_count = 0                         # 重试计数器：与 turn_count 分离，重试不消耗轮次预算
-    max_retry = 5                           # 重试上限：防止 429/529 无限重试
-    max_output_recovery_count = 0           # max_tokens 截断恢复次数（最多 MAX_OUTPUT_TOKENS_RECOVERY 次）
+    retry_count = 0                         # 重试计数器: 与 turn_count 分离, 重试不消耗轮次预算
+                                            # 上限由参数 max_retry 给出（默认 MAX_RETRY）
+    max_output_recovery_count = 0           # max_tokens 截断恢复次数（上限由 max_max_output_recovery 给出）
     has_attempted_reactive_compact = False   # 是否已尝试过响应式压缩（只允许一次，防止循环压缩）
     compact_consecutive_failures = 0        # 连续 compact 失败次数（超过阈值后 should_auto_compact 会放弃）
     current_max_tokens = 16384              # 当前 max_tokens，可能被 escalate 到 ESCALATED_MAX_TOKENS
@@ -212,7 +232,11 @@ async def query_loop(
             # 恢复策略 1: prompt_too_long (HTTP 413) → 响应式压缩
             # 与 Phase 1 的主动压缩不同，这里是 API 已经拒绝了请求后的被动应对
             if "413" in error_event.message or "prompt_too_long" in error_event.message:
-                if not has_attempted_reactive_compact and auto_compact_fn is not None:
+                if (
+                    not has_attempted_reactive_compact
+                    and max_max_output_recovery > 0
+                    and auto_compact_fn is not None
+                ):
                     has_attempted_reactive_compact = True  # 只尝试一次，避免压缩-重试-压缩死循环
                     try:
                         from longline.compact.compact import compact_messages
@@ -235,7 +259,7 @@ async def query_loop(
                     current_max_tokens = ESCALATED_MAX_TOKENS
                     max_output_recovery_count += 1
                     recovered = True
-                elif max_output_recovery_count < MAX_OUTPUT_TOKENS_RECOVERY:
+                if not recovered and max_output_recovery_count < max_max_output_recovery:
                     # 后续截断：保存已有输出，追加"请继续"让模型接续
                     max_output_recovery_count += 1
                     if accumulated_text:
@@ -250,7 +274,7 @@ async def query_loop(
             elif error_event.is_recoverable and retry_count < max_retry:
                     retry_count += 1
                     # 退避时间: 2s, 4s, 6s, 8s, 10s（线性增长，上限 10s）
-                    await asyncio.sleep(min(2.0 * retry_count, 10.0))
+                    await sleep_fn(min(2.0 * retry_count, 10.0))
                     recovered = True
 
             if recovered:
@@ -269,7 +293,7 @@ async def query_loop(
         # 与 Phase 3 的 max_output_tokens 错误不同：这里是 API 正常返回但输出被截断
         if (
             stop_reason == "max_tokens"
-            and max_output_recovery_count < MAX_OUTPUT_TOKENS_RECOVERY
+            and max_output_recovery_count < max_max_output_recovery
             and accumulated_text
         ):
             # transcript 写入点 4: 保存截断的输出 + 续写请求

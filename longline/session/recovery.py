@@ -12,6 +12,7 @@ Ensures transcripts are API-safe after resume (crash, process exit, etc.).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 from longline.models.messages import (
     AssistantMessage,
@@ -26,7 +27,63 @@ logger = logging.getLogger(__name__)
 SYNTHETIC_TOOL_RESULT_PLACEHOLDER = "[Tool result missing due to internal error]"
 
 
-def validate_transcript(messages: list[Message]) -> list[Message]:
+@dataclass
+class TranscriptRepairReport:
+    """What `validate_transcript()` had to repair, if anything.
+
+    Previously "did this call repair anything?" was a local variable that only
+    reached a log line, which made it unusable as evidence: the recovery metric
+    has to record `transcript_repaired` per case, and a fact that exists only in
+    a log is not a fact a report can be recomputed from.
+
+    It behaves as a list of the repair kinds that fired, because that is the
+    most useful shape for a reader -- ``"truncated_tail" in report`` is how you
+    ask "did the crash-truncation repair run". The authoritative answer to "was
+    anything repaired" is `repaired`, which is set from the same code path that
+    writes the log line, so the two cannot disagree.
+    """
+
+    repairs: list[str] = field(default_factory=list)
+    orphaned_tool_use_ids: list[str] = field(default_factory=list)
+
+    @property
+    def repaired(self) -> bool:
+        """True when at least one repair was applied."""
+        return bool(self.repairs)
+
+    def __bool__(self) -> bool:
+        """Falsy when nothing was repaired, so `if report:` reads as expected."""
+        return self.repaired
+
+    def __contains__(self, kind: object) -> bool:
+        return kind in self.repairs
+
+    def __iter__(self) -> object:
+        """Iterate the repair kinds, so the report reads as a list of what fired."""
+        return iter(self.repairs)
+
+    def __len__(self) -> int:
+        return len(self.repairs)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "repaired": self.repaired,
+            "repairs": self.repairs,
+            "num_orphaned_tool_uses": len(self.orphaned_tool_use_ids),
+            "orphaned_tool_use_ids": self.orphaned_tool_use_ids,
+        }
+
+
+# The repair kinds `TranscriptRepairReport.repairs` may contain.
+REPAIR_TRUNCATED_TAIL = "truncated_tail"
+REPAIR_MID_ORPHANS = "mid_orphans"
+
+
+def validate_transcript(
+    messages: list[Message],
+    *,
+    report: TranscriptRepairReport | None = None,
+) -> list[Message]:
     """Validate and repair a transcript for API submission.
 
     Corresponds to TS: conversationRecovery.ts validateTranscript().
@@ -39,12 +96,18 @@ def validate_transcript(messages: list[Message]) -> list[Message]:
     3. 角色交替违规（连续相同角色的消息）
        → 由 normalize_messages_for_api() 在下游处理，此处不涉及
 
+    `report` is an optional out-parameter: the caller passes a fresh
+    `TranscriptRepairReport` and reads back which repairs fired. It is
+    keyword-only and defaults to None, so every existing caller and test is
+    unchanged -- a silent in-place mutation is not possible, because the object
+    is created by the caller rather than by this function.
+
     Returns the repaired message list (may modify in place).
     """
     if not messages:
         return messages
 
-    repaired = False
+    repairs = report if report is not None else TranscriptRepairReport()
 
     # ---- 修复 1: 末尾截断 ----
     # 这是最常见的崩溃场景：assistant 发出 tool_use 后，
@@ -69,7 +132,8 @@ def validate_transcript(messages: list[Message]) -> list[Message]:
                 "Transcript recovery: added synthetic results for %d orphaned tool_use(s)",
                 len(tool_uses),
             )
-            repaired = True
+            repairs.repairs.append(REPAIR_TRUNCATED_TAIL)
+            repairs.orphaned_tool_use_ids.extend(tu.id for tu in tool_uses)
 
     # ---- 修复 2: 中间孤立 tool_use ----
     # 较少见但仍可能发生：对话在工具执行中间崩溃，之后用户继续了新的对话，
@@ -122,9 +186,10 @@ def validate_transcript(messages: list[Message]) -> list[Message]:
                 "Transcript recovery: patched %d missing tool_result(s) at message %d",
                 len(missing), i,
             )
-            repaired = True
+            repairs.repairs.append(REPAIR_MID_ORPHANS)
+            repairs.orphaned_tool_use_ids.extend(tu.id for tu in missing)
 
-    if repaired:
+    if repairs.repaired:
         logger.info("Transcript recovery completed — %d messages", len(messages))
 
     return messages
