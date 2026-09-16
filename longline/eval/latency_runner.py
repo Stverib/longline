@@ -188,33 +188,46 @@ DEFAULT_SAMPLES = 40
 # shipped cases are written at 1x (sub-millisecond blocks) and run at this
 # factor, so the reported milliseconds read as a real millisecond-scale turn.
 #
-# 20x. The number is set by ONE measured ratio: the per-turn truth error divided
-# by the smallest signal the cases assert (one block delay, 20 ms declared).
+# ============================== READ THIS ==================================
+# **This benchmark is only valid on an IDLE host, and that is a precondition of
+# the measurement rather than a nuisance.** `DEFAULT_TIME_SCALE` is chosen so
+# the truth-check tolerance clears this machine's jitter; running the suite
+# while anything else is saturating the box inflates that jitter past the
+# tolerance and makes the gate reject CORRECT runs. Measured: the same code and
+# the same test passed in 220 s with the machine to itself and failed at
+# exactly 100.0 ms of error against a 100.0 ms tolerance while a test run was
+# sharing the box. Do not run this suite concurrently with another heavy job,
+# and do not "fix" a failure seen under load by widening the tolerance -- see
+# `_MAX_TOLERANCE_SIGNAL_FRACTION` for why that trades away the check.
+# ===========================================================================
 #
-#   scale   signal   worst error   error/signal
-#   1x        20 ms       ~35 ms        1.75    signal inside the noise
-#   8x       160 ms       ~38 ms        0.24    the check accepts half a tail
-#   20x      400 ms       ~46 ms        0.12    <- shipped
-#   40x      800 ms       ~75 ms        0.09    3% better, 2x the runtime
+# 20x, set by ONE measured ratio: the per-turn truth error divided by the
+# smallest signal the cases assert (one block delay, 20 ms declared).
+#
+#   scale   signal    worst error    error/signal   tolerance   margin
+#   1x        20 ms      ~35 ms          1.75          40 ms     negative
+#   8x       160 ms   38/62/99 ms     0.24-0.62        40 ms     NEGATIVE
+#   20x      400 ms   41-62 ms        0.10-0.16       100 ms     +38..+59 ms <- shipped
+#   50x     1000 ms   47-100 ms       0.05-0.10       250 ms     +150..+200 ms
+#
+# `tolerance` is what the shipped 1/4 cap produces for lat-001 (the tightest
+# case: its long tool makes for the longest turn); `margin` is that tolerance
+# minus the worst error observed. **At 8x the margin is negative** -- 40 ms of
+# tolerance against 62-99 ms of observed error -- which is why the suite failed
+# outright there rather than merely being tight. The two 8x numbers near 100 ms
+# came from runs sharing the host with another job; the 62 ms is the idle-host
+# figure, and even that does not fit under a 40 ms cap.
 #
 # The error does NOT shrink with the scale -- it is `asyncio.sleep` overshoot,
-# roughly constant at 20-75 ms -- while the signal grows linearly. So the scale
+# roughly constant at 20-100 ms -- while the signal grows linearly. So the scale
 # is the only lever on the ratio, and the ratio is what decides whether the
 # truth check means anything at all.
 #
-# Why not 8x, which looks adequate in that table. Because "adequate" has to be
-# judged against BOTH ends of the window, and at 8x they collide. Measured on
-# this host across three independent runs, the error reached 38 ms, 82 ms and
-# 100 ms -- and the check must ALSO reject a wrong measurement, the smallest of
-# which is one response tail (160 ms at 8x). A tolerance wide enough for 100 ms
-# of jitter leaves only a factor of 1.6 below the error it must catch, and the
-# run that produced 84 ms of error against an 80 ms tolerance failed outright.
-# At 20x the same jitter is 46 ms against a 400 ms tail: a factor of 8.7.
-#
 # Cost: ~5.4 s per pair at 20x, so a full run of 3 cases x 45 pairs (40 samples
-# + 5 warmups) is ~13 minutes. That is the price of a check that discriminates;
-# the alternative measured here was a suite that failed correct runs. The
-# previous default of 1000x would have been ~13 HOURS.
+# + 5 warmups) is ~13 minutes idle, and was observed at 220 s for a single
+# 30-sample case when the box was busy. That is the price of a check that
+# discriminates; the alternative measured here was a suite that failed correct
+# runs. The previous default of 1000x would have been ~13 HOURS.
 DEFAULT_TIME_SCALE = 20.0
 
 # The `tags` marker that identifies a latency row in `raw.jsonl`. These rows do
