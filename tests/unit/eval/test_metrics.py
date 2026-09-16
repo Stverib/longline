@@ -16,8 +16,11 @@ from longline.eval.metrics import (
     ci95_percentile,
     mean,
     paired_delta,
+    pass_at_k,
+    pass_pow_k,
     percentage_points,
     percentile,
+    reliability_ratio,
     wilson_ci,
 )
 
@@ -277,3 +280,72 @@ def test_percentage_points_is_a_pp_difference() -> None:
 def test_percentage_points_is_none_when_either_side_unmeasured() -> None:
     assert percentage_points(Ratio(0, 0), Ratio(3, 4)) is None
     assert percentage_points(Ratio(3, 4), Ratio(0, 0)) is None
+
+
+# --- pass@k / pass^k (tau-bench estimators, Yao et al. arXiv:2406.12045) ---
+#
+# These pin the exact numbers so the formulas cannot drift. The values are
+# computed by hand from C(c,k)/C(n,k); see the derivation in each docstring.
+
+
+def test_pass_pow_k_at_n_equals_k_is_all_runs_passed() -> None:
+    # C(c,3)/C(3,3): 1 when c == 3, else 0. This is the practical pass^3.
+    assert pass_pow_k(3, 3, 3) == 1.0
+    assert pass_pow_k(2, 3, 3) == 0.0
+    assert pass_pow_k(0, 3, 3) == 0.0
+
+
+def test_pass_pow_k_general_form_is_not_the_indicator() -> None:
+    # n > k: C(3,2)/C(5,2) = 3/10. A naive "fraction of tasks with c == k"
+    # would say 0 here; the unbiased estimator says 0.3.
+    assert pass_pow_k(3, 5, 2) == pytest.approx(0.3)
+    assert pass_pow_k(2, 4, 2) == pytest.approx(1 / 6)
+
+
+def test_pass_at_k_general_form() -> None:
+    # 1 - C(n-c,k)/C(n,k): 1 - C(2,2)/C(5,2) = 1 - 2/10 = 0.8? No:
+    # 1 - C(5-3,2)/C(5,2) = 1 - C(2,2)/10 = 1 - 0.1 = 0.9
+    assert pass_at_k(3, 5, 2) == pytest.approx(0.9)
+    assert pass_at_k(0, 4, 2) == 0.0
+    assert pass_at_k(3, 4, 2) == 1.0
+
+
+def test_pass_at_k_and_pass_pow_k_are_dual() -> None:
+    # Same binomial form, opposite tails: pass@k rises with success, pass^k
+    # falls. For n == k they bracket: any c strictly between 0 and n gives
+    # pass@k == 1 and pass^k == 0.
+    for n in (2, 3, 4):
+        for c in range(1, n):
+            assert pass_at_k(c, n, n) == 1.0, (c, n)
+            assert pass_pow_k(c, n, n) == 0.0, (c, n)
+
+
+def test_pass_estimators_reject_bad_input() -> None:
+    with pytest.raises(ValueError):
+        pass_at_k(3, 0, 1)
+    with pytest.raises(ValueError):
+        pass_pow_k(3, 3, 0)
+    with pytest.raises(ValueError):
+        pass_pow_k(4, 3, 1)
+
+
+def test_reliability_ratio_counts_all_k_passers() -> None:
+    # Three cases with 3 trials each: 3/3, 2/3, 0/3 -> only the first passes all.
+    r = reliability_ratio([3, 2, 0], [3, 3, 3], 3)
+    assert r.numerator == 1
+    assert r.denominator == 3
+    assert r.value == pytest.approx(1 / 3)
+
+
+def test_reliability_ratio_distinguishes_stable_from_flaky() -> None:
+    # This is the whole point of the metric: 1/1/1 vs 1/0/1 both mean 0.667
+    # under pass@1, but only the first is reliable.
+    stable = reliability_ratio([3], [3], 3)
+    flaky = reliability_ratio([2], [3], 3)
+    assert stable.value == 1.0
+    assert flaky.value == 0.0
+
+
+def test_reliability_ratio_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError):
+        reliability_ratio([1, 2], [3], 3)

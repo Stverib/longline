@@ -13,7 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from longline.eval.metrics import Ratio, mean, paired_delta, percentage_points, percentile
+from longline.eval.metrics import (
+    Ratio,
+    mean,
+    paired_delta,
+    percentage_points,
+    percentile,
+    reliability_ratio,
+)
 from longline.eval.types import E2E_CATEGORY_TAGS
 
 if TYPE_CHECKING:
@@ -66,6 +73,17 @@ class EvalReport:
     # --- metric-contract shapes (Task 1) ---
     l1_ratio: Ratio = field(default_factory=lambda: Ratio(0, 0))
     l2_ratio: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    # pass^k (tau-bench, arXiv:2406.12045): the fraction of E2E tasks on which
+    # EVERY repeat passed. Reported next to `l2_ratio` because the two answer
+    # different questions -- `l2_ratio` is the mean success rate, `l2_pass_k` is
+    # the reliability of that mean. Three runs of 1/1/1 and 1/0/1 are identical
+    # under the former (0.667) and opposite under the latter (1.0 vs 0.0).
+    l2_pass_k: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    l2_pass_k_k: int = 0
+    l2_repeats: int = 0
+    # Pass rate by how many tool calls the case actually needed. Diagnostic
+    # only: the count never enters a pass condition (plan §4.1).
+    by_tool_call_bucket: dict[str, GroupSummary] = field(default_factory=dict)
     tool_execution_rate: Ratio = field(default_factory=lambda: Ratio(0, 0))
     # --- Task 2: the four tool-calling metrics, each with its own denominator ---
     # `tool_selection_case_accuracy` is the resume-facing number and excludes
@@ -96,6 +114,12 @@ class EvalReport:
             "variant": self.variant,
             "l1_tool_accuracy": self.l1_ratio.to_dict(),
             "l2_pass1": self.l2_ratio.to_dict(),
+            # Reliability, not accuracy: the fraction of tasks passing ALL k
+            # repeats. `l2_pass_k_k` records which k this was computed at, since
+            # a pass^1 and a pass^3 are not the same claim.
+            "l2_pass_k": self.l2_pass_k.to_dict(),
+            "l2_pass_k_k": self.l2_pass_k_k,
+            "l2_repeats": self.l2_repeats,
             "tool_execution_rate": self.tool_execution_rate.to_dict(),
             # Task 2: four metrics, four independent denominators.
             "tool_calling": {
@@ -120,6 +144,8 @@ class EvalReport:
                 "p95": self.p95_duration_ms,
             },
             "by_category": {k: v.to_dict() for k, v in self.by_category.items()},
+        # Diagnostic stratification, not a pass condition (plan §4.1).
+        "by_tool_call_bucket": {k: v.to_dict() for k, v in self.by_tool_call_bucket.items()},
             "by_variant": {k: v.to_dict() for k, v in self.by_variant.items()},
             "per_case": self.per_case,
         }
@@ -157,6 +183,43 @@ def _summarize_group(results: list[CaseResult]) -> GroupSummary:
         avg_duration_ms=mean(durations),
         failure_types=_failure_type_counts(results),
     )
+
+
+def _tool_call_buckets(results: list[CaseResult]) -> dict[str, GroupSummary]:
+    """Pass rate bucketed by how many tool calls the case actually needed.
+
+    The contract (plan §4.1) requires the long-chain category's final result and
+    its call count to be reported SEPARATELY: the call count is diagnostic and
+    must never decide pass/fail. This is that split -- the number of calls is
+    the bucketing key, never a component of the pass condition.
+
+    The field standard for multi-step credit assignment is a per-class
+    breakdown (OSWorld and WebArena break down by domain, GAIA by difficulty
+    level) rather than per-step scoring, which is what this does. Bucketing also
+    converts an admitted weak spot into a reported stratification: it shows
+    whether success degrades as the chain lengthens, which a single aggregate
+    success rate hides.
+
+    Empty buckets are omitted rather than reported as 0%, so a bucket of zero
+    cases cannot be misread as a 0% success rate.
+    """
+    buckets: dict[str, list[CaseResult]] = {}
+    for r in results:
+        if r.case_type != "e2e":
+            continue
+        n = r.num_tool_calls
+        # Coarse, human-readable bands; the boundaries are a presentation
+        # choice, stated here so the report can name them.
+        if n <= 2:
+            label = "0-2 calls"
+        elif n <= 5:
+            label = "3-5 calls"
+        elif n <= 9:
+            label = "6-9 calls"
+        else:
+            label = "10+ calls"
+        buckets.setdefault(label, []).append(r)
+    return {label: _summarize_group(v) for label, v in buckets.items()}
 
 
 def category_metrics(
@@ -240,6 +303,22 @@ def _tool_calling_totals(
     }
 
 
+def _repeat_outcomes(results: list[CaseResult]) -> tuple[list[int], list[int]]:
+    """Group results by case id into (successes per case, trials per case).
+
+    A 3-repeat suite appends three CaseResults per case, differing only in
+    `repeat_index`. Collapsing them here is what makes pass^k computable: the
+    mean success rate (pass@1) over those three runs cannot tell an agent that
+    passed 1/1/1 from one that passed 1/0/1, while pass^3 can.
+    """
+    trials: dict[str, list[bool]] = {}
+    for r in results:
+        trials.setdefault(r.case_id, []).append(bool(r.passed))
+    successes = [sum(1 for ok in v if ok) for v in trials.values()]
+    counts = [len(v) for v in trials.values()]
+    return successes, counts
+
+
 def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalReport:
     """Summarize a batch of CaseResults by layer, category, variant and latency."""
     l1 = [r for r in results if r.case_type == "tool_call"]
@@ -247,6 +326,12 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
 
     l1_ratio = Ratio.fraction(r.passed for r in l1)
     l2_ratio = Ratio.fraction(r.passed for r in l2)
+
+    # pass^k over the E2E set. With repeats == 1 this is just the pass rate
+    # again, which is why it is only meaningful on a multi-repeat run.
+    e2e_successes, e2e_trials = _repeat_outcomes(l2)
+    k = min(e2e_trials) if e2e_trials else 0
+    e2e_pass_k = reliability_ratio(e2e_successes, e2e_trials, k) if k >= 1 else Ratio(0, 0)
 
     executed = sum(r.num_tool_calls_executed for r in results)
     successful = sum(r.num_successful_tool_calls for r in results)
@@ -295,6 +380,9 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         per_case=per_case,
         l1_ratio=l1_ratio,
         l2_ratio=l2_ratio,
+        l2_pass_k=e2e_pass_k,
+        l2_pass_k_k=k,
+        l2_repeats=max(e2e_trials) if e2e_trials else 0,
         tool_execution_rate=Ratio(successful, executed),
         tool_selection_case_accuracy=tool_metrics["tool_selection_case_accuracy"],
         tool_call_precision=tool_metrics["tool_call_precision"],
@@ -307,6 +395,7 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         total_input_tokens=sum(r.input_tokens for r in results),
         total_output_tokens=sum(r.output_tokens for r in results),
         by_category={k: _summarize_group(v) for k, v in categories.items()},
+        by_tool_call_bucket=_tool_call_buckets(l2),
         by_variant={k: _summarize_group(v) for k, v in variants.items()},
         variant=variant,
     )
@@ -364,6 +453,15 @@ def render_markdown(
         f"- **Total cases:** {report.total_cases}",
         f"- **Tool-call accuracy (L1):** {_fmt_pct(report.l1_ratio)} 95% Wilson CI {_fmt_ci(report.l1_ratio)}",
         f"- **E2E pass@1 (L2):** {_fmt_pct(report.l2_ratio)} 95% Wilson CI {_fmt_ci(report.l2_ratio)}",
+        # Reliability alongside accuracy. `pass@1` is the mean success rate;
+        # `pass^k` is the fraction of tasks that passed EVERY repeat. A suite
+        # whose runs alternate pass/fail has a high mean and a low pass^k.
+        (
+            f"- **E2E pass^{report.l2_pass_k_k} (reliability, {report.l2_repeats} runs/case):** "
+            f"{_fmt_pct(report.l2_pass_k)}"
+            if report.l2_repeats > 1
+            else "- **E2E pass^k:** n/a (needs --repeats >= 2)"
+        ),
         f"- **Tool execution success:** {_fmt_pct(report.tool_execution_rate)}",
         "- **Averages:** "
         f"turns={_fmt_num(report.avg_turns, 2)}, "

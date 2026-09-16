@@ -254,3 +254,95 @@ def percentage_points(baseline: Ratio, candidate: Ratio) -> float | None:
     if b is None or c is None:
         return None
     return (c - b) * 100.0
+
+
+# --- pass@k and pass^k (reliability) ---
+#
+# Two estimators sharing one binomial-coefficient form, with opposite tails.
+# Verified against tau-bench (Yao et al., arXiv:2406.12045), which states:
+#
+#     pass@k := 1 - E_task[ C(n - c, k) / C(n, k) ]
+#     pass^k :=     E_task[ C(c,     k) / C(n, k) ]
+#
+# where n is the number of trials for a task, c the number that succeeded, and
+# the expectation is taken across tasks.
+#
+# Why both matter: pass@1 (the mean success rate) cannot tell a stable agent
+# from a lucky one. Three runs yielding 1/1/1 and 1/0/1 both average 0.667, but
+# pass^3 gives 1.0 and 0.0 respectively. tau-bench's headline finding is exactly
+# this gap -- gpt-4o scores pass^1 = 61.2% on tau-retail but pass^8 < 25%.
+#
+# Why the estimator rather than a naive ratio: E[C(c,k)/C(n,k)] is unbiased for
+# the probability that k i.i.d. trials all succeed. Computing it as
+# "fraction of tasks where c == k" is the same number only when n == k (there
+# C(k,k)/C(k,k) = 1 and C(c,k)/C(n,k) = 0 for c < k); for n > k the two differ,
+# so the general form is used throughout rather than special-cased.
+
+
+def _comb(n: int, k: int) -> int:
+    """Binomial coefficient; 0 when k > n (the term contributes nothing)."""
+    if k < 0 or k > n:
+        return 0
+    return math.comb(n, k)
+
+
+def pass_at_k(successes: int, trials: int, k: int) -> float:
+    """Unbiased estimate of "at least one of k trials succeeds".
+
+    Rising in k: a lucky hit counts. Returns 0.0 when successes == 0, and 1.0
+    when successes > trials - k (fewer than k failures means every k-subset
+    must contain a success).
+    """
+    if trials <= 0:
+        raise ValueError(f"trials must be >= 1, got {trials}")
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if not 0 <= successes <= trials:
+        raise ValueError(f"successes must be in [0, {trials}], got {successes}")
+    denominator = _comb(trials, k)
+    if denominator == 0:  # k > trials: cannot draw k distinct trials
+        return 1.0 if successes > 0 else 0.0
+    return 1.0 - _comb(trials - successes, k) / denominator
+
+
+def pass_pow_k(successes: int, trials: int, k: int) -> float:
+    """Unbiased estimate of "all k trials succeed" -- the reliability metric.
+
+    Falling in k: any flakiness is punished. At n == k this degenerates to the
+    indicator `successes == k` (the fraction of tasks where every run passed),
+    which is the practical reading of `pass^3` for a 3-repeat suite.
+    """
+    if trials <= 0:
+        raise ValueError(f"trials must be >= 1, got {trials}")
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if not 0 <= successes <= trials:
+        raise ValueError(f"successes must be in [0, {trials}], got {successes}")
+    denominator = _comb(trials, k)
+    if denominator == 0:  # k > trials: cannot draw k distinct trials
+        return 0.0
+    return _comb(successes, k) / denominator
+
+
+def reliability_ratio(
+    successes_per_case: Sequence[int],
+    trials_per_case: Sequence[int],
+    k: int,
+) -> Ratio:
+    """`pass^k` as a Ratio over cases, for reporting alongside the pass@1 mean.
+
+    The numerator counts cases whose every trial passed, the denominator the
+    cases considered -- so the pair reads as "N of M tasks passed all k runs".
+    When n == k that is exactly the count; the general case sums the unbiased
+    per-task estimate, which is a count only in expectation. Callers reporting a
+    headcount should pass n == k.
+    """
+    if len(successes_per_case) != len(trials_per_case):
+        raise ValueError(
+            f"need one trial count per case: {len(successes_per_case)} successes "
+            f"vs {len(trials_per_case)} trial counts"
+        )
+    numerator = sum(
+        round(pass_pow_k(c, n, k)) for c, n in zip(successes_per_case, trials_per_case, strict=True)
+    )
+    return Ratio(numerator=numerator, denominator=len(successes_per_case))
