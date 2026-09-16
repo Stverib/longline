@@ -25,6 +25,7 @@ from longline.eval.types import E2E_CATEGORY_TAGS
 
 if TYPE_CHECKING:
     from longline.eval.compression_runner import CompressionSummary
+    from longline.eval.latency_runner import LatencySummary
     from longline.eval.runner import CaseResult
 
 # Case tags that decide the ToolSelectionCaseAccuracy denominator. A blind case
@@ -442,6 +443,7 @@ def render_markdown(
     baseline: EvalReport | None = None,
     baseline_label: str | None = None,
     compression: CompressionSummary | None = None,
+    latency: LatencySummary | None = None,
 ) -> str:
     """Render the report as a compact markdown table + summary lines.
 
@@ -449,10 +451,12 @@ def render_markdown(
     `baseline` report is supplied, success-rate differences are rendered in
     **percentage points** (`-3.0 pp`), never as a relative percent.
 
-    `compression` adds the Task 4 section. It is a separate argument rather than
-    a field on `EvalReport` because the compression suite's metrics have their
-    own denominators (facts, eligible cases) that do not compose with the E2E
-    ones -- folding them in would invite someone to average across the two.
+    `compression` adds the Task 4 section and `latency` the Task 6 one. They are
+    separate arguments rather than fields on `EvalReport` because neither suite's
+    metrics compose with the E2E ones: compression has its own denominators
+    (facts, eligible cases) and latency's headline number is a ratio of two
+    durations, not a rate at all. Folding either in would invite someone to
+    average across suites.
     """
     lines = [
         "# Agent Evaluation Report",
@@ -531,6 +535,9 @@ def render_markdown(
 
     if compression is not None:
         lines += _compression_lines(compression)
+
+    if latency is not None:
+        lines += _latency_lines(latency)
 
     if report.by_category:
         lines += [
@@ -653,6 +660,74 @@ def _compression_lines(summary: CompressionSummary) -> list[str]:
             f"{lost_cell} | {excluded} |"
         )
     return lines
+
+
+def _latency_lines(summary: LatencySummary) -> list[str]:
+    """The Task 6 section: streaming vs buffered, per case, with the paired delta.
+
+    Three things this section is careful about:
+
+    - **`LatencyReduction` is a ratio of two durations, not a `pp` difference.**
+      The contract's `pp` unit (§4.3) belongs to success rates; a 20 ms saving on
+      a 200 ms turn is 10%, and calling it "10 pp" would invent a numerator and
+      denominator that do not exist. So the unit is printed as a percent *change*
+      and the two underlying durations are shown next to it.
+    - **The paired delta is per case**, as §4.2 requires of any A/B latency
+      comparison: the mean of the two arms can agree while individual cases move
+      in opposite directions, and only the per-case column shows that.
+    - **The warmup count and the sample count are printed.** A latency mean
+      without its sample size and its excluded warmups is not reproducible.
+    """
+    lines = [
+        "",
+        "## Streaming tool latency (paired A/B, scripted stream)",
+        "",
+        "> `LatencyReduction` is `(buffered - streaming) / buffered` on "
+        "**durations**, so it is a ratio, **not** a difference in percentage "
+        "points (contract §5.5 / §4.3). `pp` is reserved for success rates.",
+        "",
+        f"- **Samples:** {summary.samples_per_arm} per arm per case, "
+        f"{summary.warmups_per_arm} warmup pairs excluded",
+        f"- **Time scale:** {summary.time_scale:g}x (declared case durations x this)",
+        "- **Units:** milliseconds",
+        "",
+        "| case | arm | ToolStartLatency mean | p50 | p95 | TurnLatency "
+        "mean | OverlapTime mean |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for case in summary.cases:
+        for arm in ("buffered", "streaming"):
+            m = case.metrics[arm]
+            lines.append(
+                f"| {case.case_id} | {arm} | "
+                f"{_fmt_ms(m['tool_start_latency_ms_mean'])} | "
+                f"{_fmt_ms(m['tool_start_latency_ms_p50'])} | "
+                f"{_fmt_ms(m['tool_start_latency_ms_p95'])} | "
+                f"{_fmt_ms(m['turn_latency_ms_mean'])} | "
+                f"{_fmt_ms(m['overlap_time_ms_mean'])} |"
+            )
+    lines += [
+        "",
+        "### Paired delta per case (ToolStartLatency)",
+        "",
+        "| case | reduction (ratio of durations) | mean of per-sample ratios | "
+        "p50 of per-sample ratios | samples streaming faster / slower | case note |",
+        "|---|---|---|---|---|---|",
+    ]
+    for case in summary.cases:
+        reduction = "not measured" if case.reduction is None else f"{case.reduction * 100:+.1f}%"
+        lines.append(
+            f"| {case.case_id} | {reduction} | "
+            f"{_fmt_pct_ratio(case.reduction_mean)} | "
+            f"{_fmt_pct_ratio(case.reduction_p50)} | "
+            f"{case.lifetime_samples} / {case.overlap_samples} | {case.note} |"
+        )
+    return lines
+
+
+def _fmt_pct_ratio(value: float | None) -> str:
+    """A ratio rendered as a signed percent change; `pp` is never used here."""
+    return "n/a" if value is None else f"{value * 100:+.1f}%"
 
 
 def _fmt_num(value: float | None, digits: int) -> str:

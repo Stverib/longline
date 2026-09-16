@@ -450,3 +450,212 @@ class TestCompressionSuite:
         )
         md = (tmp_path / "run" / cli.REPORT_NAME).read_text(encoding="utf-8")
         assert "CompressionRatio" in md
+
+
+# --- Task 6: the latency suite ---------------------------------------------
+
+
+class TestLatencySuite:
+    def test_suite_preset_selects_the_latency_layer(self) -> None:
+        ns = cli.parse_args(["--suite", "latency"])
+        cli._apply_suite(ns, ["--suite", "latency"])
+        assert ns.type == "latency"
+
+    def test_explicit_type_still_wins(self) -> None:
+        argv = ["--suite", "latency", "--type", "e2e"]
+        ns = cli.parse_args(argv)
+        cli._apply_suite(ns, argv)
+        assert ns.type == "e2e"
+
+    def test_latency_knobs_default_to_none_so_the_module_decides(self) -> None:
+        """FAILS ON: the CLI hard-coding a sample count that drifts from the contract."""
+        ns = cli.parse_args(["--suite", "latency"])
+        assert ns.samples is None
+        assert ns.warmups is None
+        assert ns.time_scale is None
+
+    def test_latency_knobs_parse(self) -> None:
+        ns = cli.parse_args([
+            "--suite", "latency", "--samples", "35", "--warmups", "2", "--time-scale", "3.5",
+        ])
+        assert ns.samples == 35
+        assert ns.warmups == 2
+        assert ns.time_scale == 3.5
+
+    @staticmethod
+    def _stub_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make `run_latency_suite` return a canned pair instead of driving one.
+
+        The wiring these tests check -- which files land on disk, what shape the
+        rows have, whether `raw.jsonl` alone recomputes the reduction -- does not
+        depend on the timing being real. Running the genuine suite at the
+        shipped scale costs ~60-90 s per test, and three of those turned this
+        file into a five-minute hazard.
+
+        Exactly ONE test below runs the real suite
+        (`test_a_real_run_lands_on_disk_and_recomputes`), so the wiring is still
+        verified end to end somewhere; everything else here checks file layout
+        and arithmetic, which a canned summary checks just as well.
+        """
+        from longline.eval import latency_runner as lr
+
+        async def canned(
+            cases: object, *, samples: int = 40, warmups: int = 5,
+            time_scale: float = 20.0, clock: object = None,
+        ) -> tuple[object, list[object]]:
+            case = next(iter(cases))  # type: ignore[call-overload]
+            truth = case.truth(time_scale)
+            rows = []
+            for _ in range(samples):
+                for variant in ("buffered", "streaming"):
+                    start_ns = (
+                        truth.response_ns if variant == "buffered"
+                        else truth.streaming_tool_start_ns
+                    )
+                    rows.append(lr.Sample(
+                        variant=variant, case_id=case.id,
+                        timestamps={
+                            "request_start": 0,
+                            "tool_block_complete": truth.block_offsets_ns[0],
+                            "tool_execute_start": start_ns,
+                            "response_complete": truth.response_ns,
+                            "tool_execute_end": start_ns + truth.tool_ns,
+                            "turn_complete": truth.buffered_turn_ns
+                            if variant == "buffered" else truth.streaming_turn_ns,
+                        },
+                        result_texts=list(case.results()),
+                        tool_durations_ms=[truth.tool_ns / 1e6] * case.num_calls,
+                        time_scale=time_scale, grid_lag_ns=[0], release_ns=0, sink_ns=0,
+                    ))
+            summary = lr.LatencySummary(
+                samples_per_arm=samples, warmups_per_arm=warmups,
+                time_scale=time_scale,
+                cases=[lr.summarize_case(
+                    case, [(rows[i * 2], rows[i * 2 + 1]) for i in range(samples)],
+                    warmups=warmups, time_scale=time_scale,
+                )],
+            )
+            return summary, rows
+
+        monkeypatch.setattr(lr, "run_latency_suite", canned)
+
+    async def test_run_latency_writes_the_contract_layout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FAILS ON: a run that prints a number but leaves no `raw.jsonl` behind.
+
+        Contract §3: a figure that is not recomputable from raw.jsonl is not a
+        figure. The suite is stubbed -- see `_stub_suite` -- because this test is
+        about the FILES, not about the timing.
+        """
+        self._stub_suite(monkeypatch)
+        args = cli.parse_args([
+            "--suite", "latency", "--run-id", "lat-test", "--max-cases", "1",
+            "--samples", "30", "--warmups", "0",
+        ])
+        cli._apply_suite(args, ["--suite", "latency"])
+        code = await cli._run_latency(
+            args, case_file=Path(args.case_file), out_dir=tmp_path, run_id="lat-test",
+        )
+        assert code == 0
+        run_dir = tmp_path / "lat-test"
+        rows = [
+            json.loads(line)
+            for line in (run_dir / cli.RAW_NAME).read_text(encoding="utf-8").splitlines()
+        ]
+        # 30 samples x 2 arms, and every row tagged as latency rather than E2E.
+        assert len(rows) == 60
+        assert all("latency" in r["tags"] for r in rows)
+        assert {r["variant"] for r in rows} == {"buffered", "streaming"}
+
+        summary = json.loads((run_dir / cli.SUMMARY_NAME).read_text(encoding="utf-8"))
+        assert summary["latency"]["reduction_units"] == "ratio_of_durations"
+        assert summary["metadata"]["suite"] == "latency"
+
+    async def test_raw_jsonl_alone_recomputes_the_reduction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The §3 rule, checked as arithmetic rather than as a file's existence."""
+        self._stub_suite(monkeypatch)
+        args = cli.parse_args([
+            "--suite", "latency", "--run-id", "lat-recompute", "--max-cases", "1",
+            "--samples", "30", "--warmups", "0",
+        ])
+        cli._apply_suite(args, ["--suite", "latency"])
+        await cli._run_latency(
+            args, case_file=Path(args.case_file), out_dir=tmp_path, run_id="lat-recompute",
+        )
+        run_dir = tmp_path / "lat-recompute"
+        rows = [
+            json.loads(line)
+            for line in (run_dir / cli.RAW_NAME).read_text(encoding="utf-8").splitlines()
+        ]
+        baseline = [r["tool_start_latency_ms"] for r in rows if r["variant"] == "buffered"]
+        candidate = [r["tool_start_latency_ms"] for r in rows if r["variant"] == "streaming"]
+        recomputed = (sum(baseline) / len(baseline) - sum(candidate) / len(candidate)) / (
+            sum(baseline) / len(baseline)
+        )
+        summary = json.loads((run_dir / cli.SUMMARY_NAME).read_text(encoding="utf-8"))
+        assert summary["latency"]["cases"][0]["reduction"] == pytest.approx(recomputed)
+
+    async def test_a_real_run_lands_on_disk_and_recomputes(self, tmp_path: Path) -> None:
+        """The one UNSTUBBED end-to-end latency run in the whole suite.
+
+        Everything else in this class stubs `run_latency_suite`, so without this
+        the wiring assertions above could all pass while the real runner wrote
+        nothing usable. It drives one case for real at the shipped scale, which
+        costs ~60-90 s, and it is deliberately the only test that pays it.
+
+        It also carries the load-bearing claim through the CLI: streaming starts
+        its tool earlier on every one of the 30 samples, never later.
+        """
+        args = cli.parse_args([
+            "--suite", "latency", "--run-id", "lat-real", "--max-cases", "1",
+            "--samples", "30", "--warmups", "0",
+        ])
+        cli._apply_suite(args, ["--suite", "latency"])
+        await cli._run_latency(
+            args, case_file=Path(args.case_file), out_dir=tmp_path, run_id="lat-real",
+        )
+        run_dir = tmp_path / "lat-real"
+        rows = [
+            json.loads(line)
+            for line in (run_dir / cli.RAW_NAME).read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(rows) == 60
+        baseline = [r["tool_start_latency_ms"] for r in rows if r["variant"] == "buffered"]
+        candidate = [r["tool_start_latency_ms"] for r in rows if r["variant"] == "streaming"]
+        # Every paired sample favours streaming, on a real run.
+        assert all(c < b for b, c in zip(baseline, candidate, strict=True))
+
+        summary = json.loads((run_dir / cli.SUMMARY_NAME).read_text(encoding="utf-8"))
+        case = summary["latency"]["cases"][0]
+        assert case["reduction"] > 0
+        assert case["samples_with_streaming_faster"] == 30
+        assert case["samples_with_streaming_slower"] == 0
+        # And the report renders it as a ratio of durations, never as `pp`.
+        md = (run_dir / cli.REPORT_NAME).read_text(encoding="utf-8")
+        assert "ratio of durations" in md
+
+    async def test_missing_run_id_is_refused(self) -> None:
+        """FAILS ON: emitting a headline number with no durable record behind it."""
+        args = cli.parse_args([
+            "--suite", "latency", "--max-cases", "1", "--samples", "30",
+            "--warmups", "0",
+        ])
+        cli._apply_suite(args, ["--suite", "latency"])
+        with pytest.raises(SystemExit, match="run-id"):
+            await cli._run_latency(
+                args, case_file=Path(args.case_file), out_dir=Path("."), run_id=None,
+            )
+
+    async def test_a_tag_that_matches_nothing_is_refused(self) -> None:
+        """FAILS ON: silently running zero cases and reporting a summary of none."""
+        args = cli.parse_args([
+            "--suite", "latency", "--run-id", "x", "--tag", "no-such-tag",
+        ])
+        cli._apply_suite(args, ["--suite", "latency"])
+        with pytest.raises(SystemExit, match="no latency cases"):
+            await cli._run_latency(
+                args, case_file=Path(args.case_file), out_dir=Path("."), run_id="x",
+            )

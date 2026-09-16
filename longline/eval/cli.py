@@ -50,6 +50,13 @@ REPORT_NAME = "report.md"
 # riding on `e2e`: its cases carry a scripted `history` and `key_facts` that
 # `E2ECase` has no field for, so loading them as E2E would drop the transcript
 # and leave the suite measuring an ordinary artifact check.
+# `latency` is the Task 6 suite. Its cases are not loaded from a JSONL file at
+# all -- they are declared in `longline/eval/latency_cases.py`, because a latency
+# case is a schedule (a block grid plus a tool duration) that no `EvalCase`
+# shape can carry. The case-file entry is therefore a *label*, used only for the
+# run metadata's `suite` field and the report directory name; `_run_latency`
+# never opens it. Pointing it at a real file that exists keeps `--case-file`
+# sanity checks and `case_file_sha256` from silently referencing nothing.
 # `tool_calls` stays pointed at the retired legacy file so old invocations keep
 # reproducing their old case set exactly.
 SUITES: dict[str, tuple[str, str]] = {
@@ -57,12 +64,13 @@ SUITES: dict[str, tuple[str, str]] = {
     "tool_selection": ("tool_selection.jsonl", "tool_call"),
     "e2e": ("e2e.jsonl", "e2e"),
     "compression": ("compression.jsonl", "compression"),
+    "latency": ("e2e.jsonl", "latency"),
     "all": ("tool_calls.jsonl", "all"),
 }
 
-# Layer names accepted by --type. `compression` is separate from `e2e` for the
-# reason above.
-TYPE_CHOICES = ["tool_call", "e2e", "compression", "all"]
+# Layer names accepted by --type. `compression` and `latency` are separate from
+# `e2e` for the reasons above.
+TYPE_CHOICES = ["tool_call", "e2e", "compression", "latency", "all"]
 
 # Case tags that partition the tool-selection suite. `--blind` / `--instruction`
 # are sugar over `--tag`, kept as flags because the two halves must never be
@@ -207,6 +215,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Also write the CaseResult of the last case as JSON to PATH. "
              "Used by the recovery runner's subprocess worker so the parent "
              "reads the child's verdict off a file rather than stdout.",
+    )
+    # --- Task 6 additions ---
+    p.add_argument(
+        "--samples", type=int, default=None, metavar="N",
+        help="Latency suite: samples per arm per case, in "
+             "[30, 50] per contract §5.5 (default 40). Warmups are separate "
+             "and are never counted.",
+    )
+    p.add_argument(
+        "--warmups", type=int, default=None, metavar="N",
+        help="Latency suite: warmup pairs per case, excluded from every "
+             "statistic (contract §5.5 fixes this at 5).",
+    )
+    p.add_argument(
+        "--time-scale", type=float, default=None, metavar="X",
+        help="Latency suite: multiplier applied to every duration the cases "
+             "declare. Signal scales with X, this host's scheduler jitter does "
+             "not, so lowering X shrinks the signal-to-jitter margin. See "
+             "longline/eval/latency_runner.py's module docstring for the "
+             "measured basis of the default.",
     )
     return p.parse_args(argv)
 
@@ -556,6 +584,114 @@ async def _run_compression(
     )
 
 
+async def _run_latency(
+    args: argparse.Namespace,
+    *,
+    case_file: Path,
+    out_dir: Path,
+    run_id: str | None,
+) -> int:
+    """Run the Task 6 streaming-vs-buffered micro-benchmark and write its report.
+
+    No model, no API key, no network: the transport is scripted, which is what
+    contract §5.5 asks for ("用可控的延迟工具和脚本化流做稳定微基准").
+
+    `raw.jsonl` here is a different shape from the E2E rows -- one row per
+    SAMPLE per arm, tagged `LATENCY_TAG`, carrying the six contract timestamps
+    in ns relative to `request_start`. That is deliberate: contract §3 says the
+    raw file is the sole source of truth, and the report's mean/p50/p95 and the
+    per-case paired reduction are all recomputable from those rows.
+    """
+    from longline.eval.latency_cases import LATENCY_CASES
+    from longline.eval.latency_runner import (
+        DEFAULT_SAMPLES,
+        DEFAULT_TIME_SCALE,
+        WARMUP_ROUNDS,
+        pooled_start_reduction,
+        run_latency_suite,
+    )
+
+    cases = LATENCY_CASES
+    if args.tag is not None:
+        cases = tuple(c for c in cases if args.tag in c.tags)
+    if args.max_cases is not None:
+        cases = cases[: args.max_cases]
+    if not cases:
+        raise SystemExit("no latency cases selected - check --tag / --max-cases")
+
+    samples = DEFAULT_SAMPLES if args.samples is None else args.samples
+    warmups = WARMUP_ROUNDS if args.warmups is None else args.warmups
+    time_scale = DEFAULT_TIME_SCALE if args.time_scale is None else args.time_scale
+
+    if args.run_id is None:
+        # Checked BEFORE the run, not after it. The suite costs minutes at the
+        # shipped scale, and refusing to emit a number only once the number has
+        # been computed wastes all of it -- the caller waited for nothing. Same
+        # reasoning as the compression suite, which refuses for the same
+        # contract reason (a figure with no `raw.jsonl` behind it is not a
+        # figure), but there the check happens to be cheap.
+        raise SystemExit(
+            "the latency suite needs --run-id: its numbers must be backed by "
+            "raw.jsonl under evals/results/<run_id>/ (evals/README.md §3)"
+        )
+
+    run_id = run_id or make_run_id(args.model, "latency")
+
+    summary, recorded = await run_latency_suite(
+        cases, samples=samples, warmups=warmups, time_scale=time_scale,
+    )
+    print(f"[eval] {len(cases)} latency cases x {samples} samples/arm "
+          f"(+{warmups} warmups excluded), time_scale={time_scale:g}")
+    for case in summary.cases:
+        b = case.metrics["buffered"]["tool_start_latency_ms_mean"]
+        s = case.metrics["streaming"]["tool_start_latency_ms_mean"]
+        reduction = case.reduction
+        print(
+            f"[eval]   {case.case_id}: ToolStartLatency "
+            f"buffered={_fmt_latency(b)} streaming={_fmt_latency(s)} "
+            f"LatencyReduction={'n/a' if reduction is None else f'{reduction * 100:+.1f}%'}"
+        )
+    pooled = pooled_start_reduction(summary.cases)
+    print(f"[eval]   LatencyReduction (pooled, n={pooled['n']}): "
+          f"mean={_fmt_ratio_value(pooled['mean'])} "
+          f"p50={_fmt_ratio_value(pooled['p50'])} "
+          f"p95={_fmt_ratio_value(pooled['p95'])}")
+
+    metadata = run_metadata(
+        run_id=run_id, suite="latency", variant=args.variant, model=args.model,
+        case_file=case_file, repeat_index=0, repeats_completed=1,
+    )
+
+    run_dir = out_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / RAW_NAME).open("w", encoding="utf-8") as fh:
+        for sample in recorded:
+            fh.write(json.dumps(sample.to_row(), ensure_ascii=False) + "\n")
+    (run_dir / SUMMARY_NAME).write_text(
+        json.dumps({"metadata": metadata, "latency": summary.to_dict()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / REPORT_NAME).write_text(
+        render_markdown(aggregate([]), latency=summary), encoding="utf-8",
+    )
+    print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+    print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+    print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+    return 0
+
+
+def _fmt_latency(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}ms"
+
+
+def _fmt_ratio_value(value: object) -> str:
+    """A `ratio_of_durations` rendered as a percent *change*, never as `pp`."""
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value * 100:+.1f}%"
+
+
 async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args, argv)
@@ -575,6 +711,14 @@ async def _run(argv: Sequence[str] | None = None) -> int:
         return await _run_compression(
             args, case_file=case_file, fixtures=fixtures, out_dir=out_dir,
             api_key=api_key, run_id=args.run_id,
+        )
+
+    # The latency suite is dispatched before the case-file load: its cases are
+    # declared in code, not in a JSONL file, and it produces one sample per arm
+    # rather than a pass/fail CaseResult per case.
+    if args.type == "latency" or args.suite == "latency":
+        return await _run_latency(
+            args, case_file=case_file, out_dir=out_dir, run_id=args.run_id,
         )
 
     cases = load_cases(case_file)

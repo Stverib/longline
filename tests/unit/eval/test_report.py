@@ -350,3 +350,101 @@ class TestCompressionReport:
     def test_no_section_when_summary_is_none(self) -> None:
         md = render_markdown(aggregate([]), compression=None)
         assert "CompressionRatio" not in md
+
+
+# --- Task 6: the latency section -------------------------------------------
+
+
+def _latency_summary(*, reduction: float | None = 0.25) -> Any:
+    """A two-case `LatencySummary` built by hand, so no clock is involved."""
+    from longline.eval.latency_runner import (
+        DEFAULT_TIME_SCALE,
+        CaseLatency,
+        LatencySummary,
+    )
+
+    def metrics(start: float, turn: float, overlap: float) -> dict[str, dict[str, float | None]]:
+        def one(v: float) -> dict[str, float | None]:
+            return {f"{k}_{s}": v for k in
+                    ("tool_start_latency_ms", "turn_latency_ms", "overlap_time_ms")
+                    for s in ("mean", "p50", "p95")}
+
+        return {"buffered": one(start), "streaming": one(start * (1 - (reduction or 0)))}
+
+    cases = [
+        CaseLatency(
+            case_id="lat-001", note="single tool", samples_per_arm=40,
+            metrics=metrics(40.0, 190.0, 0.0), reduction=reduction,
+            reduction_per_sample=[reduction or 0.0] * 40,
+            reduction_mean=reduction, reduction_p50=reduction,
+            lifetime_samples=40, overlap_samples=0,
+        ),
+        CaseLatency(
+            case_id="lat-002", note="three tools", samples_per_arm=40,
+            metrics=metrics(80.0, 130.0, 50.0), reduction=reduction,
+            reduction_per_sample=[reduction or 0.0] * 40,
+            reduction_mean=reduction, reduction_p50=reduction,
+            lifetime_samples=40, overlap_samples=0,
+        ),
+    ]
+    return LatencySummary(
+        samples_per_arm=40, warmups_per_arm=5, time_scale=DEFAULT_TIME_SCALE, cases=cases,
+    )
+
+
+class TestLatencyReportSection:
+    def test_section_renders_both_arms_per_case(self) -> None:
+        md = render_markdown(aggregate([]), latency=_latency_summary())
+        assert "## Streaming tool latency" in md
+        for case_id in ("lat-001", "lat-002"):
+            assert case_id in md
+        assert "buffered" in md and "streaming" in md
+
+    def test_metrics_are_mean_p50_and_p95(self) -> None:
+        """Contract §5.5: the report口径 is mean / p50 / p95 plus a paired delta."""
+        md = render_markdown(aggregate([]), latency=_latency_summary())
+        header = md.split("### Paired delta")[0]
+        assert "mean" in header and "p50" in header and "p95" in header
+
+    def test_reduction_is_a_ratio_not_percentage_points(self) -> None:
+        """The specific error the contract's §4.3 rule exists to prevent.
+
+        Checked on the RENDERED VALUE CELLS, not on the section text: the
+        section's own note mentions the word "pp" precisely to say it is not
+        used here, so scanning the whole block would fail on the explanation
+        rather than on a number.
+        """
+        md = render_markdown(aggregate([]), latency=_latency_summary())
+        assert "ratio of durations" in md
+        delta_section = md.split("### Paired delta per case")[1]
+        delta_rows = [line for line in delta_section.splitlines() if line.startswith("| lat-")]
+        assert delta_rows
+        for row in delta_rows:
+            cells = [c.strip() for c in row.strip("|").split("|")]
+            # Columns: case, reduction, mean of per-sample ratios, p50, counts, note.
+            for cell in cells[1:4]:
+                assert cell.endswith("%"), f"a duration ratio rendered as {cell!r}"
+                assert "pp" not in cell
+
+    def test_the_sample_count_and_excluded_warmups_are_printed(self) -> None:
+        """A latency mean without its n and its excluded warmups is not reproducible."""
+        md = render_markdown(aggregate([]), latency=_latency_summary())
+        assert "40" in md  # samples per arm
+        assert "warmup" in md.lower()
+
+    def test_the_time_scale_is_stated(self) -> None:
+        """A scaled run is not reproducible without the factor it was run at."""
+        from longline.eval.latency_runner import DEFAULT_TIME_SCALE
+
+        md = render_markdown(aggregate([]), latency=_latency_summary())
+        assert "scale" in md.lower()
+        assert f"{DEFAULT_TIME_SCALE:g}" in md
+
+    def test_an_unmeasured_reduction_says_so(self) -> None:
+        """FAILS ON: a None reduction rendered as 0%, which reads as "no effect"."""
+        md = render_markdown(aggregate([]), latency=_latency_summary(reduction=None))
+        assert "not measured" in md
+
+    def test_no_section_when_summary_is_none(self) -> None:
+        md = render_markdown(aggregate([]), latency=None)
+        assert "Streaming tool latency" not in md
