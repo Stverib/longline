@@ -21,6 +21,7 @@ Two things are deliberate here:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from longline.tools.base import Tool, ToolRegistry, ToolResult, ToolSchema
@@ -143,6 +144,105 @@ def build_tool_profile(profile: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(CORE_FAMILY + extra))
 
 
+# --- the sandbox boundary ---------------------------------------------------
+#
+# Every path-bearing tool is confined to the case's sandbox. Without this the
+# suite measures something other than what it claims to.
+#
+# `Glob`/`Grep` default to the PROCESS working directory, and an eval run's
+# process cwd is the repository root, not the sandbox. A model asked about "the
+# sandbox's analysis.ipynb" that reaches for `Glob("**/analysis.ipynb")` is
+# therefore handed a path inside `evals/fixtures/`, reads it, and edits it IN
+# PLACE. Measured rather than hypothesised: one tool-calling run made 12 such
+# calls across 4 cases and corrupted the tracked fixture
+# `evals/fixtures/notebook_repo/analysis.ipynb`. The case isolation the contract
+# requires (`evals/README.md` §8.3) is broken the moment one case writes into
+# another case's starting state, and a run like that produces numbers that are
+# about the repository rather than about the model.
+#
+# The rule is the one a shell inside a sandbox would apply, not a blanket
+# refusal:
+#
+# - a RELATIVE path resolves against the sandbox, which IS the working directory
+#   the system prompt declares;
+# - an ABSOLUTE path inside the sandbox is allowed;
+# - an ABSOLUTE path outside it is refused, as a tool error the model sees and
+#   can recover from.
+#
+# Refusing rather than silently rewriting matters: a model that meant to write
+# outside must be told it cannot, or the run records a success that a real
+# deployment would not have produced.
+#
+# Known gap: `Bash` is not confined by this. It starts in the sandbox
+# (`BashTool(cwd=sandbox)`) but a command can still `cd` out or name an absolute
+# path, and no amount of argument inspection confines a shell. The structured
+# tools above are where writes happen in practice, and they are the ones this
+# closes; a case is free to make a Bash escape a grading criterion, but no case
+# should have one happen by accident.
+
+# tool name -> the argument that carries a filesystem path
+SANDBOXED_PATH_ARG: dict[str, str] = {
+    "Read": "file_path",
+    "Write": "file_path",
+    "Edit": "file_path",
+    "Glob": "path",
+    "Grep": "path",
+    "NotebookEdit": "notebook_path",
+}
+
+
+class SandboxedTool(Tool):
+    """Delegates to a production tool, confining its path argument to `sandbox`.
+
+    Subclasses `Tool` rather than duck-typing, so the registry swap is a
+    type-level fact -- the same reason `faults.ToolFaultWrapper` and
+    `safety_runner.SentinelTool` do.
+
+    `get_name` and `get_schema` are forwarded unchanged: the model must see the
+    production tool exactly, or the tool-selection metric is measuring a
+    different menu. Only `execute` differs, and only in where the path may point.
+    """
+
+    def __init__(self, inner: Tool, sandbox: str, path_arg: str) -> None:
+        self._inner = inner
+        self._sandbox = Path(sandbox).resolve()
+        self._path_arg = path_arg
+
+    def get_name(self) -> str:
+        return self._inner.get_name()
+
+    def get_schema(self) -> ToolSchema:
+        return self._inner.get_schema()
+
+    def is_concurrency_safe(self, tool_input: dict[str, Any]) -> bool:
+        return self._inner.is_concurrency_safe(tool_input)
+
+    async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
+        arg = self._path_arg
+        raw = tool_input.get(arg)
+        if not raw:
+            # `Glob`/`Grep` read a missing `path` as "the working directory",
+            # which for an eval case is the sandbox -- not wherever the eval
+            # process was launched from. The other tools declare the argument
+            # required and are left to report that themselves.
+            if arg == "path" and raw is None:
+                return await self._inner.execute({**tool_input, arg: str(self._sandbox)})
+            return await self._inner.execute(tool_input)
+
+        candidate = Path(str(raw))
+        resolved = candidate if candidate.is_absolute() else self._sandbox / candidate
+        resolved = resolved.resolve()
+        if not resolved.is_relative_to(self._sandbox):
+            return ToolResult(
+                content=(
+                    f"Error: {arg}={raw!r} is outside this case's sandbox. "
+                    f"The working directory is {self._sandbox}; use a path inside it."
+                ),
+                is_error=True,
+            )
+        return await self._inner.execute({**tool_input, arg: str(resolved)})
+
+
 def build_eval_registry(
     sandbox: str,
     *,
@@ -162,16 +262,24 @@ def build_eval_registry(
 
     # Factories, not instances: the registry owns exactly one of each, but the
     # sandbox-bound and store-bound ones need their dependency at construction.
+    #
+    # Every path-bearing tool goes through `SandboxedTool`, which resolves
+    # relative paths against the sandbox and refuses absolute ones outside it.
+    # `Bash` takes the sandbox as its cwd instead -- see the note above the
+    # wrapper for why a shell cannot be confined the same way.
+    def _sandboxed(factory: Any, name: str) -> Any:
+        return lambda: SandboxedTool(factory(), sandbox, SANDBOXED_PATH_ARG[name])
+
     factories: dict[str, Any] = {
         "Bash": lambda: BashTool(cwd=sandbox),
-        "Read": FileReadTool,
-        "Write": FileWriteTool,
-        "Edit": FileEditTool,
-        "Glob": GlobTool,
-        "Grep": GrepTool,
+        "Read": _sandboxed(FileReadTool, "Read"),
+        "Write": _sandboxed(FileWriteTool, "Write"),
+        "Edit": _sandboxed(FileEditTool, "Edit"),
+        "Glob": _sandboxed(GlobTool, "Glob"),
+        "Grep": _sandboxed(GrepTool, "Grep"),
         "WebSearch": EvalWebSearchTool,
         "WebFetch": EvalWebFetchTool,
-        "NotebookEdit": NotebookEditTool,
+        "NotebookEdit": _sandboxed(NotebookEditTool, "NotebookEdit"),
         "TaskCreate": lambda: TaskCreateTool(store),
         "TaskGet": lambda: TaskGetTool(store),
         "TaskList": lambda: TaskListTool(store),

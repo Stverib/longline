@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from longline.eval.engine_factory import EVAL_TOOL_NAMES
 from longline.eval.eval_tools import (
@@ -19,6 +22,9 @@ from longline.eval.eval_tools import (
     EvalWebSearchTool,
     build_tool_profile,
 )
+from longline.tools.file_read.file_read_tool import FileReadTool
+from longline.tools.glob_tool.glob_tool import GlobTool
+from longline.tools.grep_tool.grep_tool import GrepTool
 from longline.tools.notebook.notebook_edit_tool import NotebookEditTool
 from longline.tools.task_tools.task_tools import TaskStore
 from longline.tools.web_fetch.web_fetch_tool import WebFetchTool
@@ -117,3 +123,149 @@ class TestNotebookAndTaskToolsAreTheProductionOnes:
         created = _run(registry.get("TaskCreate").execute({"subject": "s"}))  # type: ignore[union-attr]
         assert created.is_error is False
         assert [t.subject for t in store.list_all()] == ["s"]
+
+
+class TestNoToolEscapesTheSandbox:
+    """A case must not be able to read or write the repository around it.
+
+    Shipped once: `Glob`/`Grep` defaulted to the PROCESS cwd, which for an eval
+    run is the repository root. A model asked about "the sandbox's
+    analysis.ipynb" ran `Glob("**/analysis.ipynb")`, was handed an absolute path
+    to `evals/fixtures/notebook_repo/analysis.ipynb`, and edited it in place --
+    corrupting a tracked fixture and breaking the next case's starting state.
+    """
+
+    def _registry(self, sandbox: Path) -> Any:
+        from longline.eval.eval_tools import build_eval_registry
+
+        return build_eval_registry(str(sandbox), profile="all")
+
+    def test_glob_searches_the_sandbox_not_the_process_cwd(self, tmp_path: Path) -> None:
+        """FAILS ON: the shipped bug -- a glob walking the repo root.
+
+        The outside file is named the same as the fixture that was corrupted, so
+        a regression reintroduces the exact failure rather than a lookalike.
+        """
+        sandbox = tmp_path / "sandbox"
+        outside = tmp_path / "outside"
+        sandbox.mkdir()
+        outside.mkdir()
+        (outside / "analysis.ipynb").write_text("{}", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get("Glob").execute({"pattern": "**/*.ipynb"}))  # type: ignore[union-attr]
+
+        assert "analysis.ipynb" not in result.content
+        assert str(outside) not in result.content
+
+    def test_glob_finds_a_file_inside_the_sandbox(self, tmp_path: Path) -> None:
+        """The confinement must not cost the tool its normal function."""
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "kept.ipynb").write_text("{}", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get("Glob").execute({"pattern": "**/*.ipynb"}))  # type: ignore[union-attr]
+
+        assert "kept.ipynb" in result.content
+
+    def test_grep_stays_inside_the_sandbox(self, tmp_path: Path) -> None:
+        """FAILS ON: a Grep that searches the process cwd for the same reason."""
+        sandbox = tmp_path / "sandbox"
+        outside = tmp_path / "outside"
+        sandbox.mkdir()
+        outside.mkdir()
+        (outside / "leak.txt").write_text("NEEDLE_OUTSIDE\n", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get("Grep").execute({"pattern": "NEEDLE_OUTSIDE"}))  # type: ignore[union-attr]
+
+        assert "NEEDLE_OUTSIDE" not in result.content
+
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("Read", {"file_path": "OUTSIDE"}),
+            ("Write", {"file_path": "OUTSIDE", "content": "x"}),
+            ("Edit", {"file_path": "OUTSIDE", "old_string": "a", "new_string": "b"}),
+            ("Glob", {"pattern": "*", "path": "OUTSIDE"}),
+            ("Grep", {"pattern": "x", "path": "OUTSIDE"}),
+            ("NotebookEdit", {"notebook_path": "OUTSIDE", "command": "delete_cell", "cell_index": 0}),
+        ],
+    )
+    def test_an_absolute_path_outside_is_refused(
+        self, tmp_path: Path, tool: str, args: dict[str, Any]
+    ) -> None:
+        """Every path-bearing tool, not just the one that was caught."""
+        sandbox = tmp_path / "sandbox"
+        outside = tmp_path / "outside"
+        sandbox.mkdir()
+        outside.mkdir()
+        target = outside / "target.txt"
+        target.write_text("secret\n", encoding="utf-8")
+        args = {k: (str(target) if v == "OUTSIDE" else v) for k, v in args.items()}
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get(tool).execute(args))  # type: ignore[union-attr]
+
+        assert result.is_error is True, f"{tool} did not refuse an outside path"
+        assert "sandbox" in result.content
+
+    def test_the_refusal_leaves_the_outside_file_untouched(self, tmp_path: Path) -> None:
+        """A refusal that still writes is worse than no check at all."""
+        sandbox = tmp_path / "sandbox"
+        outside = tmp_path / "outside"
+        sandbox.mkdir()
+        outside.mkdir()
+        target = outside / "keep.txt"
+        target.write_text("original\n", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        _run(registry.get("Write").execute({"file_path": str(target), "content": "CLOBBERED"}))  # type: ignore[union-attr]
+
+        assert target.read_text(encoding="utf-8") == "original\n"
+
+    def test_a_relative_path_resolves_against_the_sandbox(self, tmp_path: Path) -> None:
+        """The sandbox IS the working directory the system prompt declares."""
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "notes.md").write_text("hello\n", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get("Read").execute({"file_path": "notes.md"}))  # type: ignore[union-attr]
+
+        assert result.is_error is False
+        assert "hello" in result.content
+
+    def test_an_absolute_path_inside_is_allowed(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "notes.md").write_text("hello\n", encoding="utf-8")
+
+        registry = self._registry(sandbox)
+        result = _run(registry.get("Read").execute({"file_path": str(sandbox / "notes.md")}))  # type: ignore[union-attr]
+
+        assert result.is_error is False
+
+    def test_the_model_still_sees_the_production_tool(self, tmp_path: Path) -> None:
+        """Confining `execute` must not change the menu the model is shown.
+
+        A wrapper that altered `get_schema` would silently change which tool the
+        model believes it is choosing, and the selection rate would no longer be
+        a statement about the production tools.
+        """
+        from longline.eval.eval_tools import build_eval_registry
+
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        wrapped = build_eval_registry(str(sandbox), profile="all")
+
+        for name, production in (
+            ("Read", FileReadTool()),
+            ("Glob", GlobTool()),
+            ("Grep", GrepTool()),
+        ):
+            got = wrapped.get(name).get_schema()  # type: ignore[union-attr]
+            want = production.get_schema()
+            assert got.name == want.name, name
+            assert got.input_schema == want.input_schema, name
