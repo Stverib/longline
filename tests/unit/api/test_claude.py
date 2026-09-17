@@ -12,8 +12,10 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from longline.api.claude import stream_response
-from longline.core.events import TextDelta, ToolUseStart, TurnComplete
+from longline.core.events import ErrorEvent, TextDelta, ToolUseStart, TurnComplete
 
 
 @dataclass
@@ -252,3 +254,60 @@ class TestServedModel:
 
         turns = [e for e in events if isinstance(e, TurnComplete)]
         assert turns[0].served_model is None
+
+
+class TestTransientGatewayErrorsAreRetryable:
+    """A 5xx from the gateway is an outage, not a verdict about the case.
+
+    `is_recoverable=True` is what makes `query_loop` back off and retry
+    (2s..10s, capped by `max_retry`) instead of ending the case. Without it, a
+    gateway blip writes a row that measured nothing -- and a long paid run can
+    collect hundreds of them. This was not hypothetical: a live suite died on
+    503 "Upstream request failed: Endpoint is unavailable" on every case.
+    """
+
+    @staticmethod
+    def _status_error(status: int, body: dict) -> Any:
+        import httpx
+
+        import anthropic
+
+        return anthropic.APIStatusError(
+            f"Error code: {status} - {body}",
+            response=httpx.Response(status, request=httpx.Request("POST", "http://x")),
+            body=body,
+        )
+
+    @pytest.mark.parametrize("status", [429, 529, 502, 503, 504])
+    async def test_transient_statuses_are_recoverable(self, status: int) -> None:
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=self._status_error(status, {"error": {"type": "server_error"}})
+        )
+
+        events = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].is_recoverable is True
+
+    async def test_a_client_error_stays_fatal(self) -> None:
+        """FAILS ON: treating every 4xx/5xx as retryable.
+
+        A 400/404/413 is a fact about the REQUEST; retrying it five times just
+        spends 30 seconds per case re-sending something the server has already
+        rejected on its merits.
+        """
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=self._status_error(400, {"error": {"type": "invalid_request_error"}})
+        )
+
+        events = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        assert errors[0].is_recoverable is False

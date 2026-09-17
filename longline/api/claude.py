@@ -292,11 +292,21 @@ async def stream_response(
             if isinstance(error_info, dict):
                 error_type = error_info.get("type", "")
 
-        # 可恢复判断: 429（限流）、529（过载）、或 body 中标记为 overloaded_error
-        # query_loop Phase 3 会对可恢复错误做指数退避重试
+        # 可恢复判断: 限流 (429)、过载 (529)、以及网关侧的瞬时故障
+        # (502/503/504, 例如 "Upstream request failed: Endpoint is unavailable"),
+        # 或者 body 中标记为 overloaded_error. query_loop Phase 3 会对可恢复错误做
+        # 指数退避重试 (2s..10s, 上限 max_retry).
+        #
+        # 502/503/504 是这次实测补上的: 一次正式跑在网关上游不可用时,
+        # 每个用例都直接记成 runtime_error 而不是退避重试, 204 行全是
+        # 「没测到」. 4xx 一律保持致命: 400/404/413 是对请求本身的判决,
+        # 重试只是在重复发送一个服务器已经按事实拒绝的东西.
         yield ErrorEvent(
             message=str(e),
-            is_recoverable=e.status_code in (429, 529) or error_type == "overloaded_error",
+            is_recoverable=(
+                e.status_code in (429, 502, 503, 504, 529)
+                or error_type == "overloaded_error"
+            ),
         )
         return
 
