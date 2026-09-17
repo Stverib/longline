@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -97,7 +97,9 @@ def _make_events_with_stop_reason(stop_reason: str | None) -> list[MockEvent]:
 
 def _make_client(events: list[MockEvent]) -> MagicMock:
     client = MagicMock()
-    client.messages.stream = MagicMock(return_value=MockStream(events))
+    # `stream_response` reads the raw event stream (`create(stream=True)`), not
+    # the SDK's `stream()` helper -- see the note in `longline/api/claude.py`.
+    client.messages.create = AsyncMock(return_value=MockStream(events))
     return client
 
 

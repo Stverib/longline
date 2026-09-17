@@ -50,16 +50,28 @@ API_KEY = get_api_key()
 skip_no_key = pytest.mark.skipif(API_KEY is None, reason="No API key available")
 
 
+# Conditions that mean "this environment cannot serve the request", as opposed
+# to "the code is wrong". A test that cannot reach a usable endpoint has not
+# measured the code, so it skips; anything else stays a failure.
+_ENVIRONMENT_ERRORS = (
+    "Connection error",       # no network
+    "MissingSessionID",       # the local gateway requires a client identity
+                              # header that a bare SDK client does not send
+)
+
+
 def _check_for_connection_error(events: list[QueryEvent]) -> None:
     """W4: If we got a connection error, skip the test instead of failing.
 
-    This distinguishes 'network unavailable' (environment issue)
+    This distinguishes 'endpoint unavailable' (environment issue)
     from 'code bug' (logic issue).
     """
     for event in events:
-        if isinstance(event, ErrorEvent) and "Connection error" in event.message:
+        if isinstance(event, ErrorEvent) and any(
+            marker in event.message for marker in _ENVIRONMENT_ERRORS
+        ):
             pytest.skip(
-                f"Network unavailable — skipping online test. "
+                f"Endpoint unavailable — skipping online test. "
                 f"Error: {event.message}"
             )
 

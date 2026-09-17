@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -89,7 +89,7 @@ class TestUnknownBlockTypeWarning:
             ),
         ]
         client = MagicMock()
-        client.messages.stream = MagicMock(return_value=MockStream(events))
+        client.messages.create = AsyncMock(return_value=MockStream(events))
 
         with caplog.at_level(logging.WARNING, logger="longline.api.claude"):
             result_events = [e async for e in stream_response(
@@ -118,7 +118,7 @@ class TestUnknownBlockTypeWarning:
             ),
         ]
         client = MagicMock()
-        client.messages.stream = MagicMock(return_value=MockStream(events))
+        client.messages.create = AsyncMock(return_value=MockStream(events))
 
         with caplog.at_level(logging.WARNING, logger="longline.api.claude"):
             [e async for e in stream_response(

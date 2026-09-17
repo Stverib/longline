@@ -13,6 +13,8 @@ the original six-tool core set, so existing runs are unchanged.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from longline.core.query_engine import QueryEngine
 
 # NOTE: anthropic SDK is imported lazily inside build_engine() so that this
@@ -24,6 +26,32 @@ from longline.prompts.builder import build_system_prompt
 # Tools the model under evaluation may use during eval runs (default profile).
 EVAL_TOOL_NAMES = ("Bash", "Read", "Write", "Edit", "Glob", "Grep")
 
+# The client identity this harness presents to the gateway.
+#
+# The OpenCode gateway (`opencode.ai/zen/go`) refuses a request that looks like a
+# bare SDK call. Its documentation asks a client to "identify itself with its own
+# user agent, such as `my-coding-agent/1.0`" rather than an HTTP library's
+# default, and to "send a stable session ID in `x-opencode-session` for each
+# conversation". A request without both is answered with an HTTP 403 carrying a
+# Cloudflare interstitial -- which reads exactly like a network block, and cost
+# this project a detour chasing one.
+#
+# Nothing here is OpenCode-specific in a way that breaks a real Anthropic
+# endpoint: an unknown header is ignored, and naming the client is good manners
+# against any gateway.
+EVAL_USER_AGENT = "longline-eval/1.0"
+
+
+def client_headers(session_id: str) -> dict[str, str]:
+    """Headers that identify this harness and pin one conversation's routing.
+
+    `session_id` is what the gateway routes and caches on, so it must be stable
+    WITHIN a conversation and different BETWEEN them. Each eval case is one
+    conversation, and its sandbox is unique per case, so the sandbox is the
+    natural source -- see `build_engine`.
+    """
+    return {"x-opencode-session": session_id, "user-agent": EVAL_USER_AGENT}
+
 
 def build_engine(
     *,
@@ -31,6 +59,7 @@ def build_engine(
     model: str,
     api_key: str,
     tool_profile: str = "core",
+    session_id: str | None = None,
 ) -> QueryEngine:
     """Build a QueryEngine wired for evaluation.
 
@@ -41,6 +70,9 @@ def build_engine(
       unknown profile raises rather than silently falling back to the core
       set, because a silently smaller toolset still produces a plausible
       accuracy number.
+    - session_id: the gateway's routing key for this conversation. Defaults to
+      the sandbox's basename, which is already unique per case; callers that
+      know something more meaningful (a case id) may pass it instead.
     """
     import anthropic
 
@@ -50,7 +82,10 @@ def build_engine(
         is_interactive=False,
     )
     return QueryEngine(
-        client=anthropic.AsyncAnthropic(api_key=api_key),
+        client=anthropic.AsyncAnthropic(
+            api_key=api_key,
+            default_headers=client_headers(session_id or Path(sandbox).name),
+        ),
         model=model,
         registry=build_eval_registry(sandbox, profile=tool_profile),
         system_prompt=system,

@@ -119,7 +119,19 @@ async def stream_response(
     stop_reason: str | None = None
 
     try:
-        async with client.messages.stream(**params) as stream:
+        # `client.messages.create(stream=True)` rather than the SDK's
+        # `client.messages.stream()` helper.
+        #
+        # `.stream()` routes every event through the SDK's accumulator, which
+        # builds the final message from `message_start` with
+        # `ParsedMessage.construct(**event.message.to_dict())`. `construct()`
+        # applies no defaults, so a `message_start` that omits `content` -- as
+        # the Anthropic-compatible proxies in use here do -- yields
+        # `snapshot.content is None`, and the next `content_block_start` does
+        # `None.append(...)` and raises AttributeError. Nothing in this module
+        # uses the accumulator's output: the block state below is accumulated
+        # here, so the indirection only adds a way to fail.
+        async with await client.messages.create(stream=True, **params) as stream:
             async for event in stream:
                 # 使用 getattr 而非直接属性访问，因为 SDK 的事件类型是 Union，
                 # 不同事件有不同属性，直接访问会触发 AttributeError

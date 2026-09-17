@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from longline.api.claude import stream_response
 from longline.core.events import TextDelta, ToolUseStart, TurnComplete
@@ -130,7 +130,7 @@ class TestStreamResponseTextOnly:
     async def test_text_deltas_yielded(self) -> None:
         """Mock: pure text response → TextDelta events + TurnComplete."""
         mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=MockStream(make_text_stream_events()))
+        mock_client.messages.create = AsyncMock(return_value=MockStream(make_text_stream_events()))
 
         events = [e async for e in stream_response(
             mock_client,
@@ -153,7 +153,7 @@ class TestStreamResponseToolUse:
     async def test_tool_use_detected(self) -> None:
         """Mock: text + tool_use → TextDelta + ToolUseStart + TurnComplete(tool_use)."""
         mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=MockStream(make_tool_use_stream_events()))
+        mock_client.messages.create = AsyncMock(return_value=MockStream(make_tool_use_stream_events()))
 
         events = [e async for e in stream_response(
             mock_client,
@@ -179,7 +179,7 @@ class TestStreamResponseToolUse:
     async def test_partial_json_accumulated(self) -> None:
         """Tool input JSON is correctly accumulated from partial chunks."""
         mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=MockStream(make_tool_use_stream_events()))
+        mock_client.messages.create = AsyncMock(return_value=MockStream(make_tool_use_stream_events()))
 
         events = [e async for e in stream_response(
             mock_client,

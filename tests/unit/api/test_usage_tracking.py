@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -101,7 +101,7 @@ class TestUsageTracking:
             ),
         ]
         client = MagicMock()
-        client.messages.stream = MagicMock(return_value=MockStream(events))
+        client.messages.create = AsyncMock(return_value=MockStream(events))
 
         result_events = [e async for e in stream_response(
             client, messages=[{"role": "user", "content": "x"}], system="s",
