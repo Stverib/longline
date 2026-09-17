@@ -744,8 +744,36 @@ def _latency_lines(summary: LatencySummary) -> list[str]:
 
 
 def _fmt_pct_ratio(value: float | None) -> str:
-    """A ratio rendered as a signed percent change; `pp` is never used here."""
+    """A ratio rendered as a signed percent change; `pp` is never used here.
+
+    Only correct for a quantity that ALREADY is a relative change -- `reduction`
+    and `TokenOverhead` are both fractional differences from a baseline, so
+    `value * 100` is their percent form. It is NOT correct for a ratio whose
+    neutral point is 1.0; use `_fmt_speedup` for those.
+    """
     return "n/a" if value is None else f"{value * 100:+.1f}%"
+
+
+def _fmt_speedup(value: float | None) -> str:
+    """A ratio of two durations, where `1.00x` is parity.
+
+    Deliberately not `_fmt_pct_ratio`. That helper renders a value as a percent
+    of ITSELF, which is right for a quantity that already is a relative change
+    (`0.5` means "half of baseline") but wrong for a ratio whose neutral point
+    is 1.0. Measured on this suite: `single / multi = 0.12` means the multi arm
+    took 8.7x as long, and rendering that `+11.6%` reads as an improvement --
+    the exact opposite of the truth. A benchmark whose headline number can be
+    read backwards is worse than one with no number at all.
+
+    `pp` is never used here: the contract reserves it for success rates.
+    """
+    if value is None:
+        return "n/a"
+    if value > 1.0:
+        return f"{value:.2f}x faster"
+    if value < 1.0:
+        return f"{value:.2f}x ({1 / value:.1f}x slower)"
+    return "1.00x (parity)"
 
 
 def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
@@ -775,7 +803,9 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
         "> `Speedup` is `single_wall_time / multi_wall_time` and `TokenOverhead` is "
         "`(multi - single) / single` -- both **ratios**, never differences in "
         "percentage points (contract §5.6 / §4.3). `pp` is reserved for success "
-        "rates. Tokens include **every** sub-agent, not only the leader.",
+        "rates. Tokens include **every** sub-agent, not only the leader. "
+        "`Speedup` is a multiplier where **1.00x is parity**: below 1.00x means "
+        "the multi-agent arm was SLOWER, which is the usual offline result.",
     ]
 
     for group, summary in sorted(summaries.items()):
@@ -811,8 +841,8 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
                 "判分通过的多 Agent 用例 / 用例总数",
             ),
             (
-                f"| Speedup | {_fmt_pct_ratio(summary.mean_speedup)} "
-                f"(ratio of durations) | n/a | mean over "
+                f"| Speedup | {_fmt_speedup(summary.mean_speedup)} "
+                f"| n/a | mean over "
                 f"{summary.eligible_cases} per-case `single / multi` ratios |"
             ),
             (
@@ -857,7 +887,7 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
             lines.append(
                 f"| {row['case_id']} | {row['workers']} | {single['passed']} | "
                 f"{multi['passed']} | {_fmt_ms(single_ms)} | {_fmt_ms(multi_ms)} | "
-                f"{_fmt_pct_ratio(speedup)} | {single['total_tokens']} | "
+                f"{_fmt_speedup(speedup)} | {single['total_tokens']} | "
                 f"{multi['total_tokens']} | {multi['child_tokens']} | {excluded} |"
             )
     return lines

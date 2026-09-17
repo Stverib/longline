@@ -30,7 +30,12 @@ from typing import TYPE_CHECKING
 
 from longline.eval.multi_agent import GROUPS, MAX_WORKERS, MIN_WORKERS, load_multi_agent_cases
 from longline.eval.multi_agent_runner import MULTI_AGENT_TAG
-from longline.eval.report import aggregate, paired_report_delta, render_markdown
+from longline.eval.report import (
+    _fmt_speedup,  # canonical: a duration ratio has parity at 1.00x, not 0
+    aggregate,
+    paired_report_delta,
+    render_markdown,
+)
 from longline.eval.runner import CaseResult, run_suite
 from longline.eval.types import E2ECase, EvalCase, ToolCallCase, load_cases
 from longline.models.messages import Usage
@@ -807,8 +812,8 @@ async def _run_multi_agent(
               f"multi={_fmt_ratio(summary.multi_success_rate)}")
         print(f"[eval]     WallClockTime single={_fmt_ms(summary.single_wall_time_ms)} "
               f"multi={_fmt_ms(summary.multi_wall_time_ms)}")
-        print(f"[eval]     Speedup={_fmt_ratio_value(summary.mean_speedup)} "
-              f"(ratio of durations, not pp)")
+        print(f"[eval]     Speedup={_fmt_speedup(summary.mean_speedup)} "
+              f"(single_wall / multi_wall; 1.00x is parity)")
         print(f"[eval]     TokenOverhead={_fmt_ratio_value(summary.mean_token_overhead)} "
               f"single_total={summary.single_tokens['total_tokens']} "
               f"multi_total={summary.multi_tokens['total_tokens']} "

@@ -448,3 +448,91 @@ class TestLatencyReportSection:
     def test_no_section_when_summary_is_none(self) -> None:
         md = render_markdown(aggregate([]), latency=None)
         assert "Streaming tool latency" not in md
+
+
+def _multi_agent_summary(*, mean_speedup: float | None) -> Any:
+    """A one-case `MultiAgentSummary` built by hand, so nothing is measured."""
+    from longline.eval.metrics import Ratio
+    from longline.eval.multi_agent_runner import MultiAgentSummary
+
+    both = Ratio(numerator=1, denominator=1)
+    return MultiAgentSummary(
+        group="controlled",
+        num_cases=1,
+        eligible_cases=1,
+        excluded_cases=0,
+        single_success_rate=both,
+        multi_success_rate=both,
+        single_wall_time_ms=16.9,
+        multi_wall_time_ms=146.3,
+        mean_speedup=mean_speedup,
+        mean_token_overhead=2.3333,
+        single_tokens={"input_tokens": 1, "output_tokens": 1, "total_tokens": 74520,
+                       "child_tokens": 0},
+        multi_tokens={"input_tokens": 1, "output_tokens": 1, "total_tokens": 248400,
+                      "child_tokens": 198720},
+        single_tool_calls=5,
+        multi_tool_calls=5,
+        agent_counts=[5],
+    )
+
+
+class TestSpeedupIsARatioNotAPercent:
+    """`Speedup` has parity at 1.00x, so it cannot share `_fmt_pct_ratio`.
+
+    `_fmt_pct_ratio` renders `value * 100` as a signed percent, which is correct
+    for a quantity that already IS a relative change (`reduction`,
+    `TokenOverhead`) and wrong for this one. Shipped once: an offline run
+    measured `single / multi = 0.1155` and the report printed `+11.6%`, which
+    reads as an 11.6% improvement when the multi arm was in fact 8.7x SLOWER.
+    """
+
+    def test_a_slowdown_is_never_rendered_with_a_plus_sign(self) -> None:
+        """FAILS ON: the shipped bug -- 0.1155 rendered as '+11.6%'."""
+        from longline.eval.report import _fmt_speedup
+
+        rendered = _fmt_speedup(0.1155)
+        assert not rendered.startswith("+"), rendered
+        assert "slower" in rendered
+
+    def test_a_slowdown_states_the_factor(self) -> None:
+        """FAILS ON: a bare '0.12x' a reader has to invert in their head."""
+        from longline.eval.report import _fmt_speedup
+
+        assert _fmt_speedup(0.5) == "0.50x (2.0x slower)"
+
+    def test_parity_is_named(self) -> None:
+        """FAILS ON: 1.0 rendered as '+100.0%', which reads as a doubling."""
+        from longline.eval.report import _fmt_speedup
+
+        assert _fmt_speedup(1.0) == "1.00x (parity)"
+
+    def test_an_improvement_says_faster(self) -> None:
+        from longline.eval.report import _fmt_speedup
+
+        assert _fmt_speedup(2.0) == "2.00x faster"
+
+    def test_unmeasured_is_not_zero(self) -> None:
+        """FAILS ON: a None speedup rendered as '0.00x (parity)'."""
+        from longline.eval.report import _fmt_speedup
+
+        assert _fmt_speedup(None) == "n/a"
+
+    def test_the_two_formatters_disagree_on_the_same_value(self) -> None:
+        """The regression in one line: the same number, two meanings.
+
+        This is the test that would have caught it without knowing which suite
+        it came from. `0.1155` as a relative change is a small positive change;
+        as a duration ratio it is a large regression.
+        """
+        from longline.eval.report import _fmt_pct_ratio, _fmt_speedup
+
+        assert _fmt_pct_ratio(0.1155) == "+11.6%"
+        assert _fmt_speedup(0.1155) == "0.12x (8.7x slower)"
+
+    def test_the_multi_agent_section_uses_the_ratio_formatter(self) -> None:
+        """FAILS ON: the section calling `_fmt_pct_ratio` on a mean speedup."""
+        summary = _multi_agent_summary(mean_speedup=0.1155)
+        md = render_markdown(aggregate([]), multi_agent={"controlled": summary})
+        assert "0.12x (8.7x slower)" in md
+        assert "+11.6%" not in md
