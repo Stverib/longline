@@ -196,7 +196,12 @@ def _positive_int(value: str) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="python -m longline.eval", description="Run the agent evaluation suite.")
     p.add_argument("--type", choices=TYPE_CHOICES, default="all")
-    p.add_argument("--model", default="claude-sonnet-4-20250514")
+    # The default model is `ANTHROPIC_MODEL` from the project .env when set, so
+    # a run records and requests the model the user actually configured; the
+    # gateway decides what it serves regardless, and `model_provenance` reports
+    # that distinction separately. The legacy constant stays as the fallback.
+    p.add_argument("--model",
+                   default=_load_env_file().get("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514")
     p.add_argument("--case-file", default=str(PROJECT_ROOT / "evals" / "tool_calls.jsonl"),
                    help="Path to a JSONL file of cases.")
     p.add_argument("--fixtures-dir", default=str(PROJECT_ROOT / "evals" / "fixtures"))

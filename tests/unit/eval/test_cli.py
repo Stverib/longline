@@ -15,7 +15,12 @@ from longline.eval.types import ToolCallCase
 def test_parse_known_args_defaults(tmp_path: Path) -> None:
     ns = cli.parse_args(["--case-file", str(tmp_path / "c.jsonl")])
     assert ns.type == "all"
-    assert ns.model == "claude-sonnet-4-20250514"
+    # The default model comes from `ANTHROPIC_MODEL` in the project .env when
+    # set, falling back to the legacy constant when it is not. Assert against
+    # the same source the CLI reads, so the test holds under both configs.
+    assert ns.model == (
+        cli._load_env_file().get("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
+    )
     assert ns.case_file == str(tmp_path / "c.jsonl")
     assert ns.max_cases is None
     assert ns.out_dir is not None
