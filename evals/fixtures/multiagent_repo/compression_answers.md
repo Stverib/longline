@@ -1,7 +1,7 @@
 # Compression answers
 
 Write one line per key fact below, in the form `<id>=<answer>`.
-Replace `FILL_ME` with the answer, keeping the id.
+Replace each placeholder with the answer, keeping the id.
 
 A1=FILL_ME
 A2=FILL_ME
