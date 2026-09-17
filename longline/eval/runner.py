@@ -12,6 +12,7 @@ human can inspect the scene.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import time
@@ -26,7 +27,7 @@ from longline.eval.trajectory import ToolCall, ToolExecution, extract_trajectory
 from longline.eval.types import ABSTENTION_TAG, EvalCase, ToolCallCase, resolve_fixture
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from longline.eval.trajectory import Trajectory
 
@@ -64,6 +65,10 @@ class CaseResult:
     event_timestamps: dict[str, int] = field(default_factory=dict)
     sandbox: str | None = None
     sandbox_kept: bool = False
+    # Every distinct model the transport said it served, in first-seen order.
+    # Empty means the transport never said; see `model_provenance` for how that
+    # is reported, and why it is not silently replaced by the requested model.
+    served_models: list[str] = field(default_factory=list)
 
     @property
     def num_rounds(self) -> int:
@@ -213,7 +218,53 @@ class CaseResult:
             ],
             "event_timestamps": self.event_timestamps,
             "judge_detail": self.detail,
+            "served_models": self.served_models,
         }
+
+
+def served_models_in(items: Iterable[object]) -> list[str]:
+    """Every distinct served model across a set of case results, first-seen order.
+
+    Accepts anything carrying a `served_models` list -- a `CaseResult` from an
+    ordinary suite, or a `VariantRun` from the multi-agent one -- so the run
+    metadata reports provenance through one path regardless of which runner
+    produced the rows. A per-runner copy of this loop is a per-runner way for
+    the metadata to disagree with the artifact it describes.
+    """
+    out: list[str] = []
+    for item in items:
+        for name in getattr(item, "served_models", []) or []:
+            if name not in out:
+                out.append(name)
+    return out
+
+
+def model_provenance(requested: str, served: list[str]) -> dict[str, object]:
+    """Where the run's model name came from, and whether it agrees with the ask.
+
+    A report that prints `model: X` is making a claim about what ran. Three
+    cases, and they are not interchangeable:
+
+    - `measured` -- the transport named the model it served. `model_served` is
+      evidence. `model_matches_request` is False when the gateway substituted
+      a different model, which is a fact a reader of the numbers needs; the
+      Anthropic-compatible gateway this project uses ignores the requested
+      `model` field entirely and always serves its own.
+    - `requested_unverified` -- the transport said nothing. `model_served` is
+      empty and `model_matches_request` is None, because "we did not check" is
+      not the same as "it matched". Recording the requested name here would be
+      a claim with no evidence behind it.
+    - a single name that equals the request -- `measured`, matched True.
+
+    A list rather than one name, because a gateway can fail over between turns
+    and a run answered by two different models has to be able to say so.
+    """
+    return {
+        "model_requested": requested,
+        "model_served": list(served),
+        "model_source": "measured" if served else "requested_unverified",
+        "model_matches_request": (requested in served) if served else None,
+    }
 
 
 def _prepare_sandbox(fixtures_dir: Path, fixture: str | None, case_id: str = "<unknown>") -> str:
@@ -316,6 +367,7 @@ def _result_from_trajectory(
         tool_executions=traj.tool_executions,
         event_timestamps=traj.event_timestamps,
         sandbox=sandbox,
+        served_models=list(traj.served_models),
     )
 
 
@@ -498,6 +550,8 @@ async def run_suite(
     profile_for_case: Callable[[EvalCase], str] | None = None,
     skip_case_ids: frozenset[str] = frozenset(),
     sink: Callable[[CaseResult], None] | None = None,
+    pace_seconds: float = 0.0,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> list[CaseResult]:
     """Run a batch of cases serially.
 
@@ -517,11 +571,29 @@ async def run_suite(
     `skip_case_ids` omits cases already answered by a previous attempt. The
     `trial` index still counts the skipped ones, so a resumed run's rows carry
     the same `trial` a fresh run would have given them.
+
+    `pace_seconds` puts a pause BETWEEN two API calls. The serial contract
+    (`evals/README.md` §4.6) keeps quality runs from overlapping, but a gateway
+    can still reject back-to-back requests from one account, and a rejected
+    request produces a row that measured nothing. The pause is taken only when
+    another case is actually about to run, so it never precedes the first call
+    and never separates two calls that `skip_case_ids` removed -- the point is
+    to keep real calls apart, not to add wall-clock to a resumed run.
+
+    `sleep` is injected so the pacing is exactly assertable without sleeping.
     """
+    sleeper = sleep if sleep is not None else asyncio.sleep
     results: list[CaseResult] = []
+    # Whether the previous iteration actually ran a case. Pacing separates two
+    # real API calls, so it is taken before a case only when one just ran --
+    # never before the first, and never across a case `skip_case_ids` removed.
+    ran_previous = False
     for trial, case in enumerate(cases):
         if case.id in skip_case_ids:
             continue
+        if ran_previous and pace_seconds > 0.0:
+            await sleeper(pace_seconds)
+        ran_previous = True
         result = await run_case(
             case,
             model=model,

@@ -73,6 +73,15 @@ class Trajectory:
     output_tokens: int = 0
     text: str = ""
     errors: list[str] = field(default_factory=list)
+    # Every distinct `TurnComplete.served_model` this stream carried, in first-seen
+    # order. A LIST rather than a single name because a gateway can fail over
+    # between turns, and a run whose turns were answered by two different models
+    # has to be able to say so: picking one -- the first, the last, the majority
+    # -- would produce a single confident name for a number that is an average of
+    # two. Empty means the transport never told us, which is not the same as
+    # "the transport served what we asked for"; `served_model_source` in the run
+    # metadata is what distinguishes the two for a reader.
+    served_models: list[str] = field(default_factory=list)
     # Task 1 telemetry
     tool_executions: list[ToolExecution] = field(default_factory=list)
     event_timestamps: dict[str, int] = field(default_factory=dict)
@@ -147,6 +156,8 @@ async def extract_trajectory(
             traj.turns += 1
             traj.input_tokens += event.usage.input_tokens
             traj.output_tokens += event.usage.output_tokens
+            if event.served_model and event.served_model not in traj.served_models:
+                traj.served_models.append(event.served_model)
             traj.event_timestamps[f"turn_{traj.turns}_complete"] = clock()
         elif isinstance(event, TextDelta):
             traj.text += event.text

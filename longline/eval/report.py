@@ -11,7 +11,7 @@ number. Everything here is recomputable from `raw.jsonl`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from longline.eval.metrics import (
     Ratio,
@@ -354,6 +354,7 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
             "turns": r.turns,
             "input_tokens": r.input_tokens,
             "output_tokens": r.output_tokens,
+            "served_models": r.served_models,
             "num_tool_calls": r.num_tool_calls,
             "num_successful_tool_calls": r.num_successful_tool_calls,
             "error_type": r.error_type,
@@ -470,9 +471,25 @@ def render_markdown(
     same work, while an exploratory case's coordinator decomposes freely, so a
     pooled number would be comparing different work under one heading.
     """
+    # The model line reports only what the TRANSPORT said it served. A run
+    # whose stream never named a model states that, rather than repeating the
+    # requested name as though it had been checked -- the requested name is
+    # still in the run metadata (`model`) under its own key.
+    served = sorted({
+        m
+        for row in report.per_case
+        for m in cast("list[str]", row.get("served_models") or [])
+    })
+    model_line = (
+        f"- **Model served:** {', '.join(served)} (reported by the transport)"
+        if served
+        else "- **Model served:** not reported by the transport"
+    )
+
     lines = [
         "# Agent Evaluation Report",
         "",
+        model_line,
         f"- **Total cases:** {report.total_cases}",
         f"- **Tool-call accuracy (L1):** {_fmt_pct(report.l1_ratio)} 95% Wilson CI {_fmt_ci(report.l1_ratio)}",
         f"- **E2E pass@1 (L2):** {_fmt_pct(report.l2_ratio)} 95% Wilson CI {_fmt_ci(report.l2_ratio)}",

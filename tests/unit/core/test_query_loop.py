@@ -228,3 +228,62 @@ class TestQueryLoopRecoverableError:
 
         tool_results = [e for e in events if isinstance(e, ToolResultReady)]
         assert len(tool_results) >= 1
+
+
+class TestServedModelSurvivesTheLoop:
+    """`query_loop` REBUILDS `TurnComplete`, so every field must be carried over.
+
+    Phase 2 does not forward the model's `TurnComplete`; it stores `stop_reason`
+    and `usage` and emits a fresh event after Phase 4. A field added to the
+    event but not to that hand-off is silently dropped here -- which is exactly
+    what happened to `served_model`: the API reported `deepseek-flash` on every
+    response and the eval recorded "the transport never said".
+    """
+
+    async def test_served_model_is_carried_to_the_emitted_turn_complete(self) -> None:
+        registry = ToolRegistry()
+        messages: list[Message] = [UserMessage(content="test")]
+
+        async def mock_call_model(**kwargs: Any) -> Any:
+            yield TextDelta(text="hi")
+            yield TurnComplete(
+                stop_reason="end_turn", usage=Usage(), served_model="deepseek-flash",
+            )
+
+        events = [
+            e
+            async for e in query_loop(
+                messages=messages,
+                system_prompt="test",
+                tools=registry,
+                call_model=mock_call_model,
+                max_turns=3,
+            )
+        ]
+
+        turns = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turns) == 1
+        assert turns[0].served_model == "deepseek-flash"
+
+    async def test_a_silent_model_stays_silent_through_the_loop(self) -> None:
+        """FAILS ON: substituting a default here, which would fabricate evidence."""
+        registry = ToolRegistry()
+        messages: list[Message] = [UserMessage(content="test")]
+
+        async def mock_call_model(**kwargs: Any) -> Any:
+            yield TextDelta(text="hi")
+            yield TurnComplete(stop_reason="end_turn", usage=Usage())
+
+        events = [
+            e
+            async for e in query_loop(
+                messages=messages,
+                system_prompt="test",
+                tools=registry,
+                call_model=mock_call_model,
+                max_turns=3,
+            )
+        ]
+
+        turns = [e for e in events if isinstance(e, TurnComplete)]
+        assert turns[0].served_model is None

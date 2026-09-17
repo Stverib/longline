@@ -117,20 +117,26 @@ async def stream_response(
     # 如果流中断但没收到 message_delta，stop_reason 保持 None，
     # 最终在 yield TurnComplete 时 fallback 为 "end_turn"。
     stop_reason: str | None = None
+    # 响应自己声明的模型名. 默认 None 的含义是「这条流没有告诉我们」, 而不是
+    # 「就是请求里那个」: Anthropic 兼容网关 (实测 cc-switch) 会忽略请求里的
+    # model 字段并服务它自己的模型, 把请求值当默认值写进 TurnComplete 会让上层
+    # 记下一个从未运行过的模型.
+    served_model: str | None = None
 
     try:
         # `client.messages.create(stream=True)` rather than the SDK's
         # `client.messages.stream()` helper.
         #
-        # `.stream()` routes every event through the SDK's accumulator, which
-        # builds the final message from `message_start` with
-        # `ParsedMessage.construct(**event.message.to_dict())`. `construct()`
-        # applies no defaults, so a `message_start` that omits `content` -- as
-        # the Anthropic-compatible proxies in use here do -- yields
-        # `snapshot.content is None`, and the next `content_block_start` does
-        # `None.append(...)` and raises AttributeError. Nothing in this module
-        # uses the accumulator's output: the block state below is accumulated
-        # here, so the indirection only adds a way to fail.
+        # `.stream()` does not hand you the server's events; it routes them
+        # through `MessageStream`, which replaces `message_start.message` with a
+        # `ParsedMessage` -- a deliberately empty sentinel that fills in as
+        # deltas arrive. `ParsedMessage.construct()` applies no defaults, so
+        # `.content` reads back as `None` and `.model` as `None` for the whole
+        # of the first block, and the accumulator is what raises on them.
+        # Nothing here uses its output: the block state, the usage and the
+        # served model are all accumulated from the raw events below, which are
+        # the server's own. Taking the raw stream therefore loses nothing and
+        # drops a layer that could only add a way to fail.
         async with await client.messages.create(stream=True, **params) as stream:
             async for event in stream:
                 # 使用 getattr 而非直接属性访问，因为 SDK 的事件类型是 Union，
@@ -141,6 +147,9 @@ async def stream_response(
                 if event_type == "message_start":
                     msg = getattr(event, "message", None)
                     if msg:
+                        # 响应声明的模型名. 取的是响应而非请求: 网关可能服务
+                        # 一个与请求不同的模型, 而元数据必须描述真正跑过的那个.
+                        served_model = getattr(msg, "model", None) or None
                         msg_usage = getattr(msg, "usage", None)
                         if msg_usage:
                             # input_tokens 和 cache_* 只在 message_start 中出现
@@ -298,4 +307,6 @@ async def stream_response(
 
     # 正常完成: 将 stop_reason 的 None fallback 为 "end_turn"
     # 这个转换只在输出边界做（函数内部保持 None 语义），与 TS 行为一致
-    yield TurnComplete(stop_reason=stop_reason or "end_turn", usage=usage)
+    yield TurnComplete(
+        stop_reason=stop_reason or "end_turn", usage=usage, served_model=served_model,
+    )

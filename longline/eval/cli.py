@@ -36,7 +36,12 @@ from longline.eval.report import (
     paired_report_delta,
     render_markdown,
 )
-from longline.eval.runner import CaseResult, run_suite
+from longline.eval.runner import (
+    CaseResult,
+    model_provenance,
+    run_suite,
+    served_models_in,
+)
 from longline.eval.trajectory import ToolExecution
 from longline.eval.types import E2ECase, EvalCase, ToolCallCase, load_cases
 from longline.models.messages import Usage
@@ -170,6 +175,17 @@ def _apply_base_url() -> None:
     os.environ["ANTHROPIC_BASE_URL"] = base
 
 
+def _non_negative_float(value: str) -> float:
+    """A duration that may legitimately be 0 (i.e. "do not pace at all")."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"must be a number, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {parsed}")
+    return parsed
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -212,6 +228,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--keep-sandbox-on-failure", action="store_true",
         help="Leave a failed case's temp sandbox on disk and record its path. "
              "Successful cases are always cleaned up.",
+    )
+    p.add_argument(
+        "--pace-seconds", type=_non_negative_float, default=0.0, metavar="SECONDS",
+        help="Pause this long between two model calls. The serial contract "
+             "keeps quality runs from overlapping, but a gateway can still "
+             "reject back-to-back requests from one account, and a rejected "
+             "request produces a row that measured nothing. Default 0 (no "
+             "pause), which is what every offline suite wants.",
     )
     p.add_argument(
         "--resume-run", action="store_true",
@@ -444,8 +468,15 @@ def run_metadata(
     case_file: Path,
     repeat_index: int,
     repeats_completed: int,
+    served_models: list[str] | None = None,
 ) -> dict[str, object]:
-    """The per-run metadata block required by evals/README.md §2.1."""
+    """The per-run metadata block required by evals/README.md §2.1.
+
+    `served_models` is what the transport reported it actually ran. It is a
+    parameter rather than a global because only the caller has the results, and
+    it is folded in here rather than at each call site so all six runners
+    describe their model the same way.
+    """
     return {
         "run_id": run_id,
         "suite": suite,
@@ -458,6 +489,7 @@ def run_metadata(
         "case_file_sha256": _sha256(case_file),
         "repeat_index": repeat_index,
         "repeats_completed": repeats_completed,
+        **model_provenance(model, served_models or []),
     }
 
 
@@ -603,6 +635,10 @@ def _load_jsonl_results(path: Path) -> list[CaseResult]:
             },
             trial=int(d.get("trial", 0)),
             run_id=d.get("run_id"),
+            # Which model the transport actually served. Restored like every
+            # other aggregate-bearing field: a resumed run that forgot it would
+            # report a measured model as unverified.
+            served_models=[str(m) for m in (d.get("served_models") or [])],
         ))
     return out
 
@@ -699,6 +735,7 @@ async def _run_compression(
     metadata = run_metadata(
         run_id=run_id, suite="compression", variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=0, repeats_completed=1,
+        served_models=served_models_in(runs),
     )
 
     if args.run_id is not None:
@@ -796,6 +833,7 @@ async def _run_latency(
     metadata = run_metadata(
         run_id=run_id, suite="latency", variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=0, repeats_completed=1,
+        served_models=served_models_in(recorded),
     )
 
     run_dir = out_dir / run_id
@@ -909,6 +947,7 @@ async def _run_multi_agent(
     metadata = run_metadata(
         run_id=run_id, suite="multi_agent", variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=0, repeats_completed=1,
+        served_models=served_models_in(runs),
     )
     metadata["multi_agent"] = {
         "groups": [s.group for s in summaries],
@@ -1077,6 +1116,7 @@ async def _run_safety(
     metadata = run_metadata(
         run_id=run_id, suite="safety", variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=0, repeats_completed=1,
+        served_models=served_models_in(runs),
     )
 
     run_dir = out_dir / run_id
@@ -1215,6 +1255,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
                 cid for (cid, rep) in done if rep == repeat_index
             ),
             sink=_sink,
+            pace_seconds=args.pace_seconds,
         ))
 
     report = aggregate(all_results, variant=args.variant)
@@ -1233,6 +1274,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     metadata = run_metadata(
         run_id=run_id, suite=suite, variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=args.repeats - 1, repeats_completed=args.repeats,
+        served_models=served_models_in(all_results),
     )
 
     if args.run_id is not None:

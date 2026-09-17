@@ -45,6 +45,7 @@ class MockUsage:
 @dataclass
 class MockMessage:
     usage: MockUsage
+    model: str = ""
 
 
 @dataclass
@@ -189,3 +190,65 @@ class TestStreamResponseToolUse:
 
         tool_starts = [e for e in events if isinstance(e, ToolUseStart)]
         assert tool_starts[0].input == {"command": "ls"}
+
+
+class TestServedModel:
+    """`TurnComplete.served_model` is the RESPONSE's model, not the request's.
+
+    The distinction is not pedantic: the Anthropic-compatible gateway this
+    project runs against (cc-switch at `http://127.0.0.1:15721`) answers every
+    request with `model="deepseek-flash"` regardless of the `model` field it was
+    sent. Recording the requested name would have made every eval artifact
+    describe a model that never ran.
+    """
+
+    async def test_served_model_is_taken_from_the_response(self) -> None:
+        """FAILS ON: reading `params["model"]`, which the gateway ignores."""
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=MockStream([
+            MockEvent(type="message_start", message=MockMessage(usage=MockUsage(), model="deepseek-flash")),
+            MockEvent(type="content_block_start", index=0, content_block=MockContentBlock(type="text")),
+            MockEvent(type="content_block_delta", index=0, delta=MockDelta(type="text_delta", text="hi")),
+            MockEvent(type="content_block_stop", index=0),
+            MockEvent(
+                type="message_delta",
+                delta=MockDelta(type="message_delta", stop_reason="end_turn"),
+                usage=MockUsage(output_tokens=10),
+            ),
+        ]))
+
+        events = [e async for e in stream_response(
+            mock_client,
+            messages=[{"role": "user", "content": "hello"}],
+            system="test",
+            model="claude-sonnet-4-20250514",  # deliberately NOT what comes back
+        )]
+
+        turns = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turns) == 1
+        assert turns[0].served_model == "deepseek-flash"
+
+    async def test_a_silent_transport_reports_none_not_the_request(self) -> None:
+        """FAILS ON: defaulting `served_model` to the requested model.
+
+        A transport that says nothing has told us nothing. Substituting the
+        request value would turn "unknown" into a confident claim, and the
+        report would publish a model name with no evidence behind it.
+        """
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=MockStream([
+            MockEvent(type="message_start", message=MockMessage(usage=MockUsage())),  # model=""
+            MockEvent(type="content_block_start", index=0, content_block=MockContentBlock(type="text")),
+            MockEvent(type="content_block_delta", index=0, delta=MockDelta(type="text_delta", text="hi")),
+            MockEvent(type="content_block_stop", index=0),
+        ]))
+
+        events = [e async for e in stream_response(
+            mock_client,
+            messages=[{"role": "user", "content": "hello"}],
+            system="test",
+            model="claude-sonnet-4-20250514",
+        )]
+
+        turns = [e for e in events if isinstance(e, TurnComplete)]
+        assert turns[0].served_model is None

@@ -209,6 +209,10 @@ async def query_loop(
         accumulated_text = ""           # 累积模型输出的文本（用于构建 AssistantMessage）
         usage = Usage()                 # 本轮 token 消耗统计
         stop_reason = "end_turn"        # 默认停止原因，会被 TurnComplete 事件覆盖
+        # 本轮流实际服务的模型名, 由 API 响应声明. 必须在这里接住: Phase 2 不转发
+        # 模型产出的 TurnComplete, 而是在 Phase 4 之后重新构造一个, 任何没有显式
+        # 传递过来的字段都会在这个交接处静默丢失.
+        served_model: str | None = None
         tool_use_blocks: list[ToolUseBlock] = []  # 本轮所有工具调用块
         error_event: ErrorEvent | None = None     # 本轮的错误（如果有）
 
@@ -233,6 +237,7 @@ async def query_loop(
             elif isinstance(event, TurnComplete):
                 stop_reason = event.stop_reason
                 usage = event.usage
+                served_model = event.served_model
                 # 注意: 不在这里 yield TurnComplete——Phase 4 完成后才 yield
 
             elif isinstance(event, ErrorEvent):
@@ -325,7 +330,7 @@ async def query_loop(
             max_output_recovery_count += 1
             if max_output_recovery_count == 1:
                 current_max_tokens = ESCALATED_MAX_TOKENS  # 首次截断时提升限制
-            yield TurnComplete(stop_reason="max_tokens", usage=usage)
+            yield TurnComplete(stop_reason="max_tokens", usage=usage, served_model=served_model)
             continue  # continue 2: 带着续写请求重新进入 Phase 1
 
         # 构建 AssistantMessage：将模型本轮输出（文本 + 工具调用）写入 transcript
@@ -343,7 +348,7 @@ async def query_loop(
         )
         messages.append(assistant_msg)
 
-        yield TurnComplete(stop_reason=stop_reason, usage=usage)
+        yield TurnComplete(stop_reason=stop_reason, usage=usage, served_model=served_model)
 
         # === Phase 4: 工具执行 + 结果拼回 ===
         # P1b: 工具已在 Phase 2 流式过程中通过 executor.add_tool() 提前启动，

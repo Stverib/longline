@@ -63,6 +63,61 @@ def test_trajectory_dataclass_defaults() -> None:
     assert t.tool_executions == []
     assert t.event_timestamps == {}
     assert t.num_successful_tool_calls == 0
+    # `None` means "the transport did not tell us", which is a different fact
+    # from "the transport told us it was the model we asked for". See
+    # `served_models` -- the two are never collapsed.
+    assert t.served_models == []
+
+
+# --- the served model: what the transport actually ran (Task 9) ---
+
+
+async def test_served_model_is_recorded_from_the_stream() -> None:
+    """The gateway ignores the requested `model` and serves its own.
+
+    A run that records only what it asked for is describing a model that never
+    executed. This is the seam that lets the artifact say what actually ran.
+    """
+    traj = await _extract(
+        TurnComplete(stop_reason="end_turn", usage=Usage(), served_model="deepseek-flash"),
+    )
+    assert traj.served_models == ["deepseek-flash"]
+
+
+async def test_served_models_dedupes_a_repeated_answer() -> None:
+    """Two turns of one conversation answer the same thing; the list is a set."""
+    traj = await _extract(
+        TurnComplete(stop_reason="tool_use", usage=Usage(), served_model="deepseek-flash"),
+        TurnComplete(stop_reason="end_turn", usage=Usage(), served_model="deepseek-flash"),
+    )
+    assert traj.served_models == ["deepseek-flash"]
+
+
+async def test_a_mid_conversation_switch_is_visible() -> None:
+    """A gateway that fails over between turns must not be silently averaged.
+
+    Keeping BOTH names is the point: a reader has to be able to see that this
+    run's numbers came from two different models, because neither a single name
+    nor a majority vote would describe it.
+    """
+    traj = await _extract(
+        TurnComplete(stop_reason="tool_use", usage=Usage(), served_model="deepseek-flash"),
+        TurnComplete(stop_reason="end_turn", usage=Usage(), served_model="glm-4.6"),
+    )
+    assert traj.served_models == ["deepseek-flash", "glm-4.6"]
+
+
+async def test_a_transport_that_says_nothing_yields_no_name() -> None:
+    """FAILS ON: inventing the requested model when the stream is silent.
+
+    A default of "deepseek-flash" would make every offline run claim a model it
+    never contacted. An empty list is the honest answer, and the mismatch check
+    in `runner` keys off exactly this.
+    """
+    traj = await _extract(
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    )
+    assert traj.served_models == []
 
 
 # --- ToolResultReady capture (Task 1) ---

@@ -757,6 +757,7 @@ class TestRawRowsRoundTrip:
             input_tokens=111, output_tokens=22, duration_ms=33.5,
             tags=["read-write-edit", "blind"], variant="baseline",
             repeat_index=2, trial=7, run_id="r1",
+            served_models=["deepseek-flash"],
             tool_calls=[("Read", {"file_path": "a.py"}), ("Read", {"file_path": "b.py"})],
             tool_executions=[
                 ToolExecution("t1", "Read", False, 0, 5_000_000),
@@ -802,6 +803,10 @@ class TestRawRowsRoundTrip:
         assert restored.passed is True
         assert restored.repeat_index == 2
         assert restored.error_type is None
+        # Which model actually ran. Empty here would mean the resumed run had
+        # forgotten, and `model_provenance` would then report the model as
+        # unverified on a run that had in fact measured it.
+        assert restored.served_models == ["deepseek-flash"]
 
     def test_the_tool_duration_survives(self, tmp_path: Path) -> None:
         """FAILS ON: rebuilding the span with the duration dropped."""

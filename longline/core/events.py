@@ -116,6 +116,12 @@ class TurnComplete:
 
     stop_reason: str  # "end_turn" | "tool_use" | "max_turns" | "aborted" | ...
     usage: Usage  # 本轮的 token 消耗统计
+    # 传输层实际服务的模型名, 取自响应本身 (Anthropic 的 `message.model`),
+    # 而不是请求里写的那一个. 默认 None 的含义是「传输层没说」, 这是一条
+    # 与「传输层说它跑的就是你要的那个模型」不同的事实: Anthropic 兼容网关
+    # 常常忽略请求里的 model 字段 (实测 cc-switch 就是如此), 只记录请求值
+    # 会让产出的报告描述一个根本没跑过的模型.
+    served_model: str | None = None
 
 
 @dataclass

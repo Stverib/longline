@@ -6,6 +6,7 @@ events, so no API key is required.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -637,3 +638,158 @@ async def test_run_suite_records_repeat_index(monkeypatch: pytest.MonkeyPatch) -
     cases = [ToolCallCase(id="a", task="t1"), ToolCallCase(id="b", task="t2")]
     results = await run_suite(cases, model="m", api_key="k", fixtures_dir=Path("x"), repeat_index=1)
     assert [r.repeat_index for r in results] == [1, 1]
+
+
+# --- the served model: what the transport ran vs what we asked for (Task 9) ---
+
+
+async def test_case_result_carries_the_served_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage(), served_model="deepseek-flash"),
+    ]))
+    case = ToolCallCase(id="tc-served", task="t")
+    r = await run_case(case, model="claude-sonnet-4-20250514", api_key="k", fixtures_dir=Path("x"))
+    assert r.served_models == ["deepseek-flash"]
+
+
+async def test_served_models_survive_the_raw_jsonl_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """FAILS ON: writing the field but not hydrating it back on --resume-run.
+
+    `--resume-run` re-reads `raw.jsonl` to rebuild the kept rows. A field that
+    is written but never read back disappears from a resumed run's summary --
+    the same shape of bug that made a resumed suite report `1/6` on a run where
+    all six passed.
+    """
+    import longline.eval.cli as cli
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage(), served_model="deepseek-flash"),
+    ]))
+    case = ToolCallCase(id="tc-roundtrip", task="t")
+    r = await run_case(case, model="m", api_key="k", fixtures_dir=Path("x"))
+
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text(json.dumps(r.to_raw_dict(), ensure_ascii=False) + "\n", encoding="utf-8")
+    reloaded = cli._load_jsonl_results(raw)
+
+    assert [x.served_models for x in reloaded] == [["deepseek-flash"]]
+
+
+def test_the_recorded_model_source_is_never_unstated() -> None:
+    """Every run states where its model name came from, even when it has none.
+
+    'measured' means the transport named it. 'requested_unverified' means the
+    transport said nothing and the artifact is repeating what we asked for --
+    a reader must be able to tell those two apart, because only one of them is
+    evidence.
+    """
+    from longline.eval.runner import model_provenance
+
+    served = model_provenance("claude-sonnet-4-20250514", ["deepseek-flash"])
+    assert served["model_source"] == "measured"
+    assert served["model_served"] == ["deepseek-flash"]
+    assert served["model_matches_request"] is False
+
+    silent = model_provenance("claude-sonnet-4-20250514", [])
+    assert silent["model_source"] == "requested_unverified"
+    assert silent["model_served"] == []
+    assert silent["model_matches_request"] is None
+
+    agrees = model_provenance("deepseek-flash", ["deepseek-flash"])
+    assert agrees["model_matches_request"] is True
+
+
+# --- inter-case pacing (Task 9: the gateway 429s on back-to-back calls) ---
+
+
+async def test_pacing_sleeps_between_cases_but_not_before_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILS ON: sleeping once per case, which adds a wasted pause up front.
+
+    The pause exists to keep two API calls apart, so it belongs BETWEEN them.
+    Sleeping before the first call buys nothing and would make a one-case run
+    -- every `--tag` filtered run, every smoke -- pay a delay for no reason.
+    """
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        pace_seconds=1.5, sleep=fake_sleep,
+    )
+    assert slept == [1.5]  # two cases -> exactly one gap
+
+
+async def test_a_single_case_run_never_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FAILS ON: a pacing delay on a run that has no second call to separate."""
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await run_suite(
+        _two_cases()[:1], model="m", api_key="k", fixtures_dir=Path("x"),
+        pace_seconds=1.5, sleep=fake_sleep,
+    )
+    assert slept == []
+
+
+async def test_pacing_shrinks_when_cases_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FAILS ON: counting skipped cases as gaps.
+
+    A resumed run re-enters with most cases already answered. Pacing the
+    SKIPPED ones would reintroduce exactly the wall-clock the resume exists to
+    save, for calls that are not made.
+    """
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        skip_case_ids=frozenset({"a"}), pace_seconds=1.5, sleep=fake_sleep,
+    )
+    assert slept == []  # one case actually ran -> no gap
+
+
+async def test_zero_pacing_never_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The offline suites must stay instant; pacing is opt-in per run."""
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        pace_seconds=0.0, sleep=fake_sleep,
+    )
+    assert slept == []
