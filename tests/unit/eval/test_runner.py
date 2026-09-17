@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from longline.core.events import TextDelta, ToolResultReady, ToolUseStart, TurnComplete
-from longline.eval.runner import run_case, run_suite
+from longline.eval.runner import CaseResult, run_case, run_suite
 from longline.eval.types import E2ECase, ToolCallCase
 from longline.models.messages import Usage
 
@@ -119,6 +119,94 @@ async def test_run_suite_runs_all_cases(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(results) == 2
     assert results[0].case_id == "a"
     assert results[1].case_id == "b"
+
+
+# --- resumable runs ----------------------------------------------------------
+
+
+def _two_cases() -> list[ToolCallCase]:
+    return [
+        ToolCallCase(id="a", task="t1", expect_tools=["Read"]),
+        ToolCallCase(id="b", task="t2", expect_tools=["Read"]),
+    ]
+
+
+async def test_the_sink_fires_once_per_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FAILS ON: a sink called once with the batch, or never.
+
+    The sink is what survives an interruption, so it has to fire as each case
+    completes. A batch-at-the-end call would lose exactly the work it exists to
+    keep -- the whole point is that the process may not reach the end.
+    """
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        ToolUseStart(tool_name="Read", tool_id="t", input={}),
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    seen: list[CaseResult] = []
+    await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"), sink=seen.append,
+    )
+    assert [r.case_id for r in seen] == ["a", "b"]
+
+
+async def test_cases_already_answered_are_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILS ON: a resumed run paying for a case it already has a row for."""
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        ToolUseStart(tool_name="Read", tool_id="t", input={}),
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    results = await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        skip_case_ids=frozenset({"a"}),
+    )
+    assert [r.case_id for r in results] == ["b"]
+
+
+async def test_a_skipped_case_does_not_renumber_the_survivors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILS ON: filtering the case list instead of skipping inside the loop.
+
+    `trial` is the case's position in the run. Renumbering would make a resumed
+    `raw.jsonl` disagree with a fresh one about the same case, for no reason a
+    reader could see.
+    """
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        ToolUseStart(tool_name="Read", tool_id="t", input={}),
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    results = await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        skip_case_ids=frozenset({"a"}),
+    )
+    assert results[0].case_id == "b"
+    assert results[0].trial == 1
+
+
+async def test_a_skipped_case_never_reaches_the_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAILS ON: the skip happening after the sink, which double-writes the row."""
+    import longline.eval.runner as mod
+
+    monkeypatch.setattr(mod, "build_engine", _fake_engine_factory([
+        ToolUseStart(tool_name="Read", tool_id="t", input={}),
+        TurnComplete(stop_reason="end_turn", usage=Usage()),
+    ]))
+    seen: list[CaseResult] = []
+    await run_suite(
+        _two_cases(), model="m", api_key="k", fixtures_dir=Path("x"),
+        skip_case_ids=frozenset({"a"}), sink=seen.append,
+    )
+    assert [r.case_id for r in seen] == ["b"]
 
 
 # --- Task 1: telemetry, clock injection, sandbox lifecycle ---

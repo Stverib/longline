@@ -676,3 +676,156 @@ class TestLatencySuite:
             await cli._run_latency(
                 args, case_file=Path(args.case_file), out_dir=Path("."), run_id="x",
             )
+
+
+class TestResumeRunKeepsObservations:
+    """`--resume-run` must recover lost work without re-running the measurement.
+
+    The two failure kinds are not symmetric. Re-running an infrastructure
+    failure recovers a case that was never measured. Re-running a model failure
+    is "run it until it passes", which raises every rate by construction -- so
+    the split is the load-bearing part of resume, and it is tested on its own
+    rather than through a model run.
+    """
+
+    @staticmethod
+    def _row(case_id: str, *, error_type: str | None = None, passed: bool = True) -> Any:
+        from longline.eval.runner import CaseResult
+
+        return CaseResult(
+            case_id=case_id, case_type="tool_call", passed=passed,
+            repeat_index=0, error_type=error_type,
+        )
+
+    @pytest.mark.parametrize("kind", ["api_error", "runtime_error"])
+    def test_an_infrastructure_failure_is_rerun(self, kind: str) -> None:
+        """FAILS ON: an infra row kept, leaving a hole in the run forever."""
+        kept, rerun = cli._resume_split([self._row("a", error_type=kind)])
+        assert kept == []
+        assert [r.case_id for r in rerun] == ["a"]
+
+    def test_an_exhausted_turn_budget_is_kept(self) -> None:
+        """FAILS ON: re-running `max_turns`, which IS the model failing the case."""
+        kept, rerun = cli._resume_split([self._row("a", error_type="max_turns")])
+        assert [r.case_id for r in kept] == ["a"]
+        assert rerun == []
+
+    def test_a_context_overflow_is_kept(self) -> None:
+        """The product's context management is an observation, not a lost call."""
+        kept, _ = cli._resume_split([self._row("a", error_type="context_overflow")])
+        assert [r.case_id for r in kept] == ["a"]
+
+    def test_a_plain_failure_is_kept(self) -> None:
+        """FAILS ON: treating `passed=False` as "retry it" -- the worst version."""
+        kept, rerun = cli._resume_split([self._row("a", passed=False)])
+        assert [r.case_id for r in kept] == ["a"]
+        assert rerun == []
+
+    def test_a_pass_is_kept(self) -> None:
+        kept, _ = cli._resume_split([self._row("a")])
+        assert [r.case_id for r in kept] == ["a"]
+
+    def test_a_mixed_batch_splits_without_reordering(self) -> None:
+        rows = [
+            self._row("a"),
+            self._row("b", error_type="runtime_error"),
+            self._row("c", passed=False),
+        ]
+        kept, rerun = cli._resume_split(rows)
+        assert [r.case_id for r in kept] == ["a", "c"]
+        assert [r.case_id for r in rerun] == ["b"]
+
+
+class TestRawRowsRoundTrip:
+    """A row must survive `to_raw_dict` -> `_load_jsonl_results` unchanged.
+
+    This is the test that would have caught `--resume-run` reporting 1/6 on a
+    suite where every case passed. The loader restored the scalar columns and
+    silently dropped `judge_detail`, `tool_calls` and `tool_executions` -- and
+    those are what `steps_completed`, `abstention_ok`, precision and execution
+    success are computed FROM. A resumed run would have published numbers about
+    empty defaults.
+    """
+
+    @staticmethod
+    def _rich_result() -> Any:
+        from longline.eval.runner import CaseResult
+        from longline.eval.trajectory import ToolExecution
+
+        return CaseResult(
+            case_id="ts-x-01", case_type="tool_call", passed=True, turns=3,
+            input_tokens=111, output_tokens=22, duration_ms=33.5,
+            tags=["read-write-edit", "blind"], variant="baseline",
+            repeat_index=2, trial=7, run_id="r1",
+            tool_calls=[("Read", {"file_path": "a.py"}), ("Read", {"file_path": "b.py"})],
+            tool_executions=[
+                ToolExecution("t1", "Read", False, 0, 5_000_000),
+                ToolExecution("t2", "Read", True, 0, 7_000_000),
+            ],
+            detail={
+                "steps": {
+                    "step_indices": [0], "matched_call_indices": [0],
+                    "extra_call_indices": [], "all_steps_matched": True,
+                    "num_extra_calls": 0,
+                },
+                "args": {
+                    "correct_calls": 1, "checked_calls": 1,
+                    "correct_fields": 1, "checked_fields": 1,
+                    "all_calls_correct": True,
+                    "per_tool": {"Read": {
+                        "correct_fields": 1, "checked_fields": 1,
+                        "best_call_correct": 1, "calls": 2,
+                    }},
+                },
+            },
+        )
+
+    def test_every_aggregate_field_survives(self, tmp_path: Path) -> None:
+        original = self._rich_result()
+        path = tmp_path / "raw.jsonl"
+        path.write_text(
+            json.dumps(original.to_raw_dict(), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        [restored] = cli._load_jsonl_results(path)
+
+        # The three the tool metrics are built from.
+        assert restored.steps_completed == original.steps_completed is True
+        assert restored.num_tool_calls == original.num_tool_calls == 2
+        assert restored.num_tool_calls_executed == original.num_tool_calls_executed == 2
+        assert restored.num_successful_tool_calls == original.num_successful_tool_calls == 1
+        assert restored.num_arg_checked_calls == original.num_arg_checked_calls == 1
+        assert restored.num_arg_correct_calls == original.num_arg_correct_calls == 1
+
+        # And the scalar columns a report cites.
+        assert restored.tags == original.tags
+        assert restored.passed is True
+        assert restored.repeat_index == 2
+        assert restored.error_type is None
+
+    def test_the_tool_duration_survives(self, tmp_path: Path) -> None:
+        """FAILS ON: rebuilding the span with the duration dropped."""
+        original = self._rich_result()
+        path = tmp_path / "raw.jsonl"
+        path.write_text(
+            json.dumps(original.to_raw_dict(), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        [restored] = cli._load_jsonl_results(path)
+        assert [e.duration_ms for e in restored.tool_executions] == [5.0, 7.0]
+
+    def test_a_round_trip_is_idempotent(self, tmp_path: Path) -> None:
+        """FAILS ON: a loader that loses a little every time it runs."""
+        first = tmp_path / "a.jsonl"
+        first.write_text(
+            json.dumps(self._rich_result().to_raw_dict(), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        once = cli._load_jsonl_results(first)
+        second = tmp_path / "b.jsonl"
+        second.write_text(
+            json.dumps(once[0].to_raw_dict(), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        twice = cli._load_jsonl_results(second)
+        assert twice[0].to_raw_dict() == once[0].to_raw_dict()

@@ -37,11 +37,12 @@ from longline.eval.report import (
     render_markdown,
 )
 from longline.eval.runner import CaseResult, run_suite
+from longline.eval.trajectory import ToolExecution
 from longline.eval.types import E2ECase, EvalCase, ToolCallCase, load_cases
 from longline.models.messages import Usage
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -211,6 +212,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--keep-sandbox-on-failure", action="store_true",
         help="Leave a failed case's temp sandbox on disk and record its path. "
              "Successful cases are always cleaned up.",
+    )
+    p.add_argument(
+        "--resume-run", action="store_true",
+        help="Re-enter an existing --run-id directory and finish it. Rows that "
+             "recorded an observation (a pass, a fail, max_turns, "
+             "context_overflow) are kept; only rows whose error type means the "
+             "case measured nothing (api_error, runtime_error) are re-run. "
+             "Requires --run-id.",
     )
     p.add_argument(
         "--tag", default=None,
@@ -501,8 +510,53 @@ def _write_run_dir(
     )
 
 
+# Failure categories that mean a row measured NOTHING, so re-running it is
+# recovery rather than retrying-until-it-passes.
+#
+# The distinction is the whole point of `--resume-run`, and getting it wrong
+# would corrupt every rate in the run. `api_error` (429/529, "gave up after
+# retries") and `runtime_error` (a dropped connection, a 402, a crash) are
+# statements about the environment -- the model was never asked, or never
+# answered. Everything else is an OBSERVATION and is kept:
+#
+# - a normal pass or a normal fail is the measurement;
+# - `max_turns` is the model failing to finish inside the case's own budget;
+# - `context_overflow` is the product's context management, working or not.
+#
+# Deleting those and re-running them would be "run it until it passes", which
+# raises the success rate by construction. A benchmark that retries its
+# failures measures the retrying.
+RETRYABLE_ERROR_TYPES = frozenset({"api_error", "runtime_error"})
+
+
+def _resume_split(
+    rows: Iterable[CaseResult],
+) -> tuple[list[CaseResult], list[CaseResult]]:
+    """Split previous rows into `(kept, to_rerun)`.
+
+    Kept rows are observations and stay in the artifact; `to_rerun` rows are the
+    ones whose error type says the case measured nothing. Pure and separate from
+    the run loop so the classification -- the part that decides whether a
+    resumed run is honest -- can be tested without a model or a filesystem.
+    """
+    kept: list[CaseResult] = []
+    to_rerun: list[CaseResult] = []
+    for row in rows:
+        (to_rerun if row.error_type in RETRYABLE_ERROR_TYPES else kept).append(row)
+    return kept, to_rerun
+
+
 def _load_jsonl_results(path: Path) -> list[CaseResult]:
-    """Re-hydrate CaseResults from a raw.jsonl produced by a previous run."""
+    """Re-hydrate CaseResults from a raw.jsonl produced by a previous run.
+
+    Rebuilds every field the aggregates READ, not just the ones a caller happens
+    to want today. `judge_detail` drives `steps_completed`, `abstention_ok` and
+    the three matched-call counters; `tool_calls` and `tool_executions` are the
+    denominators of precision and execution success. A loader that restored only
+    the scalar columns would leave a resumed run reporting `1/6` on a suite
+    where every case passed -- which is exactly what a probe caught here before
+    `--resume-run` shipped.
+    """
     out: list[CaseResult] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -522,6 +576,33 @@ def _load_jsonl_results(path: Path) -> list[CaseResult]:
             variant=d.get("variant"),
             repeat_index=int(d.get("repeat_index", 0)),
             error_type=d.get("error_type"),
+            # --- the fields the aggregates read ---
+            detail=dict(d.get("judge_detail") or {}),
+            tool_calls=[
+                (str(t["tool_name"]), dict(t.get("input") or {}))
+                for t in d.get("tool_calls_with_args", [])
+            ],
+            tool_executions=[
+                ToolExecution(
+                    tool_id=str(e["tool_id"]),
+                    tool_name=str(e["tool_name"]),
+                    is_error=bool(e["is_error"]),
+                    # The row carries a derived duration rather than the
+                    # absolute span, so rebuild a span that reproduces it.
+                    start_ns=0,
+                    end_ns=(
+                        int(e["duration_ms"] * 1_000_000)
+                        if e.get("duration_ms") is not None
+                        else None
+                    ),
+                )
+                for e in d.get("tool_executions", [])
+            ],
+            event_timestamps={
+                str(k): int(v) for k, v in (d.get("event_timestamps") or {}).items()
+            },
+            trial=int(d.get("trial", 0)),
+            run_id=d.get("run_id"),
         ))
     return out
 
@@ -1081,7 +1162,40 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     run_id: str = args.run_id or make_run_id(args.model, args.suite or args.type)
     suite = args.suite or args.type
 
-    all_results: list[CaseResult] = []
+    # --- resumable output -------------------------------------------------
+    # Every case is appended to `raw.jsonl` the moment it finishes, so an
+    # interruption -- an exhausted usage window, a Ctrl-C, a dropped machine --
+    # keeps what was already measured. `--resume-run` re-enters the same
+    # directory, keeps every row that is an observation, and re-runs only the
+    # ones that measured nothing (see `RETRYABLE_ERROR_TYPES`).
+    #
+    # Without this, a paid suite that outlasts an account's usage window is
+    # unaffordable rather than merely slow: the work is discarded and the whole
+    # run is paid for again.
+    run_dir = out_dir / run_id
+    raw_path = run_dir / RAW_NAME
+    already: list[CaseResult] = []
+    done: set[tuple[str, int]] = set()
+    if args.resume_run:
+        if not raw_path.is_file():
+            raise SystemExit(f"--resume-run: no {RAW_NAME} at {raw_path}")
+        kept, dropped = _resume_split(_load_jsonl_results(raw_path))
+        already = kept
+        done = {(r.case_id, r.repeat_index) for r in kept}
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(raw_path, kept)
+        kinds = sorted({r.error_type for r in dropped if r.error_type})
+        print(
+            f"[eval] resume: kept {len(kept)} rows, re-running {len(dropped)} "
+            f"that measured nothing {kinds}"
+        )
+
+    def _sink(result: CaseResult) -> None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with raw_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(result.to_raw_dict(), ensure_ascii=False) + "\n")
+
+    all_results: list[CaseResult] = list(already)
     for repeat_index in range(args.repeats):
         all_results.extend(await run_suite(
             cases,
@@ -1097,6 +1211,10 @@ async def _run(argv: Sequence[str] | None = None) -> int:
                 (lambda case: profile_for_case(case, args.tool_profile))
                 if args.tool_profile_by_tag else None
             ),
+            skip_case_ids=frozenset(
+                cid for (cid, rep) in done if rep == repeat_index
+            ),
+            sink=_sink,
         ))
 
     report = aggregate(all_results, variant=args.variant)
@@ -1119,7 +1237,6 @@ async def _run(argv: Sequence[str] | None = None) -> int:
 
     if args.run_id is not None:
         # Explicit run id -> the contract layout evals/results/<run_id>/.
-        run_dir = out_dir / run_id
         baseline_file = out_dir / "baseline" / RAW_NAME
         baseline_results = (
             _load_jsonl_results(baseline_file) if baseline_file.is_file() else None

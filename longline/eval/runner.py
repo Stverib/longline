@@ -496,6 +496,8 @@ async def run_suite(
     clock: Callable[[], int] = time.perf_counter_ns,
     tool_profile: str = "core",
     profile_for_case: Callable[[EvalCase], str] | None = None,
+    skip_case_ids: frozenset[str] = frozenset(),
+    sink: Callable[[CaseResult], None] | None = None,
 ) -> list[CaseResult]:
     """Run a batch of cases serially.
 
@@ -505,24 +507,37 @@ async def run_suite(
     `profile_for_case` lets one suite mix families — a web case and a notebook
     case need different registries, and running either against the wrong one
     would score an unsatisfiable task as a model error.
+
+    `sink`, when given, is called with each result as it completes. The caller
+    uses it to append to `raw.jsonl` so an interrupted run keeps what it
+    finished -- a paid suite can outlast an account's usage window, and losing
+    every completed case to one interruption makes the run unaffordable rather
+    than merely slow.
+
+    `skip_case_ids` omits cases already answered by a previous attempt. The
+    `trial` index still counts the skipped ones, so a resumed run's rows carry
+    the same `trial` a fresh run would have given them.
     """
     results: list[CaseResult] = []
     for trial, case in enumerate(cases):
-        results.append(
-            await run_case(
-                case,
-                model=model,
-                api_key=api_key,
-                fixtures_dir=fixtures_dir,
-                variant=variant,
-                repeat_index=repeat_index,
-                trial=trial,
-                run_id=run_id,
-                keep_sandbox_on_failure=keep_sandbox_on_failure,
-                clock=clock,
-                tool_profile=(
-                    profile_for_case(case) if profile_for_case is not None else tool_profile
-                ),
-            )
+        if case.id in skip_case_ids:
+            continue
+        result = await run_case(
+            case,
+            model=model,
+            api_key=api_key,
+            fixtures_dir=fixtures_dir,
+            variant=variant,
+            repeat_index=repeat_index,
+            trial=trial,
+            run_id=run_id,
+            keep_sandbox_on_failure=keep_sandbox_on_failure,
+            clock=clock,
+            tool_profile=(
+                profile_for_case(case) if profile_for_case is not None else tool_profile
+            ),
         )
+        results.append(result)
+        if sink is not None:
+            sink(result)
     return results
