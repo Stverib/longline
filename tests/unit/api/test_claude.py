@@ -311,3 +311,57 @@ class TestTransientGatewayErrorsAreRetryable:
 
         errors = [e for e in events if isinstance(e, ErrorEvent)]
         assert errors[0].is_recoverable is False
+
+
+class TestInputTokensFromEitherEvent:
+    """A gateway may report input_tokens in `message_delta`, not `message_start`.
+
+    Anthropic's convention puts `input_tokens` in `message_start.message.usage`
+    and only `output_tokens` in `message_delta`. The gateway these eval runs go
+    through does the opposite: it sends `message_start.usage.input_tokens = 0`
+    and the real count in `message_delta`. Reading only the documented field
+    recorded `input_tokens = 0` on every row -- a token bill that is missing its
+    entire input half, while the output half looks perfectly healthy.
+    """
+
+    @staticmethod
+    def _stream(start_in: int, delta_in: int | None) -> MockStream:
+        delta_usage = MockUsage(input_tokens=delta_in if delta_in is not None else 0)
+        events = [
+            MockEvent(type="message_start", message=MockMessage(
+                usage=MockUsage(input_tokens=start_in), model="omen-alpha")),
+            MockEvent(type="content_block_start", index=0, content_block=MockContentBlock(type="text")),
+            MockEvent(type="content_block_delta", index=0, delta=MockDelta(type="text_delta", text="hi")),
+            MockEvent(type="content_block_stop", index=0),
+            MockEvent(type="message_delta", delta=MockDelta(
+                type="message_delta", stop_reason="end_turn"), usage=delta_usage),
+        ]
+        return MockStream(events)
+
+    async def _usage(self, stream: MockStream) -> Any:
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=stream)
+        events = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+        return [e for e in events if isinstance(e, TurnComplete)][0].usage
+
+    async def test_a_gateway_that_reports_input_in_the_delta_is_believed(self) -> None:
+        """FAILS ON: trusting `message_start` alone, which reads 0 here."""
+        usage = await self._usage(self._stream(start_in=0, delta_in=38))
+        assert usage.input_tokens == 38
+
+    async def test_the_documented_field_still_wins_when_the_delta_is_silent(self) -> None:
+        """Anthropic sends no `input_tokens` in `message_delta`; nothing changes."""
+        usage = await self._usage(self._stream(start_in=100, delta_in=None))
+        assert usage.input_tokens == 100
+
+    async def test_a_zero_in_the_delta_never_clobbers_a_real_count(self) -> None:
+        """FAILS ON: unconditional assignment from whichever event arrives last.
+
+        Some gateways send `input_tokens=0` in the delta as a placeholder. Taking
+        the last value rather than the last NON-ZERO value would turn a correct
+        `message_start` reading into a zero.
+        """
+        usage = await self._usage(self._stream(start_in=100, delta_in=0))
+        assert usage.input_tokens == 100

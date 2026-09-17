@@ -278,10 +278,24 @@ async def stream_response(
                             stop_reason = sr
                     evt_usage = getattr(event, "usage", None)
                     if evt_usage:
-                        # P0-5: output_tokens 只从 message_delta 获取（不从 message_start）
-                        # input_tokens 和 cache_* 只从 message_start 获取（不从 message_delta）
-                        # 这两处分离是 Anthropic API 的设计，混用会导致重复计数
+                        # output_tokens 只在 message_delta 中累积（message_start 里恒为 0）
                         usage.output_tokens = getattr(evt_usage, "output_tokens", 0)
+                        # input_tokens 的位置则因网关而异. Anthropic 的约定是只放在
+                        # message_start; 但实测的兼容网关 (cc-switch / omen-alpha)
+                        # 在 message_start 里填 0, 把真实值放在 message_delta.
+                        # 只按文档字段读会让每一行的 input_tokens 都是 0 —— 一份
+                        # 少了整个输入部分的账单, 而输出部分看上去完全正常.
+                        #
+                        # 规则: 非零才算数, 且后到的非零值覆盖先前的. 这样两种约定
+                        # 都对 —— Anthropic 的 delta 不带 input_tokens (None), 不动;
+                        # 网关的 delta 带真实值, 覆盖掉 message_start 的 0.
+                        delta_in = getattr(evt_usage, "input_tokens", None)
+                        if delta_in:
+                            usage.input_tokens = delta_in
+                        for field in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+                            val = getattr(evt_usage, field, None)
+                            if val:
+                                setattr(usage, field, val)
 
     except anthropic.APIStatusError as e:
         # === 错误映射: SDK 异常 → 内部 ErrorEvent ===
