@@ -315,11 +315,18 @@ async def stream_response(
         # 每个用例都直接记成 runtime_error 而不是退避重试, 204 行全是
         # 「没测到」. 4xx 一律保持致命: 400/404/413 是对请求本身的判决,
         # 重试只是在重复发送一个服务器已经按事实拒绝的东西.
+        #
+        # 例外 (也是实测补上的): 这个网关会把上游故障包进 400 的信封里
+        # ("Upstream request failed: Model is unavailable", error.type =
+        # server_error). 那不是对请求的判决, 是网关在报它上游的坟, 重试是
+        # 恢复不是重犯. 判据是 body 里的 error.type, 不匹配错误文本 --
+        # 文本是随上游方措辞变化的, 类型字段是结构化的.
+        is_gateway_upstream = error_type in ("server_error", "overloaded_error")
         yield ErrorEvent(
             message=str(e),
             is_recoverable=(
                 e.status_code in (429, 502, 503, 504, 529)
-                or error_type == "overloaded_error"
+                or is_gateway_upstream
             ),
         )
         return

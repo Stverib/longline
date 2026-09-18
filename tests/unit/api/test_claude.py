@@ -365,3 +365,55 @@ class TestInputTokensFromEitherEvent:
         """
         usage = await self._usage(self._stream(start_in=100, delta_in=0))
         assert usage.input_tokens == 100
+
+
+class TestGatewayWrappedUpstreamFailures:
+    """The gateway can wrap an upstream outage in HTTP 400.
+
+    A live baseline re-run died because the gateway served
+    `400 - {'error': {'type': 'server_error', 'message': 'Upstream request
+    failed: Model is unavailable.'}}`. A 400 is normally a verdict about the
+    REQUEST and fatal by design -- but this body is the gateway reporting ITS
+    upstream, not judging our request. Retrying it is recovery, and treating it
+    as fatal wrote 54 rows that measured nothing (again zero tokens).
+    """
+
+    @staticmethod
+    def _wrapped(status: int, error_type: str, message: str) -> Any:
+        import httpx
+
+        import anthropic
+
+        body = {"error": {"type": error_type, "message": message}}
+        return anthropic.APIStatusError(
+            f"Error code: {status} - {body}",
+            response=httpx.Response(status, request=httpx.Request("POST", "http://x")),
+            body=body,
+        )
+
+    async def test_a_400_from_the_gateway_reporting_its_upstream_is_retryable(self) -> None:
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=self._wrapped(
+            400, "server_error", "Upstream request failed: Model is unavailable.",
+        ))
+
+        events = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        assert errors[0].is_recoverable is True
+
+    async def test_a_real_400_is_still_fatal(self) -> None:
+        """A client-shaped 400 (invalid request) must not be retried."""
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=self._wrapped(
+            400, "invalid_request_error", "max_tokens: field required",
+        ))
+
+        events = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        assert errors[0].is_recoverable is False
