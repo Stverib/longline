@@ -608,3 +608,71 @@ class TestTokenEfficiency:
 
         assert "Token efficiency" in md
         assert "11.0 tok/case" in md
+
+
+class TestDedicatedToolPreference:
+    """DedicatedToolPreferenceRate: did the agent reach for the dedicated tool?
+
+    The denominator is `dedicated + equivalent-Bash`, so a Bash call the
+    equivalence table cannot judge is excluded from BOTH sides. That is what
+    keeps the rate from moving when the table is edited.
+    """
+
+    def _with_calls(self, cid: str, calls: list[tuple[str, dict[str, Any]]]) -> CaseResult:
+        return CaseResult(case_id=cid, case_type="e2e", passed=True, tool_calls=calls)
+
+    def test_counts_the_substitution(self) -> None:
+        from longline.eval.report import report_tool_preference
+
+        got = report_tool_preference([self._with_calls("a", [
+            ("Read", {"file_path": "x.py"}),
+            ("Grep", {"pattern": "p"}),
+            ("Bash", {"command": "cat y.py"}),   # should have been Read
+            ("Bash", {"command": "pytest -q"}),  # neutral: not a missed Read
+        ])])
+
+        assert got.numerator == 2
+        assert got.denominator == 3
+
+    def test_a_neutral_bash_call_moves_neither_side(self) -> None:
+        from longline.eval.report import report_tool_preference
+
+        got = report_tool_preference([self._with_calls("a", [
+            ("Read", {"file_path": "x.py"}),
+            ("Bash", {"command": "git status"}),
+            ("Bash", {"command": "pytest -q"}),
+        ])])
+
+        assert (got.numerator, got.denominator) == (1, 1)
+
+    def test_unmeasured_when_nothing_had_an_alternative(self) -> None:
+        from longline.eval.report import report_tool_preference
+
+        got = report_tool_preference([self._with_calls("a", [
+            ("Bash", {"command": "git status"}),
+        ])])
+
+        assert got.value is None
+
+    def test_write_and_notebook_edit_are_not_in_the_numerator(self) -> None:
+        """Neither has a Bash equivalent, so counting them would inflate the
+        rate with calls that never had a choice."""
+        from longline.eval.report import report_tool_preference
+
+        got = report_tool_preference([self._with_calls("a", [
+            ("Write", {"file_path": "x.py"}),
+            ("NotebookEdit", {"notebook_path": "n.ipynb"}),
+            ("Bash", {"command": "cat y.py"}),
+        ])])
+
+        assert (got.numerator, got.denominator) == (0, 1)
+
+    def test_aggregate_exposes_it(self) -> None:
+        rep = aggregate([self._with_calls("a", [
+            ("Read", {"file_path": "x.py"}),
+            ("Bash", {"command": "cat y.py"}),
+        ])])
+
+        assert rep.dedicated_tool_preference.numerator == 1
+        assert rep.dedicated_tool_preference.denominator == 2
+        assert rep.to_dict()["tool_calling"]["dedicated_tool_preference"]["value"] == 0.5

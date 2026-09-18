@@ -21,6 +21,7 @@ from longline.eval.metrics import (
     percentile,
     reliability_ratio,
 )
+from longline.eval.tool_equivalence import DEDICATED_TOOLS, classify_bash
 from longline.eval.types import E2E_CATEGORY_TAGS
 
 if TYPE_CHECKING:
@@ -98,6 +99,11 @@ class EvalReport:
     argument_field_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
     # Reported separately, never folded into the number above.
     instruction_following_case_accuracy: Ratio = field(default_factory=lambda: Ratio(0, 0))
+    # Routing preference, independent of whether the case passed: the question
+    # is which tool the agent reached for, not what it produced. A Bash call the
+    # equivalence table cannot judge is excluded from both sides -- see
+    # `report_tool_preference`.
+    dedicated_tool_preference: Ratio = field(default_factory=lambda: Ratio(0, 0))
     mean_duration_ms: float | None = None
     p50_duration_ms: float | None = None
     p95_duration_ms: float | None = None
@@ -141,6 +147,7 @@ class EvalReport:
                 "instruction_following_case_accuracy": (
                     self.instruction_following_case_accuracy.to_dict()
                 ),
+                "dedicated_tool_preference": self.dedicated_tool_preference.to_dict(),
             },
             "avg_turns": self.avg_turns,
             "avg_input_tokens": self.avg_input_tokens,
@@ -334,6 +341,29 @@ def _repeat_outcomes(results: list[CaseResult]) -> tuple[list[int], list[int]]:
     return successes, counts
 
 
+def report_tool_preference(results: list[CaseResult]) -> Ratio:
+    """DedicatedToolPreferenceRate: dedicated calls / calls that had a choice.
+
+    The denominator is `dedicated + equivalent-Bash`, so a Bash call the
+    equivalence table cannot judge is excluded from BOTH sides. That is what
+    keeps the rate from moving when the table is edited, and what makes it a
+    statement about the agent rather than about the table.
+
+    Independent of whether the case passed: the question is which tool the
+    agent reached for, not what it produced. Two agents that both fail can be
+    told apart by this, which is the whole reason the round measures it.
+    """
+    dedicated = 0
+    equivalent = 0
+    for r in results:
+        for name, tool_input in r.tool_calls:
+            if name in DEDICATED_TOOLS:
+                dedicated += 1
+            elif name == "Bash" and classify_bash(str(tool_input.get("command", ""))):
+                equivalent += 1
+    return Ratio(dedicated, dedicated + equivalent)
+
+
 def _safe_div(numerator: float, denominator: int) -> float | None:
     """A ratio with a zero denominator is unmeasured, not zero.
 
@@ -417,6 +447,7 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         argument_call_accuracy=tool_metrics["argument_call_accuracy"],
         argument_field_accuracy=tool_metrics["argument_field_accuracy"],
         instruction_following_case_accuracy=tool_metrics["instruction_following_case_accuracy"],
+        dedicated_tool_preference=report_tool_preference(results),
         mean_duration_ms=mean(durations),
         p50_duration_ms=percentile(durations, 50) if durations else None,
         p95_duration_ms=percentile(durations, 95) if durations else None,
@@ -588,6 +619,12 @@ def render_markdown(
             _metric_row(
                 "InstructionFollowingCaseAccuracy (separate, not in the number above)",
                 report.instruction_following_case_accuracy, "显式指定工具的用例 / 该类用例",
+            ),
+            _metric_row(
+                "DedicatedToolPreferenceRate",
+                report.dedicated_tool_preference,
+                "专用工具调用 / (专用工具调用 + 功能等价的 Bash 调用); "
+                "等价表判不准的命令两侧都不计",
             ),
         ]
 
