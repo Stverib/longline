@@ -893,3 +893,44 @@ class TestPromptVariantFlag:
     def test_rejects_an_unknown_variant(self) -> None:
         with pytest.raises(SystemExit):
             cli.parse_args(["--suite", "e2e", "--prompt-variant", "nope"])
+
+
+class TestToolDescVariantFlag:
+    def test_defaults_to_baseline(self) -> None:
+        assert cli.parse_args(["--suite", "tool_selection"]).tool_desc_variant == "baseline"
+
+    def test_accepts_steered_and_notebook(self) -> None:
+        assert cli.parse_args(
+            ["--suite", "e2e", "--tool-desc-variant", "steered"]
+        ).tool_desc_variant == "steered"
+        assert cli.parse_args(
+            ["--suite", "e2e", "--tool-desc-variant", "notebook"]
+        ).tool_desc_variant == "notebook"
+
+    def test_rejects_an_unknown_variant(self) -> None:
+        with pytest.raises(SystemExit):
+            cli.parse_args(["--suite", "e2e", "--tool-desc-variant", "nope"])
+
+
+class TestAblationRunMetadata:
+    """An arm that did not record its switches cannot be told from another."""
+
+    def _metadata(self, **kw: Any) -> dict[str, object]:
+        return cli.run_metadata(
+            run_id="r", suite="e2e", variant=None, model="m",
+            case_file=Path("evals/e2e.jsonl"), repeat_index=0, repeats_completed=1,
+            **kw,
+        )
+
+    def test_records_both_switches(self) -> None:
+        block = self._metadata(prompt_variant="no-retrieval", tool_desc_variant="steered")
+
+        assert block["prompt_variant"] == "no-retrieval"
+        assert block["tool_desc_variant"] == "steered"
+
+    def test_omits_them_when_the_caller_names_none(self) -> None:
+        """Suites with no ablation keep a byte-identical metadata block."""
+        block = self._metadata()
+
+        assert "prompt_variant" not in block
+        assert "tool_desc_variant" not in block

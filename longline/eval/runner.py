@@ -386,6 +386,7 @@ async def run_case(
     tool_profile: str = "core",
     forbidden: Iterable[str] = (),
     prompt_variant: str = "baseline",
+    tool_desc_variant: str = "baseline",
 ) -> CaseResult:
     """Run one case and return its CaseResult.
 
@@ -445,6 +446,8 @@ async def run_case(
         # of build_engine written before this parameter existed keep working.
         if prompt_variant != "baseline":
             engine_kwargs["prompt_variant"] = prompt_variant
+        if tool_desc_variant != "baseline":
+            engine_kwargs["tool_desc_variant"] = tool_desc_variant
         engine = build_engine(**engine_kwargs)
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
@@ -576,6 +579,7 @@ async def run_suite(
     pace_seconds: float = 0.0,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     prompt_variant: str = "baseline",
+    tool_desc_variant: str = "baseline",
 ) -> list[CaseResult]:
     """Run a batch of cases serially.
 
@@ -638,6 +642,7 @@ async def run_suite(
             # default. The replacement happens inside run_case.
             forbidden=forbidden,
             prompt_variant=prompt_variant,
+            tool_desc_variant=tool_desc_variant,
         )
         results.append(result)
         if sink is not None:

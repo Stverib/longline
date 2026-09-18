@@ -269,6 +269,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "paragraph. Recorded in the run metadata, so a run cannot be "
              "read as the other arm by accident.",
     )
+    p.add_argument(
+        "--tool-desc-variant", choices=("baseline", "steered", "notebook"),
+        default="baseline",
+        help="Replace the description TEXT of the named tools (see "
+             "longline/eval/tool_desc_variants.py). The registry still offers "
+             "every tool: this is a wording experiment, never a visibility "
+             "one. Recorded in the run metadata, so an arm cannot be read as "
+             "another by accident.",
+    )
     # --- Task 2 additions ---
     p.add_argument(
         "--tool-profile", default="core",
@@ -507,6 +516,7 @@ def run_metadata(
     repeats_completed: int,
     served_models: list[str] | None = None,
     prompt_variant: str | None = None,
+    tool_desc_variant: str | None = None,
 ) -> dict[str, object]:
     """The per-run metadata block required by evals/README.md §2.1.
 
@@ -520,6 +530,10 @@ def run_metadata(
     than an overload of `variant` because the two answer different questions:
     `variant` is the caller's own label for what is being compared, while this
     records which prompt was actually assembled.
+
+    `tool_desc_variant` follows the same rule for the same reason: the ablation
+    switches two independent things, and a run that recorded only one of them
+    could not be told apart from an arm that differed in both.
     """
     block: dict[str, object] = {
         "run_id": run_id,
@@ -537,6 +551,8 @@ def run_metadata(
     }
     if prompt_variant is not None:
         block["prompt_variant"] = prompt_variant
+    if tool_desc_variant is not None:
+        block["tool_desc_variant"] = tool_desc_variant
     return block
 
 
@@ -1305,6 +1321,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
             sink=_sink,
             pace_seconds=args.pace_seconds,
             prompt_variant=args.prompt_variant,
+            tool_desc_variant=args.tool_desc_variant,
         ))
 
     report = aggregate(all_results, variant=args.variant)
@@ -1325,6 +1342,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
         case_file=case_file, repeat_index=args.repeats - 1, repeats_completed=args.repeats,
         served_models=served_models_in(all_results),
         prompt_variant=args.prompt_variant,
+        tool_desc_variant=args.tool_desc_variant,
     )
 
     if args.run_id is not None:

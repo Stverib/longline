@@ -66,6 +66,7 @@ def build_engine(
     forbidden: Iterable[str] = (),
     session_id: str | None = None,
     prompt_variant: str = "baseline",
+    tool_desc_variant: str = "baseline",
 ) -> QueryEngine:
     """Build a QueryEngine wired for evaluation.
 
@@ -86,6 +87,9 @@ def build_engine(
       `build_system_prompt`). It changes the PROMPT only -- the registry is
       untouched, so an ablation on wording cannot accidentally measure a
       different tool menu.
+    - tool_desc_variant: which tool DESCRIPTIONS to serve (see
+      `longline/eval/tool_desc_variants.py`). It changes the schema text only,
+      never which tools exist, for the same reason.
     """
     import anthropic
 
@@ -104,6 +108,7 @@ def build_engine(
         model=model,
         registry=build_eval_registry(
             sandbox, profile=tool_profile, forbidden=forbidden,
+            tool_desc_variant=tool_desc_variant,
         ),
         system_prompt=system,
         permission_ctx=permission_ctx,

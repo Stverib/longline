@@ -28,6 +28,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 from longline.eval.constraint_enforcer import strip_forbidden
+from longline.eval.tool_desc_variants import (
+    STEERED_DESCRIPTIONS,
+    DescriptionVariantTool,
+    steered_tool_names,
+)
 from longline.tools.base import Tool, ToolRegistry, ToolResult, ToolSchema
 from longline.tools.bash.bash_tool import BashTool
 from longline.tools.file_edit.file_edit_tool import FileEditTool
@@ -253,6 +258,7 @@ def build_eval_registry(
     profile: str = "core",
     task_store: TaskStore | None = None,
     forbidden: Iterable[str] = (),
+    tool_desc_variant: str = "baseline",
 ) -> ToolRegistry:
     """Assemble a ToolRegistry for one eval case.
 
@@ -261,6 +267,13 @@ def build_eval_registry(
     would let one case's tasks leak into the next one's `TaskList` output,
     breaking the contract's "cases do not share mutable state" rule
     (`evals/README.md` §8.3).
+
+    `tool_desc_variant` replaces the description TEXT of the named tools, for
+    an A/B on wording. The registry still offers every tool in the profile:
+    this is a wording experiment, never a visibility one, because hiding a tool
+    would make the evaluator do half the routing the metric exists to measure.
+    `"baseline"` leaves every description exactly as production serves it, so
+    the control arm is not perturbed by the scaffold.
     """
     names = build_tool_profile(profile)
     store = task_store if task_store is not None else TaskStore()
@@ -293,7 +306,11 @@ def build_eval_registry(
     }
 
     registry = ToolRegistry()
+    steered = steered_tool_names(tool_desc_variant)
     for name in names:
-        registry.register(factories[name]())
+        tool: Any = factories[name]()
+        if name in steered:
+            tool = DescriptionVariantTool(tool, STEERED_DESCRIPTIONS[name])
+        registry.register(tool)
     strip_forbidden(registry, forbidden)
     return registry
