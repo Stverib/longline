@@ -18,7 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from longline.eval.engine_factory import build_engine
 from longline.eval.judges import case_passed, judge_case_args, judge_steps
@@ -422,14 +422,17 @@ async def run_case(
     # re-raises, so it cannot swallow a cancellation — it just ensures Ctrl-C
     # during engine construction does not leave a temp dir behind.
     try:
-        engine_kwargs = {
+        engine_kwargs: dict[str, Any] = {
             "sandbox": sandbox,
             "model": model,
             "api_key": api_key,
             "tool_profile": tool_profile,
         }
-        # The case's own forbidden list wins; the suite-level `forbidden` is
-        # the fallback for cases without one. Keyword-gated: an empty list is
+        # Precedence: a ToolCallCase's own forbidden_tools REPLACES the
+        # suite-level `forbidden` wholesale, and an EMPTY case-level list
+        # means no constraint at case level -- it does not fall back to the
+        # suite value. The suite-level param applies only to E2ECase, which
+        # carries no forbidden field. Keyword-gated: an empty list is
         # behaviorally a no-op, so pre-existing offline fakes of build_engine
         # (which predate this parameter) keep working unchanged.
         case_forbidden = (
@@ -437,7 +440,7 @@ async def run_case(
         )
         if list(case_forbidden):
             engine_kwargs["forbidden"] = list(case_forbidden)
-        engine = build_engine(**engine_kwargs)  # type: ignore[arg-type]
+        engine = build_engine(**engine_kwargs)
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
         raise
@@ -623,10 +626,11 @@ async def run_suite(
             tool_profile=(
                 profile_for_case(case) if profile_for_case is not None else tool_profile
             ),
-            forbidden=(
-                case.forbidden_tools
-                if isinstance(case, ToolCallCase) else forbidden
-            ),
+            # For a ToolCallCase the case-level forbidden_tools REPLACES this
+            # suite-level value (an empty case list is no constraint at all);
+            # the suite-level param only reaches E2ECase, via run_case's
+            # default. The replacement happens inside run_case.
+            forbidden=forbidden,
         )
         results.append(result)
         if sink is not None:

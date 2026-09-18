@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from longline.eval.constraint_enforcer import strip_forbidden
-from longline.tools.base import Tool, ToolRegistry
+from longline.tools.base import Tool, ToolRegistry, ToolResult, ToolSchema
 
 
 class FakeTool(Tool):
@@ -18,10 +18,12 @@ class FakeTool(Tool):
     def get_name(self) -> str:
         return self._name
 
-    def get_schema(self) -> Tool:
-        return None  # type: ignore[return-value]  # never used by these tests
+    # These tests only exercise registry membership, never schema export, so a
+    # null schema is honest about what the fake supports.
+    def get_schema(self) -> ToolSchema:
+        return None  # type: ignore[return-value]
 
-    async def execute(self, tool_input: dict[str, object]) -> Tool:
+    async def execute(self, tool_input: dict[str, object]) -> ToolResult:
         raise NotImplementedError
 
 
@@ -99,6 +101,10 @@ def test_build_registry_strips_declared_tools(tmp_path: Path) -> None:
     names = [t.get_name() for t in reg.list_tools()]
     assert "Grep" not in names
     assert "Read" in names
+    # The schema export the API request is built from must agree with the
+    # registry: a dead entry behind a list_tools-shaped check would surface
+    # exactly here.
+    assert "Grep" not in [s["name"] for s in reg.get_api_schemas()]
 
 
 def test_build_registry_without_forbidden_is_unchanged(tmp_path: Path) -> None:
