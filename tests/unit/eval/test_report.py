@@ -536,3 +536,75 @@ class TestSpeedupIsARatioNotAPercent:
         md = render_markdown(aggregate([]), multi_agent={"controlled": summary})
         assert "0.12x (8.7x slower)" in md
         assert "+11.6%" not in md
+
+
+class TestTokenEfficiency:
+    """Three ratios, three denominators, and None where nothing was measured.
+
+    Reported next to the pass rate rather than instead of it: a pass@1 that
+    rises while tokens-per-success rises faster is not an improvement. The
+    feedback that prompted these named a fourth, `cost_per_success`, but its
+    definition (`total_tokens / passed_cases`) is the same quantity as
+    TokensPerSuccessfulCase, and this repo has no price table -- a currency
+    figure would be invented rather than measured, so it is carried under the
+    token name.
+    """
+
+    def _tok(
+        self, cid: str, *, passed: bool, in_tok: int, out_tok: int, executed: int,
+    ) -> CaseResult:
+        return CaseResult(
+            case_id=cid, case_type="e2e", passed=passed,
+            input_tokens=in_tok, output_tokens=out_tok,
+            tool_executions=[
+                ToolExecution(tool_id=f"t{i}", tool_name="Read", is_error=False)
+                for i in range(executed)
+            ],
+        )
+
+    def test_each_metric_uses_its_own_denominator(self) -> None:
+        rep = aggregate([
+            self._tok("a", passed=True, in_tok=100, out_tok=10, executed=2),
+            self._tok("b", passed=False, in_tok=300, out_tok=30, executed=6),
+        ])
+
+        assert rep.total_tokens == 440
+        assert rep.tokens_per_case == 220.0            # 440 / 2 cases
+        assert rep.tokens_per_successful_case == 440.0  # 440 / 1 passed case
+        assert rep.input_tokens_per_tool_call == 50.0   # 400 / 8 executed calls
+
+    def test_an_empty_run_is_unmeasured_not_zero(self) -> None:
+        rep = aggregate([])
+
+        assert rep.tokens_per_case is None
+        assert rep.tokens_per_successful_case is None
+        assert rep.input_tokens_per_tool_call is None
+
+    def test_nothing_passed_leaves_the_per_success_ratio_unmeasured(self) -> None:
+        rep = aggregate([self._tok("a", passed=False, in_tok=10, out_tok=1, executed=1)])
+
+        assert rep.tokens_per_successful_case is None
+        assert rep.tokens_per_case == 11.0
+
+    def test_no_tool_call_executed_leaves_that_ratio_unmeasured(self) -> None:
+        """A run that executed nothing has no per-call cost to report."""
+        rep = aggregate([self._tok("a", passed=True, in_tok=10, out_tok=1, executed=0)])
+
+        assert rep.input_tokens_per_tool_call is None
+
+    def test_the_summary_dict_exposes_them_together(self) -> None:
+        rep = aggregate([self._tok("a", passed=True, in_tok=10, out_tok=1, executed=1)])
+        payload = rep.to_dict()["token_efficiency"]
+
+        assert payload == {
+            "tokens_per_case": 11.0,
+            "tokens_per_successful_case": 11.0,
+            "input_tokens_per_tool_call": 10.0,
+        }
+
+    def test_the_markdown_reports_them(self) -> None:
+        rep = aggregate([self._tok("a", passed=True, in_tok=10, out_tok=1, executed=1)])
+        md = render_markdown(rep)
+
+        assert "Token efficiency" in md
+        assert "11.0 tok/case" in md

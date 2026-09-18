@@ -103,6 +103,12 @@ class EvalReport:
     p95_duration_ms: float | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # --- token efficiency ---
+    # Each has its own denominator, and None means "nothing was measured",
+    # never zero -- a 0.0 here would read as a perfect score for an empty run.
+    tokens_per_case: float | None = None
+    tokens_per_successful_case: float | None = None
+    input_tokens_per_tool_call: float | None = None
     by_category: dict[str, GroupSummary] = field(default_factory=dict)
     by_variant: dict[str, GroupSummary] = field(default_factory=dict)
     variant: str | None = None
@@ -142,6 +148,11 @@ class EvalReport:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens": self.total_tokens,
+            "token_efficiency": {
+                "tokens_per_case": self.tokens_per_case,
+                "tokens_per_successful_case": self.tokens_per_successful_case,
+                "input_tokens_per_tool_call": self.input_tokens_per_tool_call,
+            },
             "latency_ms": {
                 "mean": self.mean_duration_ms,
                 "p50": self.p50_duration_ms,
@@ -323,6 +334,18 @@ def _repeat_outcomes(results: list[CaseResult]) -> tuple[list[int], list[int]]:
     return successes, counts
 
 
+def _safe_div(numerator: float, denominator: int) -> float | None:
+    """A ratio with a zero denominator is unmeasured, not zero.
+
+    Returning 0.0 would report "this run used no tokens per case" for an empty
+    run, and "no input tokens per tool call" for a run that executed nothing --
+    both of which read as a perfect score.
+    """
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
 def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalReport:
     """Summarize a batch of CaseResults by layer, category, variant and latency."""
     l1 = [r for r in results if r.case_type == "tool_call"]
@@ -399,6 +422,16 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         p95_duration_ms=percentile(durations, 95) if durations else None,
         total_input_tokens=sum(r.input_tokens for r in results),
         total_output_tokens=sum(r.output_tokens for r in results),
+        tokens_per_case=_safe_div(
+            sum(r.input_tokens + r.output_tokens for r in results), len(results),
+        ),
+        tokens_per_successful_case=_safe_div(
+            sum(r.input_tokens + r.output_tokens for r in results),
+            sum(1 for r in results if r.passed),
+        ),
+        input_tokens_per_tool_call=_safe_div(
+            sum(r.input_tokens for r in results), executed,
+        ),
         by_category={k: _summarize_group(v) for k, v in categories.items()},
         by_tool_call_bucket=_tool_call_buckets(l2),
         by_variant={k: _summarize_group(v) for k, v in variants.items()},
@@ -514,6 +547,15 @@ def render_markdown(
         "- **Tokens:** "
         f"input={report.total_input_tokens}, output={report.total_output_tokens}, "
         f"total={report.total_tokens}",
+        # Read next to the pass rate, not instead of it: a pass@1 that rises
+        # while tokens-per-success rises faster is not an improvement.
+        # `cost_per_success` is carried under `tok/success` -- the two are the
+        # same quantity, and this repo has no price table, so a currency figure
+        # would be invented rather than measured.
+        "- **Token efficiency:** "
+        f"{_fmt_num(report.tokens_per_case, 1)} tok/case, "
+        f"{_fmt_num(report.tokens_per_successful_case, 1)} tok/success, "
+        f"{_fmt_num(report.input_tokens_per_tool_call, 1)} in-tok/call",
     ]
 
     if report.tool_selection_case_accuracy.denominator or report.tool_call_precision.denominator:
