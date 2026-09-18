@@ -157,6 +157,21 @@ Focus text output on:
 If you can say it in one sentence, don't use three. Prefer short, direct sentences over long explanations. This does not apply to code or tool calls."""
 
 
+def get_minimal_tool_use_section() -> str:
+    """Information sufficiency: the fewest tool calls that carry the next step.
+
+    Added because the 2026-09-17 paid eval measured ToolCallPrecision at 31.2%
+    while ArgumentCallAccuracy hit 96.9% -- parameter competence is fine; the
+    leak is the look-again habit. This teaches information sufficiency, not
+    "call less".
+    """
+    return """# Minimal tool use
+ - Use the FEWEST tool calls that give you enough information for the current step, then act. A tool call is justified by the information it adds, not by caution.
+ - When you already hold enough information to act, act. Do not confirm a fact you have just established.
+ - Do not re-read a file you just edited with Edit or Write unless the edit may have failed. Do not Glob for a file whose path you already know. If a Grep hit has located the code, Read only the lines around the hit (a line range), not the whole file.
+ - Before a redundant read, ask: what question would this call answer that I cannot already answer? If none, skip it."""
+
+
 # 提醒模型在回复中记录工具结果中的关键信息，
 # 因为上下文压缩后原始工具结果可能被清除
 SUMMARIZE_TOOL_RESULTS = "When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later."
