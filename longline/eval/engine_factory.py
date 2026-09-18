@@ -14,6 +14,10 @@ the original six-tool core set, so existing runs are unchanged.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from longline.core.query_engine import QueryEngine
 
@@ -59,6 +63,7 @@ def build_engine(
     model: str,
     api_key: str,
     tool_profile: str = "core",
+    forbidden: Iterable[str] = (),
     session_id: str | None = None,
 ) -> QueryEngine:
     """Build a QueryEngine wired for evaluation.
@@ -70,6 +75,9 @@ def build_engine(
       unknown profile raises rather than silently falling back to the core
       set, because a silently smaller toolset still produces a plausible
       accuracy number.
+    - forbidden: tool names this case may not call (see
+      `longline/eval/constraint_enforcer.py`). Stripped from the registry
+      the engine runs against, so the harness carries the constraint.
     - session_id: the gateway's routing key for this conversation. Defaults to
       the sandbox's basename, which is already unique per case; callers that
       know something more meaningful (a case id) may pass it instead.
@@ -87,7 +95,9 @@ def build_engine(
             default_headers=client_headers(session_id or Path(sandbox).name),
         ),
         model=model,
-        registry=build_eval_registry(sandbox, profile=tool_profile),
+        registry=build_eval_registry(
+            sandbox, profile=tool_profile, forbidden=forbidden,
+        ),
         system_prompt=system,
         permission_ctx=permission_ctx,
         max_turns=50,

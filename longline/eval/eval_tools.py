@@ -22,8 +22,12 @@ Two things are deliberate here:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+from longline.eval.constraint_enforcer import strip_forbidden
 from longline.tools.base import Tool, ToolRegistry, ToolResult, ToolSchema
 from longline.tools.bash.bash_tool import BashTool
 from longline.tools.file_edit.file_edit_tool import FileEditTool
@@ -248,6 +252,7 @@ def build_eval_registry(
     *,
     profile: str = "core",
     task_store: TaskStore | None = None,
+    forbidden: Iterable[str] = (),
 ) -> ToolRegistry:
     """Assemble a ToolRegistry for one eval case.
 
@@ -290,4 +295,5 @@ def build_eval_registry(
     registry = ToolRegistry()
     for name in names:
         registry.register(factories[name]())
+    strip_forbidden(registry, forbidden)
     return registry

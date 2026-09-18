@@ -384,6 +384,7 @@ async def run_case(
     keep_sandbox_on_failure: bool = False,
     clock: Callable[[], int] = time.perf_counter_ns,
     tool_profile: str = "core",
+    forbidden: Iterable[str] = (),
 ) -> CaseResult:
     """Run one case and return its CaseResult.
 
@@ -421,9 +422,22 @@ async def run_case(
     # re-raises, so it cannot swallow a cancellation — it just ensures Ctrl-C
     # during engine construction does not leave a temp dir behind.
     try:
-        engine = build_engine(
-            sandbox=sandbox, model=model, api_key=api_key, tool_profile=tool_profile,
+        engine_kwargs = {
+            "sandbox": sandbox,
+            "model": model,
+            "api_key": api_key,
+            "tool_profile": tool_profile,
+        }
+        # The case's own forbidden list wins; the suite-level `forbidden` is
+        # the fallback for cases without one. Keyword-gated: an empty list is
+        # behaviorally a no-op, so pre-existing offline fakes of build_engine
+        # (which predate this parameter) keep working unchanged.
+        case_forbidden = (
+            case.forbidden_tools if isinstance(case, ToolCallCase) else list(forbidden)
         )
+        if list(case_forbidden):
+            engine_kwargs["forbidden"] = list(case_forbidden)
+        engine = build_engine(**engine_kwargs)  # type: ignore[arg-type]
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
         raise
@@ -547,6 +561,7 @@ async def run_suite(
     keep_sandbox_on_failure: bool = False,
     clock: Callable[[], int] = time.perf_counter_ns,
     tool_profile: str = "core",
+    forbidden: Iterable[str] = (),
     profile_for_case: Callable[[EvalCase], str] | None = None,
     skip_case_ids: frozenset[str] = frozenset(),
     sink: Callable[[CaseResult], None] | None = None,
@@ -607,6 +622,10 @@ async def run_suite(
             clock=clock,
             tool_profile=(
                 profile_for_case(case) if profile_for_case is not None else tool_profile
+            ),
+            forbidden=(
+                case.forbidden_tools
+                if isinstance(case, ToolCallCase) else forbidden
             ),
         )
         results.append(result)

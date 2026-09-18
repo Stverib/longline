@@ -140,6 +140,21 @@ class ToolRegistry:
         # 调用方（orchestration）会将 None 转化为 is_error=True 的 ToolResult。
         return self._tools.get(name)
 
+    def remove(self, name: str) -> Tool | None:
+        """Remove a registered tool, returning it, or None when absent.
+
+        The counterpart to `register` for callers that need to shrink the
+        pool -- the evaluation harness strips declared-forbidden tools from a
+        case's registry. Distinct from `swap(name, None)`: that would happily
+        store None inside the dict and leave a dead entry behind, which
+        `list_tools`/`get_api_schemas` would then trip over. A silently
+        tolerated removal rather than a KeyError, because the main callers
+        remove tools that may not be registered (a profile didn't offer the
+        family) and "forbid an absent tool" is a no-op, not a mistake.
+        """
+        previous = self._tools.pop(name, None)
+        return previous
+
     def swap(self, name: str, tool: Tool) -> Tool | None:
         """Replace an already-registered tool, returning the one it replaced.
 

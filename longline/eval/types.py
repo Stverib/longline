@@ -149,6 +149,8 @@ class ToolCallCase(_CaseBase):
     """
 
     accepted_tool_steps: list[list[str]] = field(default_factory=list)
+    # tools the case forbids; enforced at the registry level, not by prompt.
+    forbidden_tools: list[str] = field(default_factory=list)
     max_extra_calls: int = 0
     expect_tools: list[str] = field(default_factory=list)
     expect_args: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -177,6 +179,7 @@ class ToolCallCase(_CaseBase):
         expect_args = d.get("expect_args", {})
         fixture = d.get("fixture")
         blind_rationale = d.get("blind_rationale")
+        forbidden = d.get("forbidden_tools", [])
 
         if not isinstance(expect_args, dict):
             raise CaseParseError(f"expect_args must be dict, got {d!r}")
@@ -188,6 +191,8 @@ class ToolCallCase(_CaseBase):
             raise CaseParseError(f"max_extra_calls must be >= 0, got {max_extra_calls}")
         if blind_rationale is not None and not isinstance(blind_rationale, str):
             raise CaseParseError(f"blind_rationale must be str or null, got {blind_rationale!r}")
+        if not isinstance(forbidden, list) or not all(isinstance(t, str) for t in forbidden):
+            raise CaseParseError(f"forbidden_tools must be list[str], got {forbidden!r}")
 
         return ToolCallCase(
             id=base.id,
@@ -200,6 +205,7 @@ class ToolCallCase(_CaseBase):
             expect_args={str(k): {str(a): str(p) for a, p in v.items()} for k, v in expect_args.items()},
             fixture=fixture,
             blind_rationale=blind_rationale,
+            forbidden_tools=[str(t) for t in forbidden],
         )
 
     @staticmethod
