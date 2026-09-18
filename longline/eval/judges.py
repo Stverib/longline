@@ -571,6 +571,38 @@ def judge_line_set_equals(sandbox: Path, args: dict[str, Any]) -> bool:
     return True
 
 
+def judge_lines_match(sandbox: Path, args: dict[str, Any]) -> bool:
+    """Assert an ORDERED answer: line i matches pattern i, with no extras.
+
+    `line_set_equals` compares sets, which cancels both limits this judge
+    exists to lift, and both bit the same case (e2e-302):
+
+    - it cannot express order, so a case that asks for a listing "highest
+      first" was scored the same whichever way the answer came out;
+    - it demands one exact string per line, so the fixture's own wording
+      ("an explicit flag on the command line") FAILED while the case author's
+      paraphrase ("cli flags") passed. Measured, not assumed: feeding
+      `docs/setup.md`'s four lines to that judge returns False.
+
+    Patterns are regexes matched with `re.search`, so a case accepts the
+    several wordings a correct answer may legitimately use. The line COUNT is
+    exact, so "these four, and nothing else" is still asserted -- a judge that
+    ignored extras would accept an answer that dumped the whole document.
+    """
+    path = sandbox / str(args["path"])
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    patterns = [str(p) for p in args.get("patterns", [])]
+    if len(lines) != len(patterns):
+        return False
+    return all(
+        re.search(pattern, line, re.IGNORECASE)
+        for line, pattern in zip(lines, patterns, strict=True)
+    )
+
+
 def judge_python_test(sandbox: Path, args: dict[str, Any]) -> bool:
     """Run a declared Python test inside the sandbox and require exit code 0.
 
@@ -712,6 +744,7 @@ _JUDGES: dict[str, Any] = {
     "command_output_contains": judge_command_output_contains,
     "json_value": judge_json_value,
     "line_set_equals": judge_line_set_equals,
+    "lines_match": judge_lines_match,
     "python_test": judge_python_test,
     "directory_snapshot": judge_directory_snapshot,
     "unexpected_paths": judge_unexpected_paths,

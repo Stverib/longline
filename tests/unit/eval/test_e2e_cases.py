@@ -337,6 +337,15 @@ MUTATIONS: dict[str, Mutation] = {
         # Broken: one line is correct, the other is a plausible near-miss.
         lambda r: _write(r, "files.txt", "a.txt\nmain.py\n"),
     ),
+    "lines_match": (
+        {"path": "order.txt", "patterns": ["(?i)first", "(?i)second"]},
+        lambda r: _write(r, "order.txt", "first\nsecond\n"),
+        # Broken: the SAME two correct lines, swapped. The content is right and
+        # only the order is wrong, which is precisely the half of the assertion
+        # `line_set_equals` cannot see -- so this mutation is what proves the
+        # new judge checks something the old one did not.
+        lambda r: _write(r, "order.txt", "second\nfirst\n"),
+    ),
     "directory_snapshot": (
         {"path": ".", "equals": ["index.md", "README.md"]},
         lambda r: (_write(r, "index.md", "# Index\n"), _write(r, "README.md", "# r\n")),

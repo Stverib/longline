@@ -13,6 +13,7 @@ from longline.eval.judges import (
     check_tools,
     judge_case,
     judge_case_args,
+    judge_lines_match,
     judge_steps,
 )
 
@@ -663,3 +664,69 @@ class TestCasePassed:
     def test_bad_mode_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="checks_mode"):
             case_passed([], tmp_path, mode="most")
+
+
+class TestLinesMatch:
+    """`lines_match` exists because `line_set_equals` is a SET comparison.
+
+    Two limits of the set judge bit the same case (e2e-302): it cannot express
+    "highest first", and it demands one exact string per line -- so the
+    fixture's own wording failed while the case author's paraphrase passed.
+    """
+
+    def _patterns(self) -> list[str]:
+        return ["(?i)flag|command line", "APP_", r"local\.toml", "(?i)default"]
+
+    def test_accepts_any_correct_wording_in_order(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text(
+            "an explicit flag on the command line\n"
+            "the `APP_*` environment variables\n"
+            "`config/local.toml`\n"
+            "the compiled-in defaults\n",
+            encoding="utf-8",
+        )
+        assert judge_lines_match(tmp_path, {"path": "out.txt", "patterns": self._patterns()})
+
+    def test_accepts_a_different_correct_wording(self, tmp_path: Path) -> None:
+        """The same four answers, phrased the way a model would phrase them."""
+        (tmp_path / "out.txt").write_text(
+            "cli flags\nAPP_* environment variables\nconfig/local.toml\ncompiled-in defaults\n",
+            encoding="utf-8",
+        )
+        assert judge_lines_match(tmp_path, {"path": "out.txt", "patterns": self._patterns()})
+
+    def test_rejects_wrong_order(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text(
+            "the compiled-in defaults\nAPP_* environment variables\n", encoding="utf-8"
+        )
+        assert not judge_lines_match(
+            tmp_path, {"path": "out.txt", "patterns": ["APP_", "(?i)default"]}
+        )
+
+    def test_rejects_a_missing_line(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text("cli flags\n", encoding="utf-8")
+        assert not judge_lines_match(
+            tmp_path, {"path": "out.txt", "patterns": ["(?i)flag", "APP_"]}
+        )
+
+    def test_rejects_an_extra_line(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text("cli flags\nAPP_*\nand more\n", encoding="utf-8")
+        assert not judge_lines_match(
+            tmp_path, {"path": "out.txt", "patterns": ["(?i)flag", "APP_"]}
+        )
+
+    def test_ignores_blank_lines(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text("\n\ncli flags\n\n", encoding="utf-8")
+        assert judge_lines_match(tmp_path, {"path": "out.txt", "patterns": ["(?i)flag"]})
+
+    def test_missing_file_is_false(self, tmp_path: Path) -> None:
+        assert not judge_lines_match(tmp_path, {"path": "nope.txt", "patterns": ["x"]})
+
+    def test_empty_patterns_require_an_empty_file(self, tmp_path: Path) -> None:
+        (tmp_path / "out.txt").write_text("", encoding="utf-8")
+        assert judge_lines_match(tmp_path, {"path": "out.txt", "patterns": []})
+
+    def test_is_registered(self) -> None:
+        from longline.eval.judges import _JUDGES
+
+        assert "lines_match" in _JUDGES
