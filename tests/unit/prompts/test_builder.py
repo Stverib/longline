@@ -34,6 +34,7 @@ class TestBuildSystemPrompt:
         assert "Bash" in joined
         assert "emoji" in joined.lower()
         assert "# Minimal tool use" in joined
+        assert "# Retrieval policy" in joined
 
     def test_contains_dynamic_env(self) -> None:
         result = build_system_prompt("/tmp/myproject", "test-model")

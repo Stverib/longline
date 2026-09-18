@@ -172,6 +172,23 @@ def get_minimal_tool_use_section() -> str:
  - Before a redundant read, ask: what question would this call answer that I cannot already answer? If none, skip it."""
 
 
+def get_retrieval_policy_section() -> str:
+    """Search hierarchy: exact first, broad last.
+
+    Added because retrieval dropped to 62.5% in the paid e2e run while
+    file-ops and long-chain were perfect -- the miss is search order, not
+    search ability.
+    """
+    return """# Retrieval policy
+ - Prefer the most PRECISE search that can answer the question. From most to least precise:
+   - Known file path: Read it (a line range if you know the region).
+   - Known symbol or exact string: Grep for it, then Read only the lines around each hit.
+   - Known naming pattern: Glob for the file pattern, then Read.
+   - Nothing known: Glob the directory layout, then Grep inside the candidates.
+ - Never Read a whole file to look for one symbol; Grep first.
+ - After a Grep hit, Read the lines around the hit (e.g. +/-40 lines), not the file from line 1."""
+
+
 # 提醒模型在回复中记录工具结果中的关键信息，
 # 因为上下文压缩后原始工具结果可能被清除
 SUMMARIZE_TOOL_RESULTS = "When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later."

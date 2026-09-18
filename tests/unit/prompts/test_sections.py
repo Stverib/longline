@@ -81,3 +81,18 @@ class TestPromptSections:
             get_output_efficiency_section(),
         ])
         assert total > 5000
+
+
+def test_retrieval_policy_is_in_the_prompt():
+    from longline.prompts.sections import get_retrieval_policy_section
+    text = get_retrieval_policy_section()
+    assert "Grep" in text and "Glob" in text
+    assert "lines" in text or "range" in text   # hit -> read around the hit
+
+
+def test_builder_wires_retrieval_after_minimal():
+    from longline.prompts.builder import build_system_prompt
+    sections = build_system_prompt(cwd="/tmp", model="m")
+    joined = "\n".join(sections)
+    assert "# Retrieval policy" in joined
+    assert joined.index("# Retrieval policy") > joined.index("# Minimal tool use")

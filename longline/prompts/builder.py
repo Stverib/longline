@@ -26,6 +26,7 @@ from .sections import (
     get_intro_section,
     get_minimal_tool_use_section,
     get_output_efficiency_section,
+    get_retrieval_policy_section,
     get_system_section,
     get_tone_style_section,
     get_using_tools_section,
@@ -112,6 +113,7 @@ def build_system_prompt(
         get_actions_section(),        # 操作风险评估和确认机制
         get_using_tools_section(),    # 工具使用偏好（专用工具优先于 Bash）
         get_minimal_tool_use_section(),  # 最小充分调用 (信息充分性)
+        get_retrieval_policy_section(),  # 检索优先级 (精确优先, 全局兜底)
         get_tone_style_section(),     # 输出风格（简洁、无 emoji）
         get_output_efficiency_section(),  # 输出效率要求
         # --- 动态段落 ---
