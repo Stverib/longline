@@ -190,8 +190,18 @@ def get_retrieval_policy_section() -> str:
 
 
 # 提醒模型在回复中记录工具结果中的关键信息，
-# 因为上下文压缩后原始工具结果可能被清除
-SUMMARIZE_TOOL_RESULTS = "When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later."
+# 因为上下文压缩后原始工具结果可能被清除。
+# 2026-09-18 升级: 泛泛的 "记下重要信息" 没有指出该记什么,
+# multi-tool 类 e2e 通过率 70.8% 而 long-chain 100% 说明漏的是工具间交接,
+# 所以把常量改为点名下一步必须可达的交接字段 (文件/符号/行号/目标),
+# 使下一个工具调用可以从写下的内容推导, 而不是凭对结果的记忆.
+SUMMARIZE_TOOL_RESULTS = (
+    "When a tool result informs later steps, record in your response the facts"
+    " later steps will need: the file path, the symbol name, the line numbers,"
+    " and what the change targets. The original tool result may be cleared"
+    " later; the next tool call must be derivable from what you wrote down,"
+    " not from memory of the result."
+)
 
 
 # =============================================================================

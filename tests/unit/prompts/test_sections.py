@@ -96,3 +96,16 @@ def test_builder_wires_retrieval_after_minimal():
     joined = "\n".join(sections)
     assert "# Retrieval policy" in joined
     assert joined.index("# Retrieval policy") > joined.index("# Minimal tool use")
+
+
+def test_working_state_instruction_names_the_hand_off_fields():
+    """FAILS ON: a generic "write down info" that names no fields to carry.
+
+    multi-tool e2e dropped to 70.8% while long-chain held 100%: the leak is
+    tool-to-tool hand-off, not persistence. The instruction has to name WHICH
+    facts the next call needs, or the model summarizes prose instead of state.
+    """
+    from longline.prompts.sections import SUMMARIZE_TOOL_RESULTS
+    assert "file path" in SUMMARIZE_TOOL_RESULTS
+    assert "symbol" in SUMMARIZE_TOOL_RESULTS
+    assert "line numbers" in SUMMARIZE_TOOL_RESULTS
