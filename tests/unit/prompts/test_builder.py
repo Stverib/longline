@@ -107,3 +107,49 @@ class TestBuildSystemPrompt:
         assert "Use black" in joined
         assert "prefers ruff" in joined
         assert "# auto memory" in joined
+
+
+class TestPromptVariant:
+    """Which optional sections the ablation assembles.
+
+    The retrieval policy paragraph did not move the e2e pass rate last round,
+    but that category's failures were deterministic (three cases failed 0/3),
+    so the pass rate had no room to move. An A/B needs the variant to be
+    switchable and provably the ONLY difference.
+    """
+
+    def test_baseline_carries_the_retrieval_policy(self) -> None:
+        joined = "\n".join(build_system_prompt("/tmp", "m"))
+
+        assert "# Retrieval policy" in joined
+
+    def test_default_is_baseline(self) -> None:
+        assert build_system_prompt("/tmp", "m") == build_system_prompt(
+            "/tmp", "m", prompt_variant="baseline",
+        )
+
+    def test_no_retrieval_drops_exactly_that_section(self) -> None:
+        joined = "\n".join(build_system_prompt("/tmp", "m", prompt_variant="no-retrieval"))
+
+        assert "# Retrieval policy" not in joined
+        # The ablation is clean only if the OTHER sections are untouched.
+        assert "# Minimal tool use" in joined
+        assert "# Using your tools" in joined
+        assert "# Tone and style" in joined
+
+    def test_no_retrieval_keeps_every_other_section(self) -> None:
+        baseline = build_system_prompt("/tmp", "m")
+        without = build_system_prompt("/tmp", "m", prompt_variant="no-retrieval")
+
+        assert len(without) == len(baseline) - 1
+        assert [s for s in baseline if s not in without] == [
+            s for s in baseline if "Retrieval policy" in s
+        ]
+
+    def test_an_unknown_variant_raises(self) -> None:
+        """A typo must not silently produce the baseline prompt and a
+        plausible-looking null result in which both arms were the same arm."""
+        import pytest
+
+        with pytest.raises(ValueError, match="unknown prompt variant"):
+            build_system_prompt("/tmp", "m", prompt_variant="no-retreival")

@@ -839,3 +839,57 @@ class TestRawRowsRoundTrip:
         )
         twice = cli._load_jsonl_results(second)
         assert twice[0].to_raw_dict() == once[0].to_raw_dict()
+
+
+class TestCaseIdSelection:
+    """`--case-id` names an arbitrary subset; `--tag` cannot.
+
+    An ablation on unstable cases needs "these seven mixed cases", which no tag
+    expresses. An empty result must stay an error rather than becoming an empty
+    run that reports a clean zero.
+    """
+
+    def _cases(self) -> list[ToolCallCase]:
+        return [
+            ToolCallCase(id="e2e-403", task="t", tags=["multi-tool"]),
+            ToolCallCase(id="e2e-404", task="t", tags=["retrieval"]),
+            ToolCallCase(id="e2e-507", task="t", tags=["long-chain"]),
+        ]
+
+    def test_selects_the_named_cases(self) -> None:
+        got = cli._select_by_case_id(self._cases(), ["e2e-403", "e2e-507"])
+
+        assert [c.id for c in got] == ["e2e-403", "e2e-507"]
+
+    def test_no_ids_means_no_filtering(self) -> None:
+        cases = self._cases()
+
+        assert cli._select_by_case_id(cases, None) == cases
+        assert cli._select_by_case_id(cases, []) == cases
+
+    def test_an_unknown_id_selects_nothing(self) -> None:
+        """The caller turns this into a SystemExit; the selector must not
+        quietly return everything."""
+        assert cli._select_by_case_id(self._cases(), ["nope"]) == []
+
+    def test_parse_args_accepts_a_repeated_flag(self) -> None:
+        args = cli.parse_args(["--suite", "e2e", "--case-id", "e2e-403", "--case-id", "e2e-404"])
+
+        assert args.case_id == ["e2e-403", "e2e-404"]
+
+    def test_parse_args_defaults_to_no_case_filter(self) -> None:
+        assert cli.parse_args(["--suite", "e2e"]).case_id is None
+
+
+class TestPromptVariantFlag:
+    def test_defaults_to_baseline(self) -> None:
+        assert cli.parse_args(["--suite", "e2e"]).prompt_variant == "baseline"
+
+    def test_accepts_no_retrieval(self) -> None:
+        args = cli.parse_args(["--suite", "e2e", "--prompt-variant", "no-retrieval"])
+
+        assert args.prompt_variant == "no-retrieval"
+
+    def test_rejects_an_unknown_variant(self) -> None:
+        with pytest.raises(SystemExit):
+            cli.parse_args(["--suite", "e2e", "--prompt-variant", "nope"])

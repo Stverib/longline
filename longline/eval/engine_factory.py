@@ -65,6 +65,7 @@ def build_engine(
     tool_profile: str = "core",
     forbidden: Iterable[str] = (),
     session_id: str | None = None,
+    prompt_variant: str = "baseline",
 ) -> QueryEngine:
     """Build a QueryEngine wired for evaluation.
 
@@ -81,10 +82,16 @@ def build_engine(
     - session_id: the gateway's routing key for this conversation. Defaults to
       the sandbox's basename, which is already unique per case; callers that
       know something more meaningful (a case id) may pass it instead.
+    - prompt_variant: which optional system-prompt sections to assemble (see
+      `build_system_prompt`). It changes the PROMPT only -- the registry is
+      untouched, so an ablation on wording cannot accidentally measure a
+      different tool menu.
     """
     import anthropic
 
-    system = "\n\n".join(build_system_prompt(cwd=sandbox, model=model))
+    system = "\n\n".join(
+        build_system_prompt(cwd=sandbox, model=model, prompt_variant=prompt_variant)
+    )
     permission_ctx = PermissionContext(
         mode=PermissionMode.BYPASS,
         is_interactive=False,

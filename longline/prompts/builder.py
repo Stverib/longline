@@ -73,12 +73,22 @@ You have been invoked in the following environment:
  - The current date is {today}."""
 
 
+# prompt variant -> the section keys it drops. A named set rather than a
+# boolean per section, so a second ablation adds a key instead of another
+# parameter, and so the omitted sections are readable in one place.
+_PROMPT_VARIANTS: dict[str, frozenset[str]] = {
+    "baseline": frozenset(),
+    "no-retrieval": frozenset({"retrieval_policy"}),
+}
+
+
 def build_system_prompt(
     cwd: str,
     model: str,
     claude_md_content: str | None = None,
     memory_dir: str | None = None,
     memory_index_content: str | None = None,
+    prompt_variant: str = "baseline",
 ) -> list[str]:
     """Build the complete system prompt.
 
@@ -101,9 +111,22 @@ def build_system_prompt(
         claude_md_content: Loaded CLAUDE.md text (if any).
         memory_dir: Absolute path to the memory directory (enables memory prompt).
         memory_index_content: Content of MEMORY.md index file (if exists).
+        prompt_variant: which optional sections to assemble. `"baseline"` is the
+            production prompt; `"no-retrieval"` omits the retrieval policy
+            section so an ablation can price that paragraph. Unknown values
+            RAISE rather than fall back: a typo'd variant that silently produced
+            the baseline prompt would yield a clean-looking A/B in which both
+            arms were the same arm, and a null result that measured nothing.
 
     Returns a list of prompt sections that are joined by the API layer.
     """
+    if prompt_variant not in _PROMPT_VARIANTS:
+        raise ValueError(
+            f"unknown prompt variant: {prompt_variant!r} "
+            f"(known: {sorted(_PROMPT_VARIANTS)})"
+        )
+    dropped = _PROMPT_VARIANTS[prompt_variant]
+
     sections: list[str | None] = [
         # --- 静态段落（可缓存）---
         # 按照 TS 原版 getSystemPrompt() 中的顺序排列
@@ -113,7 +136,14 @@ def build_system_prompt(
         get_actions_section(),        # 操作风险评估和确认机制
         get_using_tools_section(),    # 工具使用偏好（专用工具优先于 Bash）
         get_minimal_tool_use_section(),  # 最小充分调用 (信息充分性)
-        get_retrieval_policy_section(),  # 检索优先级 (精确优先, 全局兜底)
+        # 检索优先级 (精确优先, 全局兜底)。`None` 表示本变体不拼这一段,
+        # 列表末尾的统一过滤会把它去掉 —— 这样"掉了哪一段"是一个显式的、
+        # 可读的选择,而不是让整段文本在别处被条件拼接出来。
+        (
+            None
+            if "retrieval_policy" in dropped
+            else get_retrieval_policy_section()
+        ),
         get_tone_style_section(),     # 输出风格（简洁、无 emoji）
         get_output_efficiency_section(),  # 输出效率要求
         # --- 动态段落 ---

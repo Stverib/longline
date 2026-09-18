@@ -254,6 +254,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--tag", default=None,
         help="Only run cases carrying this tag.",
     )
+    p.add_argument(
+        "--case-id", action="append", default=None, metavar="ID",
+        help="Only run cases with this id. Repeatable, and the ONLY way to "
+             "name an arbitrary subset: --tag cannot express 'these seven "
+             "mixed cases', which is what an ablation on unstable cases "
+             "needs. Selecting nothing is an error, not an empty run.",
+    )
+    p.add_argument(
+        "--prompt-variant", choices=("baseline", "no-retrieval"),
+        default="baseline",
+        help="Which system-prompt sections to assemble. 'no-retrieval' drops "
+             "the retrieval policy section, so an A/B can price that "
+             "paragraph. Recorded in the run metadata, so a run cannot be "
+             "read as the other arm by accident.",
+    )
     # --- Task 2 additions ---
     p.add_argument(
         "--tool-profile", default="core",
@@ -406,6 +421,23 @@ def _select_by_tag(cases: list[EvalCase], tag: str | None) -> list[EvalCase]:
     return [c for c in cases if tag in c.tags]
 
 
+def _select_by_case_id(
+    cases: list[EvalCase], case_ids: list[str] | None,
+) -> list[EvalCase]:
+    """Filter cases by id; no ids means no filtering.
+
+    `--tag` answers "which family", which is what a profile or a category
+    question needs. It cannot answer "these seven cases that pass sometimes",
+    and a subset chosen by a measured property is exactly what an ablation
+    runs on. Selecting nothing is left to the caller to reject: returning the
+    full set for an unmatched id would silently run the whole suite.
+    """
+    if not case_ids:
+        return cases
+    wanted = set(case_ids)
+    return [c for c in cases if c.id in wanted]
+
+
 # Family tag -> the tool profile that must be registered for the case to be
 # answerable at all. A case tagged `web` run against the core registry could
 # never pass, and its failure would look like a model error.
@@ -474,6 +506,7 @@ def run_metadata(
     repeat_index: int,
     repeats_completed: int,
     served_models: list[str] | None = None,
+    prompt_variant: str | None = None,
 ) -> dict[str, object]:
     """The per-run metadata block required by evals/README.md §2.1.
 
@@ -481,8 +514,14 @@ def run_metadata(
     parameter rather than a global because only the caller has the results, and
     it is folded in here rather than at each call site so all six runners
     describe their model the same way.
+
+    `prompt_variant` is added only when the caller names one, so the other
+    suites' metadata blocks stay byte-identical. It is a separate key rather
+    than an overload of `variant` because the two answer different questions:
+    `variant` is the caller's own label for what is being compared, while this
+    records which prompt was actually assembled.
     """
-    return {
+    block: dict[str, object] = {
         "run_id": run_id,
         "suite": suite,
         "variant": variant,
@@ -496,6 +535,9 @@ def run_metadata(
         "repeats_completed": repeats_completed,
         **model_provenance(model, served_models or []),
     }
+    if prompt_variant is not None:
+        block["prompt_variant"] = prompt_variant
+    return block
 
 
 def _write_jsonl(path: Path, results: list[CaseResult]) -> None:
@@ -1195,6 +1237,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     elif args.type == "e2e":
         cases = _select_cases(cases, "e2e")
     cases = _select_by_tag(cases, args.tag)
+    cases = _select_by_case_id(cases, args.case_id)
     if args.blind_only:
         cases = _select_by_tag(cases, BLIND_TAG)
     if args.instruction_only:
@@ -1202,7 +1245,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
     if args.max_cases is not None:
         cases = cases[: args.max_cases]
     if not cases:
-        raise SystemExit("no cases selected — check --type / --case-file / --tag")
+        raise SystemExit("no cases selected — check --type / --case-file / --tag / --case-id")
 
     run_id: str = args.run_id or make_run_id(args.model, args.suite or args.type)
     suite = args.suite or args.type
@@ -1261,6 +1304,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
             ),
             sink=_sink,
             pace_seconds=args.pace_seconds,
+            prompt_variant=args.prompt_variant,
         ))
 
     report = aggregate(all_results, variant=args.variant)
@@ -1280,6 +1324,7 @@ async def _run(argv: Sequence[str] | None = None) -> int:
         run_id=run_id, suite=suite, variant=args.variant, model=args.model,
         case_file=case_file, repeat_index=args.repeats - 1, repeats_completed=args.repeats,
         served_models=served_models_in(all_results),
+        prompt_variant=args.prompt_variant,
     )
 
     if args.run_id is not None:

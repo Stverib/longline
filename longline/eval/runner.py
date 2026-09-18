@@ -385,6 +385,7 @@ async def run_case(
     clock: Callable[[], int] = time.perf_counter_ns,
     tool_profile: str = "core",
     forbidden: Iterable[str] = (),
+    prompt_variant: str = "baseline",
 ) -> CaseResult:
     """Run one case and return its CaseResult.
 
@@ -440,6 +441,10 @@ async def run_case(
         )
         if list(case_forbidden):
             engine_kwargs["forbidden"] = list(case_forbidden)
+        # Same keyword-gating as `forbidden`: the default is a no-op, so fakes
+        # of build_engine written before this parameter existed keep working.
+        if prompt_variant != "baseline":
+            engine_kwargs["prompt_variant"] = prompt_variant
         engine = build_engine(**engine_kwargs)
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
@@ -570,6 +575,7 @@ async def run_suite(
     sink: Callable[[CaseResult], None] | None = None,
     pace_seconds: float = 0.0,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    prompt_variant: str = "baseline",
 ) -> list[CaseResult]:
     """Run a batch of cases serially.
 
@@ -631,6 +637,7 @@ async def run_suite(
             # the suite-level param only reaches E2ECase, via run_case's
             # default. The replacement happens inside run_case.
             forbidden=forbidden,
+            prompt_variant=prompt_variant,
         )
         results.append(result)
         if sink is not None:
