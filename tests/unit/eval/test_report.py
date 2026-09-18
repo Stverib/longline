@@ -676,3 +676,60 @@ class TestDedicatedToolPreference:
         assert rep.dedicated_tool_preference.numerator == 1
         assert rep.dedicated_tool_preference.denominator == 2
         assert rep.to_dict()["tool_calling"]["dedicated_tool_preference"]["value"] == 0.5
+
+
+class TestStabilitySection:
+    """The report must surface the stability split, not just the pass rate."""
+
+    def _row(self, cid: str, repeat: int, passed: bool, calls: list[str]) -> CaseResult:
+        return CaseResult(
+            case_id=cid, case_type="e2e", passed=passed, repeat_index=repeat,
+            tool_calls=[(n, {}) for n in calls],
+        )
+
+    def test_aggregate_carries_the_split(self) -> None:
+        rep = aggregate([
+            self._row("stable", 0, True, ["Read"]),
+            self._row("stable", 1, True, ["Read"]),
+            self._row("mixed", 0, True, ["Read"]),
+            self._row("mixed", 1, False, ["Bash"]),
+            self._row("broken", 0, False, ["Bash"]),
+            self._row("broken", 1, False, ["Bash"]),
+        ])
+        kinds = {s.case_id: s.kind for s in rep.stability}
+
+        assert kinds == {"stable": "stable", "mixed": "mixed", "broken": "always_fail"}
+
+    def test_markdown_names_the_cause_of_each_mixed_case(self) -> None:
+        rep = aggregate([
+            self._row("mixed", 0, True, ["Glob", "Write", "Write"]),
+            self._row("mixed", 1, False, ["Glob", "Write", "Write"]),
+        ])
+        md = render_markdown(rep)
+
+        assert "## Run stability" in md
+        assert "| mixed case | cause | first divergence |" in md
+        assert "| mixed | content_driven | - |" in md
+
+    def test_markdown_reports_first_action_consistency(self) -> None:
+        rep = aggregate([
+            self._row("c", 0, True, ["Read"]),
+            self._row("c", 1, True, ["Grep"]),
+        ])
+        md = render_markdown(rep)
+
+        assert "First-action consistency" in md
+
+    def test_summary_dict_exposes_the_stability_block(self) -> None:
+        rep = aggregate([
+            self._row("c", 0, True, ["Read"]),
+            self._row("c", 1, True, ["Read"]),
+        ])
+        block = rep.to_dict()["stability"]
+
+        assert block["cases"][0]["case_id"] == "c"
+        assert block["first_action_consistency"] == {
+            "stable": 1, "mixed": 0, "highly_unstable": 0,
+        }
+        assert block["redundant_actions"] == {"repeated_reads": 0, "read_after_write": 0}
+        assert block["notebook_edit_substitution"] == 0

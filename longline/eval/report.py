@@ -21,6 +21,16 @@ from longline.eval.metrics import (
     percentile,
     reliability_ratio,
 )
+from longline.eval.stability import (
+    ALWAYS_FAIL,
+    MIXED,
+    STABLE,
+    CaseStability,
+    case_stability,
+    first_action_consistency,
+    notebook_edit_substitution,
+    redundant_actions,
+)
 from longline.eval.tool_equivalence import DEDICATED_TOOLS, classify_bash
 from longline.eval.types import E2E_CATEGORY_TAGS
 
@@ -118,6 +128,14 @@ class EvalReport:
     by_category: dict[str, GroupSummary] = field(default_factory=dict)
     by_variant: dict[str, GroupSummary] = field(default_factory=dict)
     variant: str | None = None
+    # --- stability and redundancy ---
+    # Diagnostic, never a pass condition: these describe the SHAPE of a run,
+    # and a case can be perfectly stable while being perfectly wrong. They are
+    # what turns "the agent is unreliable" into a target.
+    stability: list[CaseStability] = field(default_factory=list)
+    first_action_consistency: dict[str, int] = field(default_factory=dict)
+    redundant_actions: dict[str, int] = field(default_factory=dict)
+    notebook_edit_substitution: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -169,6 +187,12 @@ class EvalReport:
         # Diagnostic stratification, not a pass condition (plan §4.1).
         "by_tool_call_bucket": {k: v.to_dict() for k, v in self.by_tool_call_bucket.items()},
             "by_variant": {k: v.to_dict() for k, v in self.by_variant.items()},
+            "stability": {
+                "cases": [s.to_dict() for s in self.stability],
+                "first_action_consistency": self.first_action_consistency,
+                "redundant_actions": self.redundant_actions,
+                "notebook_edit_substitution": self.notebook_edit_substitution,
+            },
             "per_case": self.per_case,
         }
 
@@ -467,6 +491,10 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         by_tool_call_bucket=_tool_call_buckets(l2),
         by_variant={k: _summarize_group(v) for k, v in variants.items()},
         variant=variant,
+        stability=case_stability(results),
+        first_action_consistency=first_action_consistency(results),
+        redundant_actions=redundant_actions(results),
+        notebook_edit_substitution=notebook_edit_substitution(results),
     )
 
 
@@ -652,6 +680,40 @@ def render_markdown(
 
     if safety is not None:
         lines += _safety_lines(safety)
+
+    if report.stability:
+        mixed = [s for s in report.stability if s.kind == MIXED]
+        lines += [
+            "",
+            "## Run stability",
+            "",
+            "Diagnostic, never a pass condition. `mixed` is the set this round "
+            "tries to move, split by cause: `routing` can be moved by a tool "
+            "policy, `overrun` by acting on sufficient information, and "
+            "`content_driven` by neither.",
+            "",
+            "| kind | cases |",
+            "|---|---|",
+            f"| stable (passed every repeat) | {sum(1 for s in report.stability if s.kind == STABLE)} |",
+            f"| mixed (passed sometimes) | {len(mixed)} |",
+            f"| always_fail (passed never) | {sum(1 for s in report.stability if s.kind == ALWAYS_FAIL)} |",
+            "",
+            f"- **First-action consistency:** {report.first_action_consistency}",
+            f"- **Redundant actions:** {report.redundant_actions}",
+            f"- **Notebook edited via Edit instead of NotebookEdit:** "
+            f"{report.notebook_edit_substitution} run(s)",
+        ]
+        if mixed:
+            lines += [
+                "",
+                "| mixed case | cause | first divergence |",
+                "|---|---|---|",
+                *(
+                    f"| {s.case_id} | {s.mixed_cause} | "
+                    f"{'-' if s.first_divergence is None else s.first_divergence} |"
+                    for s in mixed
+                ),
+            ]
 
     if report.by_category:
         lines += [
