@@ -24,6 +24,7 @@ other half, and it is what catches a case that picked the wrong assertion.
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any, ClassVar
@@ -156,6 +157,7 @@ class TestJudgeArgsAreComplete:
         "file_exists": ("path",),
         "json_value": ("path", "key_path", "equals"),
         "line_set_equals": ("path", "equals"),
+        "lines_match": ("path", "patterns"),
         "directory_snapshot": ("path",),
         "command_ok": ("command", "allowed_commands"),
         "command_output_contains": ("command", "contains", "allowed_commands"),
@@ -500,7 +502,7 @@ class TestLongChainCasesDoNotScoreToolCalls:
     def test_long_chain_checks_are_result_only(self, cases: list[E2ECase]) -> None:
         result_judges = {
             "file_content", "file_exists", "json_value",
-            "line_set_equals", "directory_snapshot", "python_test",
+            "line_set_equals", "lines_match", "directory_snapshot", "python_test",
             "command_ok", "command_output_contains",
         }
         for c in cases:
@@ -642,3 +644,154 @@ class TestCommandJudgingResidualRisk:
                 allowed = check["args"].get("allowed_commands") or []
                 bad = {a for a in allowed if Path(str(a)).name.lower() in banned}
                 assert not bad, f"{c.id} declares a shell as an allowed command: {bad}"
+
+
+class TestACaseIsPassableFromItsOwnFixture:
+    """A case whose own fixture cannot satisfy it measures nothing.
+
+    Both cases below were scored wrong for reasons that had nothing to do with
+    the model. These tests are the regression lock, not a style preference:
+    each feeds the fixture's OWN ground truth to the case's checks and requires
+    them to accept it. A case whose assertion is a paraphrase appearing nowhere
+    in the fixture fails here.
+    """
+
+    def _checks(self, case_id: str) -> list[dict[str, Any]]:
+        return next(c for c in load_cases(CASE_FILE) if c.id == case_id).checks
+
+    def _precedence_lines(self) -> list[str]:
+        """`docs/setup.md`'s four precedence items, as the fixture lists them."""
+        text = (FIXTURES_DIR / "retrieval_repo" / "docs" / "setup.md").read_text(
+            encoding="utf-8"
+        )
+        section = text.split("## Configuration precedence", 1)[1].split("## Known issues", 1)[0]
+        return [
+            m.group(1).strip()
+            for m in re.finditer(r"^\d+\.\s+(.*)$", section, re.MULTILINE)
+        ]
+
+    def test_e2e_302_accepts_a_transcription_of_its_fixture(self, tmp_path: Path) -> None:
+        lines = self._precedence_lines()
+        assert len(lines) == 4, f"fixture shape changed, update this test: {lines}"
+        _write(tmp_path, "config_precedence.txt", "\n".join(lines) + "\n")
+
+        check = self._checks("e2e-302")[0]
+        assert judge_case(check["fn"], tmp_path, check["args"]), (
+            "e2e-302 rejects its own fixture's wording, so a faithful answer "
+            "cannot pass -- the expectation is a paraphrase, not the source"
+        )
+
+    def test_e2e_302_accepts_the_authors_wording_too(self, tmp_path: Path) -> None:
+        """The fix must widen the judge, not swap one exact string for another."""
+        _write(
+            tmp_path, "config_precedence.txt",
+            "cli flags\nAPP_* environment variables\nconfig/local.toml\ncompiled-in defaults\n",
+        )
+        check = self._checks("e2e-302")[0]
+        assert judge_case(check["fn"], tmp_path, check["args"])
+
+    def test_e2e_302_still_enforces_the_declared_order(self, tmp_path: Path) -> None:
+        """The task says 'highest first'; a set comparison never checked that."""
+        _write(
+            tmp_path, "config_precedence.txt",
+            "\n".join(reversed(self._precedence_lines())) + "\n",
+        )
+        check = self._checks("e2e-302")[0]
+        assert not judge_case(check["fn"], tmp_path, check["args"])
+
+    def test_e2e_302_still_rejects_a_missing_item(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path, "config_precedence.txt",
+            "an explicit flag on the command line\nthe `APP_*` environment variables\n",
+        )
+        check = self._checks("e2e-302")[0]
+        assert not judge_case(check["fn"], tmp_path, check["args"])
+
+    def test_e2e_304_accepts_a_chinese_answer(self, tmp_path: Path) -> None:
+        """The task is written in Chinese, so the answer may be.
+
+        The second check already accepted Chinese; the first required the
+        literal token `array`, so a correct Chinese answer satisfied one half
+        of the assertion and failed the other.
+        """
+        _write(
+            tmp_path, "ingest_format.txt",
+            "批量写入接口的请求体是一个裸 JSON 数组。没有外层包装对象。\n",
+        )
+        for check in self._checks("e2e-304"):
+            assert judge_case(check["fn"], tmp_path, check["args"]), check
+
+    def test_e2e_304_accepts_an_english_answer(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path, "ingest_format.txt",
+            "The ingest body is a bare JSON array, with no wrapper object.\n",
+        )
+        for check in self._checks("e2e-304"):
+            assert judge_case(check["fn"], tmp_path, check["args"]), check
+
+    def test_e2e_304_still_requires_both_claims(self, tmp_path: Path) -> None:
+        """Two checks, two claims: the shape, and how it differs. Neither may
+        be satisfied by restating the other."""
+        _write(tmp_path, "ingest_format.txt", "The body is an array.\n")
+        checks = self._checks("e2e-304")
+        assert judge_case(checks[0]["fn"], tmp_path, checks[0]["args"])
+        assert not judge_case(checks[1]["fn"], tmp_path, checks[1]["args"])
+
+
+# A task that names a LINE POSITION ("第一行", "second line") is asserting
+# something a set comparison cannot see: the same lines in the other order
+# satisfy it. This is the class `lines_match` exists for.
+_POSITIONAL_TASK = re.compile(r"第一行|第二行|第三行|first line|second line", re.IGNORECASE)
+
+# Not caught by the check above, and deliberately left for a later round:
+#
+# - e2e-504 says "表头为 'stage,total', 每个 stage 一行". The header's POSITION
+#   matters and the row order does not, so `lines_match` would over-specify
+#   (it pins every line) and `line_set_equals` under-specifies. Expressing
+#   "line 1 is fixed, lines 2..n are a set" needs a judge capability this
+#   round did not build.
+# - e2e-407 says "逐行写出 data/notes.txt 里所有非空行", which reads as a
+#   transcription in source order, but names no position.
+#
+# Both are false-POSITIVE risks (a wrong answer passes), not the false-negative
+# defect the round is fixing, so they are recorded rather than guessed at.
+_ORDERED_CASES_LEFT_ALONE: frozenset[str] = frozenset({"e2e-504", "e2e-407"})
+
+
+class TestPositionalClaimsUseAnOrderedJudge:
+    """A task that names a line position must not be judged as a set."""
+
+    def test_no_positional_case_uses_a_set_judge(self, cases: list[E2ECase]) -> None:
+        offenders = [
+            c.id
+            for c in cases
+            if _POSITIONAL_TASK.search(c.task)
+            and c.id not in _ORDERED_CASES_LEFT_ALONE
+            and any(check["fn"] == "line_set_equals" for check in c.checks)
+        ]
+        assert not offenders, (
+            f"these cases state a line position but judge as a set, so a "
+            f"reordered answer passes: {offenders}"
+        )
+
+    def test_e2e_006_rejects_a_swapped_answer(self, tmp_path: Path) -> None:
+        """'第一行为 header, 第二行为 row' — a data.csv with the row first is wrong."""
+        checks = next(c.checks for c in load_cases(CASE_FILE) if c.id == "e2e-006")
+        _write(tmp_path, "data.csv", "x,1\nname,value\n")
+        assert not judge_case(checks[0]["fn"], tmp_path, checks[0]["args"])
+
+    def test_e2e_006_accepts_the_right_order(self, tmp_path: Path) -> None:
+        checks = next(c.checks for c in load_cases(CASE_FILE) if c.id == "e2e-006")
+        _write(tmp_path, "data.csv", "name,value\nx,1\n")
+        assert judge_case(checks[0]["fn"], tmp_path, checks[0]["args"])
+
+    def test_e2e_507_rejects_a_swapped_answer(self, tmp_path: Path) -> None:
+        """'第一行是行数, 第二行是函数个数' — 2 then 5 is not the same answer."""
+        checks = next(c.checks for c in load_cases(CASE_FILE) if c.id == "e2e-507")
+        _write(tmp_path, "STATUS.md", "2\n5\n")
+        assert not judge_case(checks[0]["fn"], tmp_path, checks[0]["args"])
+
+    def test_e2e_507_accepts_the_right_order(self, tmp_path: Path) -> None:
+        checks = next(c.checks for c in load_cases(CASE_FILE) if c.id == "e2e-507")
+        _write(tmp_path, "STATUS.md", "5\n2\n")
+        assert judge_case(checks[0]["fn"], tmp_path, checks[0]["args"])
