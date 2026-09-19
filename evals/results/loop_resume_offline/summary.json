@@ -1,0 +1,219 @@
+{
+  "LoopResumeRate": {
+    "numerator": 40,
+    "denominator": 50,
+    "value": 0.8,
+    "ci95_wilson": [
+      0.6696289406777459,
+      0.887562499842239
+    ]
+  },
+  "WorkspaceDriftDetectionRate": {
+    "numerator": 0,
+    "denominator": 10,
+    "value": 0.0,
+    "ci95_wilson": [
+      0.0,
+      0.2775327998628892
+    ]
+  },
+  "by_failpoint": {
+    "before_model": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0,
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ]
+    },
+    "before_tool": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0,
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ]
+    },
+    "after_tool": {
+      "numerator": 0,
+      "denominator": 10,
+      "value": 0.0,
+      "ci95_wilson": [
+        0.0,
+        0.2775327998628892
+      ]
+    },
+    "after_checkpoint": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0,
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ]
+    },
+    "truncate_tail": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0,
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ]
+    },
+    "workspace_drift": {
+      "numerator": 10,
+      "denominator": 10,
+      "value": 1.0,
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ]
+    }
+  },
+  "side_effects": {
+    "denominator": 50,
+    "redundant": 10,
+    "duplicated": 10,
+    "by_tool": {
+      "Bash": {
+        "redundant": 10,
+        "duplicated": 10
+      }
+    }
+  },
+  "failures": [
+    {
+      "case_id": "lr-after-tool#0",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#1",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#2",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#3",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#4",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#5",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#6",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#7",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#8",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-after-tool#9",
+      "failpoint": "after_tool",
+      "failpoint_reached": true,
+      "checkpoint_loaded": true,
+      "layers": {
+        "state": true,
+        "execution": false,
+        "workspace": true,
+        "task": false
+      },
+      "notes": []
+    }
+  ]
+}

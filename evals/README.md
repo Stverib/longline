@@ -692,12 +692,68 @@ State（哨兵真的写了、进程真的死了、checkpoint 载入、transcript
 
 因为 checkpoint 只在指令边界落盘，**指令 1 内部的任何杀点留下的磁盘状态是同一个**：
 只有 turn-0 那一行。于是 `before_model` / `before_tool` / `after_tool` 三个臂的恢复段
-**没有选择，只能重做整条指令**，`RedundantReExecutionRate` 因此是 100%。
-`DuplicateSideEffectRate` 则由工具是否幂等决定，不由运行时决定。
+**没有选择，只能重做整条指令**。
 
 **这就是本节最有价值的结论**：该运行时在一条指令执行期间**没有任何中途持久化**，
 中断落在指令内部会丢掉整条指令的全部工作——不只是「副作用没去重」，而是没有轮内 durability。
-`after_checkpoint` 臂是正向对照：指令 1 已完成并落盘时，恢复段**一次都不重放**。
+
+#### 实测结果（2026-09-19，6 故障点 × 10 重复 = 60 run，全离线）
+
+原始数据：`evals/results/loop_resume_offline/raw.jsonl`（60 行）与 `summary.json`。
+
+| 故障点 | 哨兵触发 | 恢复成功 | 副作用分母 | 重放 | 真翻倍 |
+|---|---:|---:|---:|---:|---:|
+| `before_model` | 10/10 | **10/10** | 0 | 0 | 0 |
+| `before_tool` | 10/10 | **10/10** | 0 | 0 | 0 |
+| `after_tool` | 10/10 | **0/10** | 10 | **10** | **10** |
+| `after_checkpoint` | 10/10 | **10/10** | 20 | 0 | 0 |
+| `truncate_tail` | 10/10 | **10/10** | 20 | 0 | 0 |
+| `workspace_drift` | 10/10 | 10/10（不进分母） | 0 | 0 | 0 |
+
+```text
+LoopResumeRate               = 40/50 = 80.0%   (95% Wilson: 67.0% – 88.8%)
+WorkspaceDriftDetectionRate  =  0/10 =  0.0%   (95% Wilson:  0.0% – 27.8%)
+```
+
+**60/60 哨兵真实触发。** 10 个种子全部用到（`distinct seeds = 0..9`）。
+
+#### 读这两个副作用指标时**必须逐臂**，聚合值会误导
+
+聚合是 `redundant = 10 / denominator = 50`，而 `duplicated = 10 / 50 = 20%`。
+**这个 20% 不该被引用**，因为三组臂对「副作用重复」的暴露程度**结构上不同**：
+
+- `before_model` / `before_tool` / `workspace_drift`：杀点在任何副作用**之前**，killed leg
+  没改过任何东西，**分母天然是 0**——它们**没机会**重复。
+- `after_checkpoint` / `truncate_tail`：分母 20（指令 1 的 `Edit` + `Bash` 追加），
+  而恢复段**正确地一次都不重放**，所以分子 0。
+- `after_tool`：分母 10，**10 次全部重放且全部真的翻倍**。
+
+把这三类加进一个分母，等于把「没机会重复」和「有机会但没重复」混在一起算。
+
+**正确的读法是逐臂**：`after_tool` 臂上，**故障前发生的副作用 100% 被重复执行、
+且 100% 真的二次生效**；其余臂要么无物可重复，要么零重放。
+
+`LoopResumeRate` 同理必须逐臂读：**它的 10 个失败全部来自 `after_tool`**，且每个都是一次
+真实的副作用翻倍——`NOTES.md` 里 `fixed-add` 出现了两次，`not_contains` 判据因此不过。
+这是**发现**，不是噪声。若失败分散在各臂，那才是脚手架有问题。
+
+#### 本轮由 60 次扫描（而非任何单次运行）抓出的检查器缺陷
+
+第一次扫描时 `after_checkpoint` 的 state 层 **10/10 全败**，把 `LoopResumeRate` 压到 30/50。
+根因是 `check_transcript_structure` 从 `recovery_worker` 抄来的一条规则：
+**「transcript 不得以 assistant 消息结尾」**。
+
+**这条规则在本套件里是错的。** `main.py` 每个 `run_turn()` 之后写一次 checkpoint，
+所以两次指令之间文件**正常地**以 assistant 的最终文本结尾——下一条用户消息会在下次
+`run_turn()` 前追加。`truncate_tail` 之所以没踩到纯属侥幸：尾行被截掉后恰好以
+`tool_result` 结尾。
+
+而它想防的情况（尾部 `tool_use` 无配对结果）**已经被配对检查覆盖**，删掉不丢东西。
+修复见 commit `982487d`，并有两条测试钉住新语义（以文本 assistant 结尾 → 通过；
+尾部未配对 `tool_use` → 仍然拒绝）。
+
+**这是同一个失败模式第三次出现**：检查器本身的语义错了，于是报出一个不存在的缺陷。
+**单次运行永远抓不到它**——只有 6×10 的矩阵让 10 个格同时红，才显出"这不是随机"。
 
 #### 局限（设计预测被推翻的部分）
 
@@ -724,6 +780,14 @@ uv run --extra dev python -c "import asyncio; from pathlib import Path; from lon
 ```
 
 全离线，零 API 花费。
+
+跑完整 60 run（约 6 分钟）：
+
+```bash
+uv run --extra dev python -c "import asyncio, json; from pathlib import Path; from longline.eval.loop_resume import load_loop_resume_cases; from longline.eval.loop_resume_runner import aggregate_loop_resume, run_loop_resume_suite; runs=asyncio.run(run_loop_resume_suite(load_loop_resume_cases(Path('evals/loop_resume.jsonl')), api_key='offline', fixtures_dir=Path('evals/fixtures'))); print(json.dumps(aggregate_loop_resume(runs).to_dict(), indent=2))"
+```
+
+**读结果前先读上面「必须逐臂」那一节。**
 
 ---
 
