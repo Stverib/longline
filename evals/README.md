@@ -905,6 +905,133 @@ FalseRejectRate         0/60             0/60   (分母 = 非 relevant-drift 的
 4. **无关漂移的检测依赖 git。** 非 git 目录下只能看见依赖文件的变化（自己记了哈希），
    看不见别的，`DriftReport.git_available` 会如实报 False。
 
+### 5.10 不可逆点：让「没跑过」和「跑了没回话」可区分（2026-09-19）
+
+§5.9 结论二记录的那个洞：`before_tool` 从 10/10 掉到 0/10。本节记录洞的准确形状、修法，
+以及修复过程中查出来的第二个问题——**两条臂的判分器恒真**。
+
+#### 洞的准确形状
+
+`PREPARED` 无 `COMMITTED` 这一个状态同时容纳两件事：
+
+- 工具进了 `execute`、跑完了、结果没回来（`after_tool` 的杀点）；
+- 工具**根本没开始**（`before_tool` 的杀点）。
+
+Bash 的效果读不回来，所以运行时对这两件事都只能说 `UNKNOWN`；而 `UNKNOWN` 的规则是
+**不重放**。于是第二种情况里，模型被告知「结果未知，没有重跑」——一个**可证明什么都没发生**
+的调用被判成不可恢复，任务静默地永远完不成。
+
+要点在于：这不是「保守一点的代价」。保守是**把未知当成未知**，而这里有一半是已知的：
+「shell 没有 spawn 过」完全可以判定，运行时只是没有把它记下来。
+
+#### 运行时改了什么
+
+| 机制 | 位置 | 作用 |
+| --- | --- | --- |
+| 不可逆点声明 | `Tool.mark_irreversible()` / `irreversible_point()` | 执行器在一次调用期间经 `ContextVar` 发布一个 marker；工具在**自己的**不可逆点报告它 |
+| 第三个状态 | `tool_journal.EXECUTING` | `PREPARED → EXECUTING → COMMITTED`，同样逐条 fsync |
+| 对账多一个事实 | `Tool.reconcile(input, *, started)` | `started` = 日志是否见过这次调用到达不可逆点 |
+| Bash 的答案 | `bash_tool.reconcile` | `started=False` → `NOT_APPLIED`（可重试）；`started=True` → `UNKNOWN`（不重试） |
+
+`BashTool` 把 `mark_irreversible()` 放在 `create_subprocess_shell` 的**上一行**：那之前全是
+校验，被拒绝的命令什么也没改；那之后 shell 里干了什么读不回来。
+
+用 `ContextVar` 而不是工具实例属性：流式执行器同时跑最多 10 个工具，属性会让一次调用的
+marker 落到另一次调用的记录上。也没有去改 `execute` 的签名——那会牵动每一个工具和每一个
+wrapper。
+
+#### 为什么默认值仍然保守（重要）
+
+`Tool.reconcile` 的默认值在 `started` 两种取值下**都是 `UNKNOWN`**。
+
+理由是：一个从不报告不可逆点的工具，它历史上**每一次**调用都是 `started=False`。如果默认值
+把 `started=False` 读成「证明没发生」，这个工具所有被打断的操作都会被放行重试——包括已经
+落地的那些。`FileEditTool` 就地写明了这个陷阱：它读回文件、忽略 `started`，因为对它而言那个
+标记只有 `False` 一种取值。
+
+所以**标记只对写了标记的工具有效**。这条约束由一个签名契约测试守住：`reconcile_pending`
+把任何异常都吞成 `UNKNOWN`，一个忘了新参数的旧 override 不会崩，只会静默地永远返回
+`UNKNOWN`——变成「某条恢复路径突然不灵了」，而不是一个报错。
+
+#### 这个写入是屏障，不是日志
+
+`PREPARE` / `COMMIT` 的失败被吞掉：会话目录写不了，不该成为用户的编辑不发生的理由。
+
+`mark_irreversible()` 的失败**不吞**：异常传进工具体内，工具放弃这次操作。吞掉它会留下
+「跑过了但没有标记」的 `PREPARED`，而「没有标记」正是授权重试的那个条件——吞掉它就等于把
+这个机制要防的重复副作用重新打开。`BashTool` 把它放在 `try` 内部，所以标记写不下去时 shell
+根本不会被 spawn。代价是一条命令会因为**记账失败**而拒绝执行，这是有意的取向了。
+
+#### 判分器缺陷：三条臂的 judge 恒真（与运行时无关）
+
+写这一节时发现的第二个问题。`lr-before-model`、`lr-before-tool`、`lr-truncate-tail` 三条臂
+的任务判定只有 `NOTES.md contains "fixed-add"`，**没有** duplicate guard——七条臂里只有
+`lr-after-tool` 与 `lr-after-checkpoint` 有。而前两条臂的 `den = 0`（故障前那条腿里没有任何
+改变状态的操作），所以 `DuplicateSideEffectRate` 的分母结构性为 0。
+
+两者叠加：`lr-before-model` 与 `lr-before-tool` 上**没有任何判据能把「追加了两次」判成失败**。
+10/10 在那种情况下依然成立。`lr-truncate-tail` 好一些——它的 `den = 20`，执行层能看见重放——
+但它的任务层同样看不见。
+
+修法是把 `"not_contains":"(?s)fixed-add.*fixed-add"` 补到这三条臂的 judge 上，然后**两个
+cell 全部重跑**（`loop_resume_v5_*`）。判分器只收紧、不放松，所以这不是把数字改好看，而是把
+一个原先不可能失败的判据变成可以失败的。
+
+> **状态：这一轮重跑被中断，结果待补。** 重跑命令被后台任务的内存回收杀掉（系统内存告急，
+> 与本命令自身的开销无关）。因此下面「实测结果」一节暂时只有 `loop_resume_v3_*` 那一次的数
+> 字，而它是在**旧判据**下取的。
+
+补第三条臂这件事本身就是那个检查生效的证据：先把 `after_tool` 的单臂测试改成「凡检查
+`NOTES.md` 内容的臂都必须带 duplicate guard」，它立刻把 `lr-truncate-tail` 指了出来。
+
+同一类问题也在集成测试里：`test_the_before_tool_arm_retries_only_the_step_that_never_ran`
+断言了 `den == 0`、`duplicates == 0`、结构完整、没有冗余重放——**这些在一个「什么都没干成」
+的运行上全部成立**，所以它在 `before_tool` 是 0/10 的那段时间里一直是绿的。已补上
+`layer_task_ok`。「没造成伤害」和「把活干完了」是两个不同的断言，原先只查了前一个。
+
+#### 实测结果
+
+after 列取自 `loop_resume_v3_durability`（7 臂 × 10 = 70 run，`problems = []`，即 70/70 哨兵
+真实触发），**判据是收紧之前的**。before 列沿用 §5.9 的消融 cell，同样没有在新判据下重跑。
+
+| 臂 | before（消融） | after | after `den` | after `dup` | after `redun` |
+| --- | --- | --- | --- | --- | --- |
+| `before_model` | 10/10 | 10/10 | 0 | 0 | 0 |
+| `before_tool` | 10/10 | **10/10**（§5.9 是 0/10） | 0 | 0 | 0 |
+| `after_tool` | 0/10 | 10/10 | 10 | 0 | 0 |
+| `after_checkpoint` | 10/10 | 10/10 | 20 | 0 | 0 |
+| `truncate_tail` | 10/10 | 10/10 | 20 | 0 | 0 |
+| `workspace_drift`（检测） | 拒绝 0/10 | 拒绝 10/10 | — | — | — |
+| `workspace_drift_unrelated`（检测） | 拒绝 0/10 | 拒绝 0/10 | — | — | — |
+
+```
+指标                    before(消融)     after(v3)
+LoopResumeRate          40/50            50/50
+DriftRecall             0/10             10/10
+FalseRejectRate         0/60             0/60
+```
+
+**这套数字支持什么、不支持什么**，逐条写清：
+
+- **支持**：`before_tool` 从 0/10 回到 10/10。恢复段确实重跑了那个没跑过的调用——不重跑的话
+  `NOTES.md` 里不会有 `fixed-add`，而这条判据在改动前正是失败的那一条。
+- **支持**：`after_tool` 的 10/10 没有被这次改动换掉，70 次运行里 `dup = 0`、`redun = 0`。
+  即：**没有一条臂是靠放行一次重复副作用换来分数的**。
+- **不支持**：「重跑恰好发生了一次」。`before_tool` 的 `den = 0`，所以 `DuplicateSideEffectRate`
+  的结构性分母是 0，而旧的任务判据只有 `contains`——两处都看不见「追加了两次」。要支持这个
+  说法必须在收紧后的判据下重跑，这正是被中断的那一轮。
+
+#### 局限
+
+1. **「没跑过就重试」只对写了标记的工具成立。** 换一个工具（比如某个 HTTP 工具），它要么自己
+   报告不可逆点，要么在 `reconcile` 里读回自己的效果；**没有第三种免费的写法**。忘掉这一步的
+   工具不会报错，只会永远返回 `UNKNOWN`——由那个签名契约测试挡住一部分，但挡不住「写了
+   override 却忘了调 `mark_irreversible()`」。
+2. **标记写失败会让命令拒绝执行。** 这是有意的（屏障而非日志），但它把「记账可用性」放进了
+   「命令能否执行」的因果链里。盘满或会话目录只读时，Bash 会返回错误而不是照常运行。
+3. **Bash 改变的文件的漂移，看起来像无关漂移**（同 §5.9 局限 2，未变）。
+4. **无关漂移的检测依赖 git**（同 §5.9 局限 4，未变）。
+
 ---
 
 ## 6. 冻结的历史数据（2026-09-15）

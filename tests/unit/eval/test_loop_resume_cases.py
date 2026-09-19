@@ -149,21 +149,34 @@ def test_every_dataset_case_names_the_cwd_placeholder() -> None:
         assert "<cwd>" in case.task, f"{case.id} does not name <cwd>"
 
 
-def test_the_after_tool_case_checks_that_the_append_did_not_double() -> None:
+def test_every_case_that_checks_the_append_can_see_it_double() -> None:
     """The task layer must be able to see a duplicated side effect.
 
     `contains: fixed-add` alone is satisfied by a file with the line twice, so
-    without the `not_contains` the after_tool arm would report task success for
-    exactly the outcome the execution layer is measuring.
+    without the `not_contains` an arm reports task success for exactly the outcome
+    the execution layer is measuring.
+
+    Written for `after_tool` alone, and that was too narrow: `before_model` and
+    `before_tool` scored 0 on `den` -- nothing state-changing happened in the
+    killed leg -- which also zeroes `DuplicateSideEffectRate`'s denominator. So
+    for those two the task judge was the ONLY thing that could have caught a
+    double append, and it could not. A run of the whole matrix came back 10/10 on
+    an arm whose judge no input could fail, which is the shape of a number that
+    means nothing.
     """
-    grouped = cases_by_failpoint(load_loop_resume_cases(DATASET))
-    checks = grouped["after_tool"][0].checks
-    notes_checks = [
-        c for c in checks
-        if c["args"].get("path") == "NOTES.md"
-    ]
-    assert notes_checks, "the after_tool case does not check NOTES.md"
-    assert "not_contains" in notes_checks[0]["args"]
+    checked = 0
+    for case in load_loop_resume_cases(DATASET):
+        notes_checks = [
+            check for check in case.checks if check["args"].get("path") == "NOTES.md"
+        ]
+        for check in notes_checks:
+            assert "not_contains" in check["args"], (
+                f"{case.id} checks NOTES.md content without a duplicate guard"
+            )
+            checked += 1
+    # Guards the sweep itself: a dataset whose paths changed would make the loop
+    # vacuous and green, which is the failure this test exists to prevent.
+    assert checked >= 5, f"only {checked} cases asserted NOTES.md content"
 
 
 def test_the_workspace_drift_case_does_not_assert_notes_content() -> None:

@@ -120,6 +120,7 @@ def test_the_after_tool_arm_does_not_replay_its_side_effect(runs: list) -> None:
     assert run.redundant_re_executions == 0, (
         "the resumed leg re-issued the Bash call at all, even without doubling"
     )
+    assert run.layer_task_ok, f"the task was not finished: {run.judge_detail}"
 
 
 def test_the_after_checkpoint_arm_replays_nothing(runs: list) -> None:
@@ -142,11 +143,21 @@ def test_the_before_tool_arm_retries_only_the_step_that_never_ran(runs: list) ->
     and redid the whole instruction. With step-level checkpoints the transcript
     carries the Read that DID complete, so the resumed leg starts at the Bash
     call -- one step re-issued, not three.
+
+    `layer_task_ok` is the assertion that matters here, and it was MISSING: this
+    test passed while the arm was scoring 0/10. Every metric it did assert --
+    denominator, duplicates, structural state -- is satisfied by a run that
+    duplicates nothing because it never got anything done. "Did no harm" and "did
+    the job" are different claims, and only one of them was being checked.
     """
     run = _by_failpoint(runs, "before_tool")
     assert run.side_effect_denominator == 0, "nothing state-changing preceded the gate"
     assert run.duplicate_side_effects == 0
     assert run.layer_state_ok, run.structural_errors
+    assert run.layer_task_ok, (
+        "the resumed leg never retried the call that provably never ran, so the task "
+        f"was left unfinished: {run.judge_detail}"
+    )
 
 
 def test_the_dependent_drift_arm_is_refused(runs: list) -> None:
