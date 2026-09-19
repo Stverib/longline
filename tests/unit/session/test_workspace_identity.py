@@ -28,6 +28,7 @@ from longline.session.workspace_identity import (
     classify_drift,
     current_git_head,
 )
+from longline.tools.base import ReconcileOutcome
 from longline.utils.hashing import sha256_file
 
 
@@ -237,3 +238,156 @@ def test_changed_paths_lists_an_untracked_file(tmp_path: Path) -> None:
     _git(tmp_path, "init")
     (tmp_path / "new.txt").write_text("x\n", encoding="utf-8")
     assert changed_paths(tmp_path) == {str((tmp_path / "new.txt").resolve())}
+
+
+# --- an interrupted write is the session's own change, not drift ---
+#
+# Found by the task-diversity suite, whose `after_tool` arms stop inside an Edit.
+# Every other after-write arm in the old suite stopped inside a Bash call, and
+# Bash declares no workload -- so its file could never be in the read set and the
+# same situation was classified `unrelated`. The tool choice hid it.
+
+NL = chr(10)
+
+
+_OUTCOME = {
+    "RECONCILED": ReconcileOutcome.APPLIED,
+    "ABORTED": ReconcileOutcome.NOT_APPLIED,
+    "INDETERMINATE": ReconcileOutcome.UNKNOWN,
+}
+
+
+def _interrupted_write(journal_dir: Path, repo: Path, path: Path) -> ToolJournal:
+    """A journal whose committed op READ `path`, then prepared an Edit of it."""
+    journal = _identity(journal_dir, repo, touched={str(path): "read"})
+    journal.prepare(
+        turn_id=1,
+        tool_call_id="tu-2",
+        tool_name="Edit",
+        tool_input={},
+        workload={str(path): "write"},
+    )
+    return journal
+
+
+def _resolve_last(journal: ToolJournal, status: str) -> None:
+    journal.resolve(
+        journal.records()[-1].operation_id, status=status, outcome=_OUTCOME[status]
+    )
+
+
+def test_a_verified_applied_write_is_not_drift(tmp_path: Path, repo: Path) -> None:
+    """The session read the file, edited it, and died inside the edit.
+
+    The edit landed but never COMMITTED, so the write set has no record of it and
+    the read set still carries the digest from before. The old rule called that a
+    moved dependency and REFUSED the resume -- so a crash inside an edit made the
+    session permanently unresumable, refused for having done the thing it was
+    asked to do.
+
+    What earns the resume here is that reconciliation ASKED: on the way back the
+    runtime ran `Edit.reconcile`, which found the new text and not the old one.
+    That verdict is the evidence.
+    """
+    path = repo / "src" / "calc.py"
+    journal = _interrupted_write(tmp_path, repo, path)
+    path.write_text("return a + b" + NL, encoding="utf-8")   # the edit landed
+    _resolve_last(journal, "RECONCILED")
+
+    report = _classify(journal, repo)
+    assert report.verdict is DriftVerdict.CLEAN
+    assert not report.rejected
+    assert [Path(p).name for p in report.verified_applied] == ["calc.py"]
+
+
+def test_an_unverified_interrupted_write_settles_nothing(
+    tmp_path: Path, repo: Path
+) -> None:
+    """INDETERMINATE is what a tool that cannot read its own effect answers, and
+    it must not authorise the resume. This is the Bash case: the file changed,
+    but nobody can say who changed it."""
+    path = repo / "src" / "calc.py"
+    journal = _interrupted_write(tmp_path, repo, path)
+    path.write_text("return a + b" + NL, encoding="utf-8")
+    _resolve_last(journal, "INDETERMINATE")
+
+    report = _classify(journal, repo)
+    assert report.verdict is DriftVerdict.RELEVANT
+    assert report.verified_applied == []
+
+
+def test_an_aborted_write_settles_nothing(tmp_path: Path, repo: Path) -> None:
+    """ABORTED is the arm that keeps the drift benchmark honest.
+
+    `Edit.reconcile` answers NOT_APPLIED by finding the OLD text still intact --
+    which is exactly what the dependent-drift arm looks like, because its Edit is
+    interrupted BEFORE it runs and the parent then appends to the same file. An
+    earlier version of this rule settled any interrupted write whose file had
+    changed, and it passed every recovery test while silently masking that arm.
+    """
+    path = repo / "src" / "calc.py"
+    journal = _interrupted_write(tmp_path, repo, path)
+    path.write_text(
+        "return a - b" + NL + "# drifted-by-another-writer" + NL, encoding="utf-8"
+    )
+    _resolve_last(journal, "ABORTED")
+
+    report = _classify(journal, repo)
+    assert report.verdict is DriftVerdict.RELEVANT, "an injected drift was masked"
+    assert report.rejected
+    assert report.verified_applied == []
+
+
+def test_somebody_elses_edit_is_still_refused(tmp_path: Path, repo: Path) -> None:
+    """No write operation in flight at all: a file the session READ, changed by
+    anyone, is a stale premise. If this ever passes, the check has stopped."""
+    path = repo / "src" / "calc.py"
+    journal = _identity(tmp_path, repo, touched={str(path): "read"})
+    path.write_text("return a * b" + NL, encoding="utf-8")
+
+    report = _classify(journal, repo)
+    assert report.verdict is DriftVerdict.RELEVANT
+    assert report.rejected
+    assert report.verified_applied == []
+
+
+def test_a_verified_write_does_not_excuse_another_file(
+    tmp_path: Path, repo: Path
+) -> None:
+    """Settling the session's own write must not settle anything else: it
+    explains one path, and only that path."""
+    written = repo / "src" / "calc.py"
+    read = repo / "NOTES.md"
+    journal = _identity(tmp_path, repo, touched={str(read): "read"})
+    journal.prepare(
+        turn_id=1,
+        tool_call_id="tu-2",
+        tool_name="Edit",
+        tool_input={},
+        workload={str(written): "write"},
+    )
+    written.write_text("return a + b" + NL, encoding="utf-8")
+    read.write_text("# Notes" + NL + "somebody else" + NL, encoding="utf-8")
+    _resolve_last(journal, "RECONCILED")
+
+    report = _classify(journal, repo)
+    assert report.verdict is DriftVerdict.RELEVANT
+    assert [Path(p).name for p in report.relevant] == ["NOTES.md"]
+
+
+def test_an_untracked_directory_is_reported_as_its_files(
+    tmp_path: Path, repo: Path
+) -> None:
+    """`git status` collapses a wholly-untracked directory to the directory.
+
+    The set it is compared against holds FILE paths, so a file the session just
+    created inside such a directory matched nothing and was reported as somebody
+    else's unrelated change. Listing every file makes the two sides comparable.
+    """
+    (repo / "generated").mkdir()
+    (repo / "generated" / "new.py").write_text("X = 1" + NL, encoding="utf-8")
+    changed = changed_paths(repo)
+    assert changed is not None
+    names = sorted(Path(p).name for p in changed)
+    assert "new.py" in names, names
+    assert "generated" not in names, "the directory was reported instead of its file"

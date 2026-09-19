@@ -71,7 +71,7 @@ from longline.eval.faults import sha256_file
 from longline.eval.judges import judge_case
 from longline.eval.leg_cost import COST_FIELDS, LegCost, mean_cost
 from longline.eval.leg_cost import saving as saving_ratio
-from longline.eval.loop_resume import SEED_A_PLACEHOLDER, SEED_B_PLACEHOLDER, SEED_PLACEHOLDER
+from longline.eval.loop_resume import SEED_OPERANDS, SEED_VALUES
 from longline.eval.loop_resume_worker import JOURNAL_NAME, SESSION_ID
 from longline.eval.metrics import Ratio
 from longline.eval.side_effect_journal import (
@@ -102,17 +102,10 @@ SANDBOX_PREFIX = "loop-resume-sandbox-"
 # with a reason, not a suite that never finishes.
 WORKER_TIMEOUT_S = 180
 
-# The workspace layer's question: "is the repository left in a working state",
-# asked with the fixture's OWN test suite rather than with the case's checks.
-# The case's checks say whether the task was done; this says whether the code
-# still runs, which a resume that half-applied an edit would break.
-WORKSPACE_TEST_ARGS: dict[str, Any] = {
-    "command": ["python", "-m", "pytest", "tests/test_calc.py", "-q"],
-    "allowed_commands": ["python"],
-    "path": "tests/test_calc.py",
-    "test": "add",
-    "scope": "sandbox",
-}
+# The workspace layer's question: "is the repository left in a working state?"
+# The command is the CASE's now (`Scenario.workspace_test`), because the five
+# tasks in the diversity suite have five different fixtures and a single
+# hardcoded `tests/test_calc.py` would have made four of them unrunnable.
 
 
 @dataclass
@@ -142,6 +135,9 @@ class LoopResumeRun:
     false_reject: bool = False
     workspace_relevant: list[str] = field(default_factory=list)
     workspace_unrelated: list[str] = field(default_factory=list)
+    # Files whose interrupted write the tool verified it had applied. Not drift,
+    # and verified rather than assumed -- see `workspace_identity`.
+    workspace_verified_applied: list[str] = field(default_factory=list)
     resume_latency_ms: float = 0.0
     # What this run's two legs cost. `resume_cost` is always present (a refused
     # resume costs zero, which is a fact about it); `restart_cost` is None unless
@@ -184,6 +180,7 @@ class LoopResumeRun:
             "false_reject": self.false_reject,
             "workspace_relevant": self.workspace_relevant,
             "workspace_unrelated": self.workspace_unrelated,
+            "workspace_verified_applied": self.workspace_verified_applied,
             "resume_latency_ms": self.resume_latency_ms,
             "resume_cost": self.resume_cost.to_dict(),
             "restart_cost": (
@@ -455,47 +452,53 @@ def _snapshot_artifacts(sandbox: Path, artifacts: Sequence[str]) -> dict[str, st
     return {rel: sha256_file(sandbox / rel) for rel in artifacts}
 
 
-def apply_seed(sandbox: Path, seed: int) -> None:
+def apply_seed(
+    sandbox: Path, seed: int, files: Sequence[tuple[str, Sequence[str]]]
+) -> None:
     """Make this run's starting state different from its siblings'.
 
-    Varies only what the case's checks and the scripted scenario do not pin: a
-    header line in NOTES.md, and the operands in the fixture's own test. The
+    Varies only what the case's checks and the scripted scenario do not pin. The
     Edit's `old_string` and every judge stay identical, so the seed makes the
     INPUT different without making the OUTCOME different.
 
-    That is the honest scope of what a repeat count buys here: "60 runs, 0
-    counterexamples" is a statement about 60 fixtures rather than about one
-    fixture sixty times. It is still not a distribution, and reporting it as a
-    rate would be wrong -- the module docstring of `loop_resume` says so.
+    That is the honest scope of what a repeat count buys here: "100 runs, 0
+    counterexamples" is a statement about 100 fixtures rather than about one
+    fixture a hundred times. It is still not a distribution, and reporting it as
+    a rate would be wrong -- the module docstring of `loop_resume` says so.
+
+    WHICH files carry placeholders is the case's data, not a convention here. The
+    five tasks in the diversity suite have different shapes, and the hardcoded
+    pair this used to substitute would have forced every one of them to grow a
+    `tests/test_calc.py`.
 
     Raises rather than quietly substituting nothing when a placeholder is
     missing: a fixture that lost them would make every repeat byte-identical,
     and the suite would look like it had sampled when it had not.
-    """
-    notes = sandbox / "NOTES.md"
-    test = sandbox / "tests" / "test_calc.py"
-    a, b = 2 + seed, 3 + seed
-    # b must not be 0, or the buggy `a - b` would already satisfy the test and
-    # the arm would pass without the fix -- measured by the `not_contains` on
-    # the fixed line, which would then never be exercised.
-    if b == 0:  # pragma: no cover - unreachable for the seeds the dataset produces
-        raise FailpointError(f"seed {seed} would make the fixture's test vacuous")
 
-    for path, replacements in (
-        (notes, {SEED_PLACEHOLDER: str(seed)}),
-        (test, {SEED_A_PLACEHOLDER: str(a), SEED_B_PLACEHOLDER: str(b)}),
-    ):
+    Written as BYTES. `Path.write_text` translates `\\n` to `os.linesep`, which on
+    Windows hands the scenario a CRLF file -- and an `Edit` whose `old_string`
+    uses `\\n` then matches nothing, so the arm's fix silently stops applying while
+    every metric still reports a clean run.
+    """
+    for rel, placeholders in files:
+        path = sandbox / rel
         if not path.is_file():
-            raise FailpointError(f"the fixture is missing {path.name}")
+            raise FailpointError(f"the fixture is missing {rel}")
         text = path.read_text(encoding="utf-8")
-        for placeholder, value in replacements.items():
+        for placeholder in placeholders:
+            value = SEED_VALUES[placeholder](seed)
+            # Only the operands: a zero there can make a fixture's bug
+            # accidentally correct, which would leave the workspace layer
+            # vacuous for that seed. `<seed>` is a label and may be "0".
+            if placeholder in SEED_OPERANDS and value == "0":
+                raise FailpointError(f"seed {seed} makes {placeholder} in {rel} zero")
             if placeholder not in text:
                 raise FailpointError(
-                    f"{path.name} does not carry {placeholder!r}; without it every "
-                    "repeat would start from a byte-identical fixture"
+                    f"{rel} does not carry {placeholder!r}; without it every repeat "
+                    "would start from a byte-identical fixture"
                 )
             text = text.replace(placeholder, value)
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text.encode("utf-8"))
 
 
 def drift_the_workspace(sandbox: Path) -> None:
@@ -725,7 +728,7 @@ async def run_loop_resume_case(
     try:
         if case.fixture:
             shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
-        apply_seed(sandbox, case.seed)
+        apply_seed(sandbox, case.seed, scenario.seed_files)
         # After the seed, so the fixture's initial commit contains the seeded
         # content and the tree starts dirty only if the RUNTIME made it dirty.
         _init_workspace_repo(sandbox)
@@ -822,6 +825,9 @@ async def run_loop_resume_case(
             ),
             workspace_relevant=[str(p) for p in resumed.get("workspace_relevant", [])],
             workspace_unrelated=[str(p) for p in resumed.get("workspace_unrelated", [])],
+            workspace_verified_applied=[
+                str(p) for p in resumed.get("verified_applied", [])
+            ],
             resume_latency_ms=resume_ms,
             resume_cost=LegCost.from_dict(resumed.get("cost")),
             restart_cost=restart_cost,
@@ -876,7 +882,7 @@ def _run_restart_baseline(
     try:
         if case.fixture:
             shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
-        apply_seed(sandbox, case.seed)
+        apply_seed(sandbox, case.seed, _scenario_of(case).seed_files)
         _init_workspace_repo(sandbox)
         spec = _build_spec(
             case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key,
@@ -933,7 +939,6 @@ __all__ = [
     "DETECTION_FAILPOINTS",
     "PER_CASE_FIELDS",
     "RELEVANT_DRIFT_FAILPOINTS",
-    "WORKSPACE_TEST_ARGS",
     "LoopResumeRun",
     "LoopResumeSummary",
     "RestartVsResume",

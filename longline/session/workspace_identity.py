@@ -46,6 +46,11 @@ class DriftReport:
     verdict: DriftVerdict
     relevant: list[str] = field(default_factory=list)
     unrelated: list[str] = field(default_factory=list)
+    # Files whose interrupted write the TOOL verified it had applied, and which
+    # are therefore this session's own revision rather than drift. Named apart
+    # from `relevant`/`unrelated` because they were settled by evidence, and a
+    # reader should be able to see which files that applied to.
+    verified_applied: list[str] = field(default_factory=list)
     git_head_changed: bool = False
     git_available: bool = False
 
@@ -81,9 +86,16 @@ def changed_paths(root: Path) -> set[str] | None:
     `--porcelain` includes untracked files, which matters: a file another writer
     just created is a change to the workspace even though no tracked content
     moved.
+
+    `--untracked-files=all` matters for the same reason, one level down. Without
+    it git collapses a wholly-untracked directory to the DIRECTORY (`?? src/`),
+    and the caller compares this set against recorded FILE paths -- so a file the
+    session itself just created inside a new directory matched nothing and was
+    reported as somebody else's unrelated change. Listing every file makes the
+    two sides comparable.
     """
     root = Path(root)
-    proc = _git(root, "status", "--porcelain")
+    proc = _git(root, "status", "--porcelain", "--untracked-files=all")
     if proc is None:
         return None
     out: set[str] = set()
@@ -104,6 +116,63 @@ __all__ = [
     "classify_drift",
     "current_git_head",
 ]
+
+
+def _verified_applied_writes(
+    records: Sequence[OperationRecord],
+) -> dict[str, str]:
+    """Files whose interrupted write the TOOL verified landed, and their revision.
+
+    A write that was interrupted has no `post_state`, so `workspace_from_records`
+    leaves it out. That is right as far as it goes -- substituting the operation's
+    `pre_state` would compare the world against a revision the session never
+    claimed. But leaving it out entirely has a cost the old suite could not see:
+    the file is still in the READ set (the session read it before editing it), so
+    its digest no longer matching reads as `RELEVANT` and the resume is REFUSED.
+    A crash inside an edit made the session permanently unresumable, refused for
+    having done the very thing it was asked to do.
+
+    **Reconciliation is the evidence, and the only evidence that will do.** When
+    the process came back, `reconcile_pending` asked the tool whether its effect
+    was present. A tool that can read its own effect answers, and `RECONCILED`
+    means it looked and found it. The revision on disk is then attributable to
+    this session, and comparing it against itself is not the vacuous move the
+    read side would be -- the verification is what makes it meaningful.
+
+    `ABORTED` and `INDETERMINATE` settle nothing, and that is the whole point.
+    `Edit.reconcile` answers `NOT_APPLIED` by finding the OLD text still intact,
+    which is exactly what an injected drift on an edit that never ran looks like;
+    settling there would mask the drift this check exists to catch. `Bash` cannot
+    read its own effect at all and answers `INDETERMINATE`, so it never settles
+    either -- its file stays classified as somebody else's change, which is the
+    documented limitation rather than a new one.
+
+    An earlier version of this settled any interrupted write whose file had
+    changed, on the reasoning that the session's own write is the likely
+    explanation. It passed every recovery test and broke
+    `test_the_dependent_drift_arm_is_refused`: the arm's Edit is interrupted
+    BEFORE it runs, the parent then appends to the same file, and "the digest
+    moved" cannot tell those apart. Verification can.
+    """
+    from longline.session.tool_journal import PREPARED, RECONCILED
+
+    starts: dict[str, OperationRecord] = {}
+    latest: dict[str, str] = {}
+    for record in records:
+        if record.status == PREPARED:
+            # First start wins, as in `workspace_from_records`: a retried call is
+            # a new operation with its own id.
+            starts.setdefault(record.operation_id, record)
+        latest[record.operation_id] = record.status
+
+    settled: dict[str, str] = {}
+    for operation_id, start in starts.items():
+        if latest.get(operation_id) != RECONCILED:
+            continue
+        for path, mode in start.access.items():
+            if mode == "write":
+                settled[path] = sha256_file(Path(path))
+    return settled
 
 
 def classify_drift(
@@ -129,11 +198,14 @@ def classify_drift(
         return DriftReport(verdict=DriftVerdict.CLEAN, git_available=False)
 
     read_set, write_set = workspace_from_records(records)
+    # Last, so a write the tool verified it applied wins over the digest the READ
+    # set carries for the same path: the read is the older claim.
+    verified = _verified_applied_writes(records)
     # Resolved on this side too: `changed_paths` reports resolved paths, and a
     # set difference between two spellings of the same file is a silent miss.
     recorded = {
         str(Path(path).resolve()): digest
-        for path, digest in {**read_set, **write_set}.items()
+        for path, digest in {**read_set, **write_set, **verified}.items()
     }
 
     pinned_head = header.get("git_head")
@@ -153,6 +225,7 @@ def classify_drift(
             verdict=DriftVerdict.RELEVANT,
             relevant=relevant,
             unrelated=unrelated,
+            verified_applied=sorted(verified),
             git_head_changed=head_changed,
             git_available=changed is not None,
         )
@@ -160,6 +233,11 @@ def classify_drift(
         return DriftReport(
             verdict=DriftVerdict.UNRELATED,
             unrelated=unrelated,
+            verified_applied=sorted(verified),
             git_available=True,
         )
-    return DriftReport(verdict=DriftVerdict.CLEAN, git_available=changed is not None)
+    return DriftReport(
+        verdict=DriftVerdict.CLEAN,
+        verified_applied=sorted(verified),
+        git_available=changed is not None,
+    )
