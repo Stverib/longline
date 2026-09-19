@@ -94,10 +94,44 @@ def test_sentinel_survives_the_writer_being_killed(tmp_path: Path) -> None:
     assert read_sentinel(tmp_path) is not None
 
 
-def test_terminate_and_reap_reports_false_for_an_already_dead_child() -> None:
+def test_terminate_and_reap_reports_true_for_an_already_dead_child() -> None:
+    """The boolean answers "is it gone", not "did we kill it".
+
+    This is `_kill_child`'s contract, which returned `proc.returncode is not
+    None` before this function existed. A child that exited on its own is just
+    as gone, and reporting False here would silently change `SessionResumeRate`
+    the moment a kill raced a child that had already stopped.
+    """
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait(timeout=30)
-    assert terminate_and_reap(proc) is False
+    assert terminate_and_reap(proc) is True
+
+
+def test_terminate_and_reap_kills_a_live_child() -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        assert terminate_and_reap(proc) is True
+    finally:
+        if proc.poll() is None:  # pragma: no cover - terminate_and_reap failed
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_terminate_and_reap_accepts_an_explicit_signal() -> None:
+    """`_kill_child` has an optional-signal branch, and the extraction has to
+    carry it or the two callers stop being equivalent."""
+    import signal
+
+    sig = getattr(signal, "SIGTERM", None)
+    if sig is None:  # pragma: no cover - Windows has no SIGTERM in the POSIX sense
+        return
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        assert terminate_and_reap(proc, signal_num=sig) is True
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_wait_for_sentinel_times_out(tmp_path: Path) -> None:

@@ -69,6 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from longline.eval.failpoints import terminate_and_reap
 from longline.eval.faults import (
     ALL_FAULTS,
     PROCESS_KILL,
@@ -950,16 +951,14 @@ def _kill_child(
             if time.monotonic() >= deadline:
                 break
 
-        if signal_num is None:
-            proc.terminate()
-        else:
-            proc.send_signal(signal_num)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-        return proc.returncode is not None
+        # The kill-and-reap sequence is shared with the loop-resume suite's
+        # failpoint gate. The two differ in how they WAIT for the child -- a
+        # fixed delay here, a sentinel file there -- and not in how they end
+        # it, so a platform fix should land in both. This is a pure
+        # extraction: `terminate_and_reap` performs the exact sequence that
+        # used to be inline, including returning True for a child that had
+        # already exited, and `SessionResumeRate` must not move because of it.
+        return terminate_and_reap(proc, grace_s=10.0, signal_num=signal_num)
     finally:
         if proc.poll() is None:
             proc.kill()

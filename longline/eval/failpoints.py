@@ -348,25 +348,37 @@ class GatedTool(Tool):
 # --- process control ---
 
 
-def terminate_and_reap(proc: subprocess.Popen[Any], *, grace_s: float = 10.0) -> bool:
-    """Terminate a live child and reap it. True when it really ended.
+def terminate_and_reap(
+    proc: subprocess.Popen[Any],
+    *,
+    grace_s: float = 10.0,
+    signal_num: int | None = None,
+) -> bool:
+    """End a child process and reap it. True when it is no longer running.
 
-    Shared with `recovery_runner._kill_child`, which waits for its child by a
-    fixed delay while this suite waits for a sentinel -- the wait differs, the
-    kill does not, so only the kill lives here.
+    The boolean answers "is the child gone", NOT "did we kill it": a child that
+    exited on its own between the caller's check and this call is just as gone,
+    and that is the question both callers ask. `recovery_runner._kill_child`
+    has returned exactly this since before this function existed, and the
+    extraction is behaviour-preserving down to that edge case.
+
+    `signal_num` reproduces `_kill_child`'s optional-signal branch: when it is
+    given, that signal is sent instead of the platform's `terminate()`.
     """
-    if proc.poll() is not None:
-        return False
-    try:
-        proc.terminate()
+    if proc.poll() is None:
         try:
-            proc.wait(timeout=grace_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=grace_s)
-    except OSError:  # pragma: no cover - the child died between poll and kill
-        pass
-    return proc.returncode is not None
+            if signal_num is None:
+                proc.terminate()
+            else:
+                proc.send_signal(signal_num)
+            try:
+                proc.wait(timeout=grace_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=grace_s)
+        except OSError:  # pragma: no cover - died between poll and signal
+            pass
+    return proc.poll() is not None
 
 
 def truncate_last_line(path: Path) -> int:
