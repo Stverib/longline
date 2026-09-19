@@ -103,8 +103,17 @@ def _sandbox(tmp_path: Path, *, seed: int = 0) -> Path:
 
     sandbox = tmp_path / "sandbox"
     shutil.copytree(FIXTURE, sandbox)
-    apply_seed(sandbox, seed)
+    apply_seed(sandbox, seed, _seed_files())
     return sandbox
+
+
+def _seed_files():
+    """The dataset's own seed declaration -- see `_canonical_scenario` for why
+    this file reads the dataset instead of restating what is in it."""
+    cases = cases_by_failpoint(load_loop_resume_cases(DATASET))
+    scenario = cases["after_tool"][0].scenario
+    assert scenario is not None
+    return scenario.seed_files
 
 
 def _spec(tmp_path: Path, sandbox: Path, failpoint: str, **overrides: Any) -> dict[str, Any]:

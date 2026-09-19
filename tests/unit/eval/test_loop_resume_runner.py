@@ -148,6 +148,18 @@ def test_aggregate_merges_the_per_tool_breakdown() -> None:
     assert summary.side_effects.by_tool["Bash"] == {"redundant": 2, "duplicated": 1}
 
 
+def _seed_files():
+    """The DATASET's seed declaration, not a copy of it.
+
+    Which files carry placeholders is the case's data now, so a list written out
+    here would keep these tests green after the dataset moved its seed somewhere
+    else -- and the thing under test is what the dataset says.
+    """
+    case = cases_by_failpoint(load_loop_resume_cases(DATASET))["after_tool"][0]
+    assert case.scenario is not None
+    return case.scenario.seed_files
+
+
 def test_apply_seed_makes_two_runs_start_from_different_fixtures(tmp_path: Path) -> None:
     """The seed must actually reach the sandbox, not just the case object."""
     import shutil
@@ -158,7 +170,7 @@ def test_apply_seed_makes_two_runs_start_from_different_fixtures(tmp_path: Path)
     for seed in (0, 7):
         sandbox = tmp_path / f"s{seed}"
         shutil.copytree(FIXTURES / "resume_repo", sandbox)
-        apply_seed(sandbox, seed)
+        apply_seed(sandbox, seed, _seed_files())
         texts.append(
             (
                 (sandbox / "NOTES.md").read_text(encoding="utf-8"),
@@ -187,7 +199,7 @@ def test_apply_seed_leaves_the_scenarios_edit_target_intact(tmp_path: Path) -> N
 
     sandbox = tmp_path / "s"
     shutil.copytree(FIXTURES / "resume_repo", sandbox)
-    apply_seed(sandbox, 3)
+    apply_seed(sandbox, 3, _seed_files())
     calc = (sandbox / "src" / "calc.py").read_text(encoding="utf-8")
     case = cases_by_failpoint(load_loop_resume_cases(DATASET))["after_tool"][0]
     assert case.scenario is not None
@@ -211,7 +223,7 @@ def test_apply_seed_keeps_the_fixtures_test_failing_before_the_fix(tmp_path: Pat
 
     sandbox = tmp_path / "s"
     shutil.copytree(FIXTURES / "resume_repo", sandbox)
-    apply_seed(sandbox, 2)
+    apply_seed(sandbox, 2, _seed_files())
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/test_calc.py", "-q"],
         cwd=sandbox,
@@ -236,13 +248,22 @@ def test_apply_seed_raises_when_a_placeholder_is_gone(tmp_path: Path) -> None:
     shutil.copytree(FIXTURES / "resume_repo", sandbox)
     (sandbox / "NOTES.md").write_text("# Notes\n", encoding="utf-8")
     with pytest.raises(FailpointError, match="does not carry"):
-        apply_seed(sandbox, 0)
+        apply_seed(sandbox, 0, _seed_files())
 
 
-def test_the_committed_fixture_carries_every_seed_placeholder() -> None:
-    for name in ("NOTES.md", "tests/test_calc.py"):
-        text = (FIXTURES / "resume_repo" / name).read_text(encoding="utf-8")
-        assert "<seed" in text, f"{name} carries no seed placeholder"
+def test_every_declared_seed_file_carries_its_placeholders() -> None:
+    """Read off the dataset, so a case added with a typo'd placeholder or a file
+    that does not carry one is caught here rather than by a suite that silently
+    ran the same fixture five times."""
+    seen = 0
+    for case in load_loop_resume_cases(DATASET):
+        assert case.scenario is not None
+        for rel, placeholders in case.scenario.seed_files:
+            text = (FIXTURES / str(case.fixture) / rel).read_text(encoding="utf-8")
+            for placeholder in placeholders:
+                assert placeholder in text, f"{case.fixture}/{rel} lacks {placeholder}"
+            seen += 1
+    assert seen >= 2, f"only {seen} seed files were checked"
 
 
 def test_every_row_carries_the_per_case_fields() -> None:

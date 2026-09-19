@@ -29,6 +29,7 @@ def _scenario(**overrides: object) -> dict[str, object]:
         "steps": [[{"tool": "Bash", "input": {"command": "echo x >> NOTES.md"}}]],
         "artifacts": ["NOTES.md"],
         "workspace_test": {"command": ["python", "-m", "pytest"], "path": "tests/t.py"},
+        "seed": [{"path": "NOTES.md", "placeholders": ["<seed>"]}],
     }
     base.update(overrides)
     return base

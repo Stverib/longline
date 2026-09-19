@@ -59,6 +59,20 @@ FIXTURE_SEED_PLACEHOLDERS: tuple[str, ...] = (
     SEED_B_PLACEHOLDER,
 )
 
+# What each placeholder becomes, as a function of the repeat index. The offsets
+# are what make the two operands different from each other and from zero.
+SEED_VALUES: dict[str, Any] = {
+    SEED_PLACEHOLDER: lambda seed: str(seed),
+    SEED_A_PLACEHOLDER: lambda seed: str(2 + seed),
+    SEED_B_PLACEHOLDER: lambda seed: str(3 + seed),
+}
+
+# The placeholders that stand for OPERANDS, as opposed to a label. A zero operand
+# can make a fixture's bug accidentally correct -- `add(a, b)` with `a - b` passes
+# when `b` is 0 -- which would leave the workspace layer vacuous for that seed.
+# `<seed>` itself is 0 for the first repeat and that is fine: it is a header.
+SEED_OPERANDS: tuple[str, ...] = (SEED_A_PLACEHOLDER, SEED_B_PLACEHOLDER)
+
 # What the model says once the scripted sequence runs out. The empty string is
 # what the sequence has always defaulted to, and it is the right default for any
 # task whose deliverable is a FILE rather than an answer. A task whose deliverable
@@ -91,6 +105,7 @@ class Scenario:
     steps: tuple[tuple[dict[str, Any], ...], ...]
     artifacts: tuple[str, ...]
     workspace_test: dict[str, Any]
+    seed_files: tuple[tuple[str, tuple[str, ...]], ...]
     answer: str = DEFAULT_ANSWER
 
     def __post_init__(self) -> None:
@@ -173,11 +188,37 @@ class Scenario:
                 "case's checks"
             )
 
+        raw_seed = d.get("seed")
+        if not isinstance(raw_seed, list) or not raw_seed:
+            raise CaseParseError(
+                f"{case_id}: scenario 'seed' must be a non-empty list of "
+                "{path, placeholders} entries. Without it every repeat of this case "
+                "starts from a byte-identical fixture and the repeat count is theatre"
+            )
+        seed_files: list[tuple[str, tuple[str, ...]]] = []
+        for entry in raw_seed:
+            if not isinstance(entry, dict) or not entry.get("path"):
+                raise CaseParseError(f"{case_id}: every seed entry needs a 'path'")
+            names = entry.get("placeholders")
+            if not isinstance(names, list) or not names:
+                raise CaseParseError(
+                    f"{case_id}: seed entry {entry['path']!r} declares no placeholders"
+                )
+            for name in names:
+                if name not in FIXTURE_SEED_PLACEHOLDERS:
+                    raise CaseParseError(
+                        f"{case_id}: unknown seed placeholder {name!r} in {entry['path']!r} "
+                        f"(known: {list(FIXTURE_SEED_PLACEHOLDERS)}). A typo here would "
+                        "never be substituted, and the repeats would silently be identical"
+                    )
+            seed_files.append((str(entry["path"]), tuple(str(n) for n in names)))
+
         return cls(
             followups=tuple(str(x) for x in raw_followups),
             steps=tuple(steps),
             artifacts=tuple(str(x) for x in raw_artifacts),
             workspace_test=dict(workspace_test),
+            seed_files=tuple(seed_files),
             answer=str(d.get("answer", DEFAULT_ANSWER)),
         )
 
@@ -362,12 +403,16 @@ def cases_by_failpoint(
 
 __all__ = [
     "CWD_PLACEHOLDER",
+    "DEFAULT_ANSWER",
     "FIXTURE_SEED_PLACEHOLDERS",
     "SEED_A_PLACEHOLDER",
     "SEED_B_PLACEHOLDER",
+    "SEED_OPERANDS",
     "SEED_PLACEHOLDER",
+    "SEED_VALUES",
     "TOOL_NAMED_FAILPOINTS",
     "LoopResumeCase",
+    "Scenario",
     "cases_by_failpoint",
     "expand_case",
     "load_loop_resume_cases",
