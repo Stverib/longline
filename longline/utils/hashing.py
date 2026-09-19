@@ -10,9 +10,11 @@ be comparing different things.
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 # What an absent file digests to. A sentinel rather than an exception: "the
@@ -33,4 +35,27 @@ def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
-__all__ = ["MISSING", "sha256_bytes", "sha256_file"]
+def input_fingerprint(tool: str, tool_input: Mapping[str, Any]) -> str:
+    """Stable fingerprint of a tool request.
+
+    Keyed on the tool name as well as the arguments: `Bash({"command": "x"})`
+    and `Write({"content": "x"})` are not the same request, and a fingerprint
+    that ignored the name would report one as a replay of the other.
+    `sort_keys=True` makes it independent of dict insertion order, which the two
+    legs of a kill-and-resume do not share.
+
+    Lives here rather than in the evaluation harness because the RUNTIME now
+    records the same fingerprint (`longline/session/tool_journal.py`) and the
+    runtime may not import from `longline/eval/`. Two implementations would be
+    two answers to "was this the same request", compared across a process
+    boundary where the disagreement would be invisible.
+    """
+    payload = json.dumps(
+        {"tool": tool, "input": dict(tool_input)},
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return sha256_bytes(payload)[:16]
+
+
+__all__ = ["MISSING", "input_fingerprint", "sha256_bytes", "sha256_file"]

@@ -42,7 +42,6 @@ naming any of them:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -50,6 +49,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from longline.eval.metrics import Ratio
+
+# Re-exported so `side_effect_journal.input_fingerprint` keeps working for every
+# existing caller. See the wrapper below for why it is not a second copy.
+from longline.utils.hashing import input_fingerprint as _input_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -104,18 +107,13 @@ class SideEffectEntry:
 def input_fingerprint(tool: str, tool_input: Mapping[str, Any]) -> str:
     """Stable fingerprint of a tool request.
 
-    Keyed on the tool name as well as the arguments: `Bash({"command": "x"})`
-    and `Write({"content": "x"})` are not the same request, and a fingerprint
-    that ignored the name would report one as a replay of the other.
-    `sort_keys=True` makes it independent of dict insertion order, which the
-    two legs do not share.
+    Re-exported, not reimplemented. The runtime records the same fingerprint now
+    (`longline/session/tool_journal.py`) and `longline/` may not import from
+    `longline/eval/`, so the implementation moved to `longline/utils/hashing.py`.
+    A second copy here would be a second answer to "was this the same request",
+    compared across a process boundary where a disagreement is invisible.
     """
-    payload = json.dumps(
-        {"tool": tool, "input": dict(tool_input)},
-        sort_keys=True,
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:16]
+    return _input_fingerprint(tool, tool_input)
 
 
 class SideEffectJournal:
