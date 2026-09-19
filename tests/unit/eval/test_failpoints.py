@@ -264,7 +264,6 @@ async def test_gated_tool_records_before_it_parks(tmp_path: Path) -> None:
         inner=inner,
         gate=gate,
         journal=_Recorder(),
-        leg="killed",
         artifact_paths=("value.txt",),
         artifact_root=str(tmp_path),
     )
@@ -277,7 +276,7 @@ async def test_gated_tool_records_before_it_parks(tmp_path: Path) -> None:
 async def test_before_tool_gate_parks_without_executing_the_tool(tmp_path: Path) -> None:
     inner = _EchoTool()
     gate = FailpointGate(tmp_path, BEFORE_TOOL, at_tool_name="Echo", block=lambda: None)
-    gated = GatedTool(inner=inner, gate=gate, leg="killed")
+    gated = GatedTool(inner=inner, gate=gate)
     await gated.execute({})
     assert inner.executions == 0, "the before_tool gate must stop before the tool runs"
     assert read_sentinel(tmp_path) is not None
@@ -341,6 +340,33 @@ def test_truncate_last_line_cuts_mid_line(tmp_path: Path) -> None:
     lines = [ln for ln in text.splitlines() if ln.strip()]
     assert json.loads(lines[0]) == {"a": 1}
     assert json.loads(lines[1]) == {"b": 2}
+
+
+@pytest.mark.asyncio
+async def test_the_tool_executor_does_not_swallow_a_failpoint(tmp_path: Path) -> None:
+    """`FailpointReached` is a BaseException, and this is why.
+
+    `StreamingToolExecutor` converts any `except Exception` raised by a tool
+    into an error `ToolResult`, deliberately, so a broken tool does not kill
+    the loop. A stop that got converted that way would let the run continue
+    past its own failpoint -- the one failure this module cannot tolerate. The
+    production path is exercised through the real executor rather than a stub,
+    because the stub is what would hide the difference.
+    """
+    from longline.eval.failpoints import FailpointReached, halt
+    from longline.models.content_blocks import ToolUseBlock
+    from longline.tools.base import ToolRegistry
+    from longline.tools.streaming_executor import StreamingToolExecutor
+
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    executor = StreamingToolExecutor(registry, hooks=None, permission_checker=None)
+    gate = FailpointGate(tmp_path, AFTER_TOOL, at_tool_name="Echo", block=halt)
+    registry.swap("Echo", GatedTool(inner=_EchoTool(), gate=gate))
+    executor.add_tool(ToolUseBlock(id="t1", name="Echo", input={}))
+    with pytest.raises(FailpointReached):
+        await executor.get_results()
+    assert read_sentinel(tmp_path) is not None
 
 
 def test_failpoint_vocabulary_is_split_into_gated_and_parent() -> None:

@@ -291,7 +291,6 @@ class GatedTool(Tool):
     inner: Tool
     gate: FailpointGate
     journal: Any | None = None
-    leg: str = "killed"
     artifact_paths: tuple[str, ...] = ()
     artifact_root: str = ""
     calls: int = 0
@@ -320,8 +319,9 @@ class GatedTool(Tool):
         post_state = self.snapshot_artifacts()
 
         if self.journal is not None:
+            # The journal already knows which leg it belongs to; passing one
+            # here would be a second source of truth for the same fact.
             self.journal.record(
-                leg=self.leg,
                 tool=name,
                 tool_input=dict(tool_input),
                 outcome="error" if result.is_error else "ok",
