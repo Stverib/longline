@@ -82,9 +82,15 @@ from longline.core.events import (
 from longline.models.messages import Usage
 from longline.tools.base import Tool, ToolResult, ToolSchema
 
+# Re-exported, not reimplemented. The runtime hashes the same files this harness
+# does (see `longline/session/tool_journal.py`), and two copies of a digest
+# function are two sets of semantics: the day one gains a normalisation the
+# other does not, every comparison across the boundary silently compares
+# different things.
+from longline.utils.hashing import sha256_file  # noqa: F401
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-    from pathlib import Path
 
 # --- fault class names (the vocabulary every report is keyed by) ---
 
@@ -766,17 +772,6 @@ async def drive_query_loop(
 
 
 # --- tool-call fingerprints (duplicate detection) ---
-
-
-def sha256_file(path: Path) -> str:
-    """Digest of a file's bytes, or `missing` when it is not there.
-
-    `missing` rather than raising: an absent artifact is a fact about the run
-    that a duplicate-check report should be able to state.
-    """
-    if not path.is_file():
-        return "missing"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def fingerprint_tool_calls(
