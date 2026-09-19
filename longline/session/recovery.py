@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+from longline.models.content_blocks import TextBlock, ToolResultBlock
 from longline.models.messages import (
     AssistantMessage,
     Message,
     UserMessage,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,7 @@ def validate_transcript(
     messages: list[Message],
     *,
     report: TranscriptRepairReport | None = None,
+    result_overrides: Mapping[str, tuple[str, bool]] | None = None,
 ) -> list[Message]:
     """Validate and repair a transcript for API submission.
 
@@ -102,12 +108,36 @@ def validate_transcript(
     unchanged -- a silent in-place mutation is not possible, because the object
     is created by the caller rather than by this function.
 
+    `result_overrides` maps a `tool_use` id to the `(text, is_error)` its result
+    should carry, when the caller knows better than the default. It exists for
+    the durable operation journal: the default text says the result was lost,
+    which is true for a call that never ran and FALSE for one whose effect is
+    already in the workspace. That difference decides whether the model retries.
+
     Returns the repaired message list (may modify in place).
     """
     if not messages:
         return messages
 
     repairs = report if report is not None else TranscriptRepairReport()
+    overrides = dict(result_overrides or {})
+
+    def _synthetic(tool_use_id: str) -> ToolResultBlock:
+        """The result for an unanswered `tool_use`.
+
+        Two call sites below use this, deliberately: an override honoured by only
+        one of them would give the same operation two different answers depending
+        on where the crash happened to land.
+        """
+        override = overrides.get(tool_use_id)
+        if override is None:
+            return ToolResultBlock(
+                tool_use_id=tool_use_id,
+                content=SYNTHETIC_TOOL_RESULT_PLACEHOLDER,
+                is_error=True,
+            )
+        text, is_error = override
+        return ToolResultBlock(tool_use_id=tool_use_id, content=text, is_error=is_error)
 
     # ---- 修复 1: 末尾截断 ----
     # 这是最常见的崩溃场景：assistant 发出 tool_use 后，
@@ -116,16 +146,7 @@ def validate_transcript(
         tool_uses = messages[-1].get_tool_use_blocks()
         if tool_uses:
             # 为每个孤立的 tool_use 生成一条错误 tool_result
-            from longline.models.content_blocks import ToolResultBlock
-
-            synthetic_results = [
-                ToolResultBlock(
-                    tool_use_id=tu.id,
-                    content=SYNTHETIC_TOOL_RESULT_PLACEHOLDER,
-                    is_error=True,
-                )
-                for tu in tool_uses
-            ]
+            synthetic_results = [_synthetic(tu.id) for tu in tool_uses]
             # 将合成结果包装为 user 消息追加到末尾，满足 API 的角色交替要求
             messages.append(UserMessage(content=synthetic_results))  # type: ignore[arg-type]
             logger.warning(
@@ -154,8 +175,6 @@ def validate_transcript(
         # 收集后续 user 消息中已有的 tool_result ID
         existing_result_ids: set[str] = set()
         if isinstance(next_msg.content, list):
-            from longline.models.content_blocks import ToolResultBlock
-
             for block in next_msg.content:
                 if isinstance(block, ToolResultBlock):
                     existing_result_ids.add(block.tool_use_id)
@@ -163,22 +182,11 @@ def validate_transcript(
         # 找出缺失 tool_result 的 tool_use（ID 不在已有结果中的）
         missing = [tu for tu in tool_uses if tu.id not in existing_result_ids]
         if missing:
-            from longline.models.content_blocks import ToolResultBlock
-
-            synthetic = [
-                ToolResultBlock(
-                    tool_use_id=tu.id,
-                    content=SYNTHETIC_TOOL_RESULT_PLACEHOLDER,
-                    is_error=True,
-                )
-                for tu in missing
-            ]
+            synthetic = [_synthetic(tu.id) for tu in missing]
             # 将合成结果插入到现有 user 消息的内容前面（prepend）
             # 这样 tool_result 在消息中的位置与 API 期望的顺序一致
             if isinstance(next_msg.content, str):
                 # user 消息原本是纯文本，需要转换为混合内容列表
-                from longline.models.content_blocks import TextBlock
-
                 next_msg.content = [*synthetic, TextBlock(text=next_msg.content)]
             elif isinstance(next_msg.content, list):
                 next_msg.content = [*synthetic, *next_msg.content]
