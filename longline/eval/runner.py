@@ -49,6 +49,11 @@ class CaseResult:
     turns: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Cache accounting, kept separate from `input_tokens` -- see
+    # `Trajectory.cache_read_tokens` for why folding them together would
+    # silently redefine a field every existing raw.jsonl row records.
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     text: str = ""
     errors: list[str] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -74,6 +79,17 @@ class CaseResult:
     def num_rounds(self) -> int:
         """Alias for `turns`, under the name the metric contract uses."""
         return self.turns
+
+    @property
+    def prompt_tokens(self) -> int:
+        """The whole prompt: uncached + written-to-cache + cache hits.
+
+        `input_tokens` is the API's own field and on a caching provider it is
+        only the uncached remainder, so the report's cost figures use this one.
+        Rows written before the cache fields existed report 0 for them and so
+        keep their original totals -- the change is additive, not a rewrite.
+        """
+        return self.input_tokens + self.cache_creation_tokens + self.cache_read_tokens
 
     @property
     def num_tool_calls(self) -> int:
@@ -203,6 +219,10 @@ class CaseResult:
             "num_successful_tool_calls": self.num_successful_tool_calls,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            # Additive fields: absent (0) in every row written before this
+            # existed, so those rows still recompute to their original totals.
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
             "error_type": self.error_type,
             "errors": self.errors,
             "tool_calls": [t[0] for t in self.tool_calls],
@@ -356,6 +376,8 @@ def _result_from_trajectory(
         turns=traj.turns,
         input_tokens=traj.input_tokens,
         output_tokens=traj.output_tokens,
+        cache_creation_tokens=traj.cache_creation_tokens,
+        cache_read_tokens=traj.cache_read_tokens,
         text=traj.text,
         errors=traj.errors,
         tool_calls=traj.tool_calls,

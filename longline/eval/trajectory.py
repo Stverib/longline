@@ -71,6 +71,15 @@ class Trajectory:
     turns: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Cache accounting, kept SEPARATE from `input_tokens` on purpose. The API
+    # reports `input_tokens` as the uncached remainder on a provider that
+    # implements prompt caching, so a total built from it alone understates the
+    # prompt -- measured at ~3x on the deepseek-flash endpoint. Folding these
+    # into `input_tokens` would silently redefine a field that every existing
+    # raw.jsonl row records; a separate field plus `prompt_tokens` makes the
+    # distinction visible instead.
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     text: str = ""
     errors: list[str] = field(default_factory=list)
     # Every distinct `TurnComplete.served_model` this stream carried, in first-seen
@@ -100,6 +109,17 @@ class Trajectory:
     def num_successful_tool_calls(self) -> int:
         """Executed calls that did not report `is_error`."""
         return sum(1 for e in self.tool_executions if not e.is_error)
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Everything the prompt cost: uncached + written-to-cache + cache hits.
+
+        This is the number a cost or context question wants. `input_tokens`
+        alone answers a narrower question ("how much of this prompt was not
+        already cached"), and on a caching provider the two differ by a large
+        factor.
+        """
+        return self.input_tokens + self.cache_creation_tokens + self.cache_read_tokens
 
 
 def _error_type(message: str) -> str:
@@ -156,6 +176,8 @@ async def extract_trajectory(
             traj.turns += 1
             traj.input_tokens += event.usage.input_tokens
             traj.output_tokens += event.usage.output_tokens
+            traj.cache_creation_tokens += event.usage.cache_creation_input_tokens
+            traj.cache_read_tokens += event.usage.cache_read_input_tokens
             if event.served_model and event.served_model not in traj.served_models:
                 traj.served_models.append(event.served_model)
             traj.event_timestamps[f"turn_{traj.turns}_complete"] = clock()

@@ -733,3 +733,73 @@ class TestStabilitySection:
         }
         assert block["redundant_actions"] == {"repeated_reads": 0, "read_after_write": 0}
         assert block["notebook_edit_substitution"] == 0
+
+
+class TestCacheAwareTokenEfficiency:
+    """The efficiency metrics price the WHOLE prompt, not the uncached part.
+
+    On a provider that reports most of the prompt as a cache hit, `input_tokens`
+    alone understates the prompt by a large factor -- measured at ~3x on the
+    deepseek-flash endpoint. `total_input_tokens` keeps reporting the API's own
+    field so historical rows stay readable; `total_prompt_tokens` is what a cost
+    question wants, and it is what the per-case figures now use.
+    """
+
+    def _cached(
+        self, cid: str, *, passed: bool, uncached: int, cached: int, executed: int,
+    ) -> CaseResult:
+        return CaseResult(
+            case_id=cid, case_type="e2e", passed=passed,
+            input_tokens=uncached, output_tokens=0,
+            cache_read_tokens=cached,
+            tool_executions=[
+                ToolExecution(tool_id=f"t{i}", tool_name="Read", is_error=False)
+                for i in range(executed)
+            ],
+        )
+
+    def test_prompt_tokens_include_cache_hits(self) -> None:
+        rep = aggregate([
+            self._cached("a", passed=True, uncached=100, cached=900, executed=1),
+            self._cached("b", passed=True, uncached=200, cached=800, executed=1),
+        ])
+
+        assert rep.total_input_tokens == 300       # the API's own field
+        assert rep.total_prompt_tokens == 2000      # 300 uncached + 1800 cached
+        assert rep.tokens_per_case == 1000.0        # over the real prompt
+        assert rep.total_cached_tokens == 1700      # 900 + 800
+        assert rep.input_tokens_per_tool_call == 1000.0  # 2000 prompt / 2 calls
+
+    def test_a_row_without_cache_fields_keeps_its_old_numbers(self) -> None:
+        """The change is additive: pre-existing raw.jsonl rows are unaffected."""
+        rep = aggregate([CaseResult(
+            case_id="old", case_type="e2e", passed=True,
+            input_tokens=500, output_tokens=50,
+        )])
+
+        assert rep.total_prompt_tokens == 500
+        assert rep.tokens_per_case == 550.0         # 500 + 50 output
+
+    def test_creation_tokens_count_too(self) -> None:
+        """A prompt written to cache is still a prompt that was sent."""
+        rep = aggregate([CaseResult(
+            case_id="a", case_type="e2e", passed=True,
+            input_tokens=10, output_tokens=0, cache_creation_tokens=90,
+        )])
+
+        assert rep.total_prompt_tokens == 100
+        assert rep.tokens_per_case == 100.0
+
+    def test_the_summary_dict_carries_both_totals(self) -> None:
+        rep = aggregate([self._cached("a", passed=True, uncached=10, cached=90, executed=1)])
+        payload = rep.to_dict()
+
+        assert payload["total_input_tokens"] == 10
+        assert payload["total_prompt_tokens"] == 100
+
+    def test_the_markdown_names_both(self) -> None:
+        """A reader must be able to see the cached part, not just the total."""
+        rep = aggregate([self._cached("a", passed=True, uncached=10, cached=90, executed=1)])
+        md = render_markdown(rep)
+
+        assert "cached" in md

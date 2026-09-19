@@ -119,6 +119,14 @@ class EvalReport:
     p95_duration_ms: float | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # `total_input_tokens` is the API's own field: on a caching provider it is
+    # only the UNCACHED remainder, so a cost figure built from it alone
+    # understates the prompt (measured at ~3x on the deepseek-flash endpoint).
+    # `total_prompt_tokens` is the whole prompt and is what the efficiency
+    # ratios below divide by. Rows written before cache accounting existed
+    # report 0 for the cache fields, so their two totals are equal.
+    total_prompt_tokens: int = 0
+    total_cached_tokens: int = 0
     # --- token efficiency ---
     # Each has its own denominator, and None means "nothing was measured",
     # never zero -- a 0.0 here would read as a perfect score for an empty run.
@@ -172,6 +180,8 @@ class EvalReport:
             "avg_output_tokens": self.avg_output_tokens,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_cached_tokens": self.total_cached_tokens,
             "total_tokens": self.total_tokens,
             "token_efficiency": {
                 "tokens_per_case": self.tokens_per_case,
@@ -477,15 +487,19 @@ def aggregate(results: list[CaseResult], *, variant: str | None = None) -> EvalR
         p95_duration_ms=percentile(durations, 95) if durations else None,
         total_input_tokens=sum(r.input_tokens for r in results),
         total_output_tokens=sum(r.output_tokens for r in results),
+        total_prompt_tokens=sum(r.prompt_tokens for r in results),
+        total_cached_tokens=sum(
+            r.cache_creation_tokens + r.cache_read_tokens for r in results
+        ),
         tokens_per_case=_safe_div(
-            sum(r.input_tokens + r.output_tokens for r in results), len(results),
+            sum(r.prompt_tokens + r.output_tokens for r in results), len(results),
         ),
         tokens_per_successful_case=_safe_div(
-            sum(r.input_tokens + r.output_tokens for r in results),
+            sum(r.prompt_tokens + r.output_tokens for r in results),
             sum(1 for r in results if r.passed),
         ),
         input_tokens_per_tool_call=_safe_div(
-            sum(r.input_tokens for r in results), executed,
+            sum(r.prompt_tokens for r in results), executed,
         ),
         by_category={k: _summarize_group(v) for k, v in categories.items()},
         by_tool_call_bucket=_tool_call_buckets(l2),
@@ -604,8 +618,9 @@ def render_markdown(
         f"p50={_fmt_ms(report.p50_duration_ms)}, "
         f"p95={_fmt_ms(report.p95_duration_ms)}",
         "- **Tokens:** "
-        f"input={report.total_input_tokens}, output={report.total_output_tokens}, "
-        f"total={report.total_tokens}",
+        f"prompt={report.total_prompt_tokens} "
+        f"(uncached={report.total_input_tokens}, cached={report.total_cached_tokens}), "
+        f"output={report.total_output_tokens}",
         # Read next to the pass rate, not instead of it: a pass@1 that rises
         # while tokens-per-success rises faster is not an improvement.
         # `cost_per_success` is carried under `tok/success` -- the two are the

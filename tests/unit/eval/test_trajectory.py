@@ -222,3 +222,48 @@ async def test_default_clock_is_monotonic_and_populates_timestamps() -> None:
     assert traj.event_timestamps["tool_result_ready"] >= traj.event_timestamps["tool_use_start"]
     duration = traj.tool_executions[0].duration_ms
     assert duration is not None and duration >= 0.0
+
+
+class TestCacheTokenAccounting:
+    """Cache-hit tokens are part of the prompt, and were never counted.
+
+    `Usage` carries `cache_creation_input_tokens` and `cache_read_input_tokens`
+    and the transport fills them, but only `input_tokens` was summed. On a
+    provider that reports most of the prompt as a cache hit the total was
+    therefore a fraction of the real one -- measured at ~3x on the
+    deepseek-flash endpoint, where the same 15 e2e cases reported ~3.1k
+    input/run against ~10.5k on omen-alpha.
+
+    Kept as SEPARATE fields rather than folded into `input_tokens`: that field
+    is the API's own and every existing raw.jsonl row records it, so redefining
+    it would silently change the meaning of historical data.
+    """
+
+    async def test_sums_the_cache_fields(self) -> None:
+        traj = await _extract(
+            TurnComplete(stop_reason="tool_use", usage=Usage(
+                input_tokens=10, output_tokens=20,
+                cache_creation_input_tokens=100, cache_read_input_tokens=1000,
+            )),
+            TurnComplete(stop_reason="end_turn", usage=Usage(
+                input_tokens=30, output_tokens=40,
+                cache_creation_input_tokens=0, cache_read_input_tokens=2000,
+            )),
+        )
+
+        assert traj.input_tokens == 40
+        assert traj.cache_creation_tokens == 100
+        assert traj.cache_read_tokens == 3000
+        assert traj.prompt_tokens == 3140
+
+    async def test_prompt_tokens_equals_input_tokens_when_nothing_was_cached(self) -> None:
+        """A transport that reports no cache fields keeps its old numbers."""
+        traj = await _extract(
+            TurnComplete(stop_reason="end_turn", usage=Usage(input_tokens=50, output_tokens=5)),
+        )
+
+        assert traj.cache_read_tokens == 0
+        assert traj.prompt_tokens == 50
+
+    async def test_an_empty_trajectory_has_no_prompt_tokens(self) -> None:
+        assert Trajectory().prompt_tokens == 0

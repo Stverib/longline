@@ -665,6 +665,10 @@ def _load_jsonl_results(path: Path) -> list[CaseResult]:
             turns=int(d.get("num_rounds", 0)),
             input_tokens=int(d.get("input_tokens", 0)),
             output_tokens=int(d.get("output_tokens", 0)),
+            # Absent in rows written before cache accounting existed, which is
+            # why they default to 0 rather than being required.
+            cache_creation_tokens=int(d.get("cache_creation_tokens", 0)),
+            cache_read_tokens=int(d.get("cache_read_tokens", 0)),
             errors=[str(e) for e in d.get("errors", [])],
             tags=[str(t) for t in d.get("tags", [])],
             duration_ms=d.get("duration_ms"),
