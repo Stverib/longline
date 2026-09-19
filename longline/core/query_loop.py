@@ -109,6 +109,7 @@ async def query_loop(
     max_max_output_recovery: int = MAX_OUTPUT_TOKENS_RECOVERY,
     max_reactive_compaction: int = MAX_REACTIVE_COMPACTION,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    journal: object | None = None,  # ToolJournal at runtime
 ) -> AsyncIterator[QueryEvent]:
     """Execute the core conversation loop.
 
@@ -150,6 +151,13 @@ async def query_loop(
     Bug fixes per check.md:
     - Recoverable errors no longer silently consume turns → tracked separately
     - Tool follow-up checks tool_use_blocks presence, not just stop_reason
+
+    `journal` is the durable tool-operation log (`longline/session/tool_journal.py`),
+    handed to the executor so every tool call is recorded as PREPARED before it
+    runs and COMMITTED after. It is typed `object` here rather than imported so
+    this module keeps its "no dependency on the persistence layer" shape; the
+    executor is the only consumer. None (the default) is every caller that cannot
+    resume, and it means no journal is written at all.
     """
     sleep_fn = sleep if sleep is not None else asyncio.sleep
     # === 状态机变量初始化 ===
@@ -205,6 +213,7 @@ async def query_loop(
 
         executor = StreamingToolExecutor(
             tools, hooks=hooks, permission_checker=permission_checker,  # type: ignore[arg-type]
+            journal=journal, turn_id=turn_count,
         )
         accumulated_text = ""           # 累积模型输出的文本（用于构建 AssistantMessage）
         usage = Usage()                 # 本轮 token 消耗统计

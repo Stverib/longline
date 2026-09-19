@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from longline.utils.hashing import sha256_file
 
 from .base import ToolRegistry, ToolResult
 
@@ -56,12 +59,21 @@ class StreamingToolExecutor:
         registry: ToolRegistry,
         hooks: list[HookConfig] | None = None,
         permission_checker: Callable[..., Any] | None = None,
+        journal: Any | None = None,
+        turn_id: int = 0,
     ) -> None:
         self._registry = registry
         self._hooks = hooks
         # permission_checker 是 P2a 阶段的权限检查接口预留，
         # 用于在执行工具前检查用户是否授权。目前可以为 None。
         self._permission_checker = permission_checker
+        # The durable operation journal (`longline/session/tool_journal.py`).
+        # None for every caller that cannot resume -- sub-agents, tests, one-shot
+        # `--print` -- which is why every use below is guarded rather than
+        # assumed. This is the only layer holding all three things a record
+        # needs: the tool_call_id, the tool, and the moment before execution.
+        self._journal = journal
+        self._turn_id = turn_id
         # _pending 记录所有已启动的 (tool_use_id, asyncio.Task) 对，
         # 用于在 get_results() 中收集结果
         self._pending: list[tuple[str, asyncio.Task[ToolResult]]] = []
@@ -129,6 +141,28 @@ class StreamingToolExecutor:
                 if not allowed:
                     return ToolResult(content="Denied by permission policy", is_error=True)
 
+            # Journal the INTENT before executing. The record has to exist before
+            # the world can change, or the window this closes -- effect present,
+            # no record of it -- is wide open.
+            operation_id: str | None = None
+            workload: dict[str, str] = {}
+            if self._journal is not None:
+                try:
+                    workload = tool.workload(block.input)
+                    operation_id = self._journal.prepare(
+                        turn_id=self._turn_id,
+                        tool_call_id=block.id,
+                        tool_name=block.name,
+                        tool_input=block.input,
+                        workload=workload,
+                    )
+                except Exception as e:
+                    # Durability is a safety net, not a gate: a session directory
+                    # that cannot be written must not be the reason a user's edit
+                    # does not happen.
+                    logger.error("Tool journal PREPARE failed for %s: %s", block.name, e)
+                    operation_id = None
+
             # Execute
             # 与 orchestration.py 一致：异常转为错误 ToolResult，不中断循环
             try:
@@ -136,6 +170,20 @@ class StreamingToolExecutor:
             except Exception as e:
                 logger.warning("Tool %s failed: %s", block.name, e)
                 result = ToolResult(content=f"Error: {e}", is_error=True)
+
+            # Committed on EVERY return path, including the error one: a tool that
+            # returned an error DID return, and leaving it PREPARED would make a
+            # failed call look interrupted -- so the next resume would reconcile a
+            # question that already has an answer.
+            if operation_id is not None and self._journal is not None:
+                try:
+                    self._journal.commit(
+                        operation_id,
+                        outcome="error" if result.is_error else "ok",
+                        post_state={path: sha256_file(Path(path)) for path in workload},
+                    )
+                except Exception as e:
+                    logger.error("Tool journal COMMIT failed for %s: %s", block.name, e)
 
             # PostToolUse hooks —— 工具完成后触发，用于审计日志、通知等
             if self._hooks:
