@@ -1402,6 +1402,12 @@ uv run --extra dev python -c "from pathlib import Path; from longline.eval.recov
 # 多 Agent 集：总数与 controlled/exploratory 拆分（预期输出：24 18 6）
 uv run --extra dev python -c "from pathlib import Path; from longline.eval.multi_agent import load_multi_agent_cases, group_of; cs=load_multi_agent_cases(Path('evals/multi_agent.jsonl')); print(len(cs), len(group_of(cs,'controlled')), len(group_of(cs,'exploratory')))"
 
+# 循环恢复多样性集：展开后的运行数与逐臂计数（预期输出：100 25 25 25 25）
+uv run --extra dev python -c "from pathlib import Path; from longline.eval.loop_resume import load_loop_resume_cases, cases_by_failpoint; cs=load_loop_resume_cases(Path('evals/loop_resume_tasks.jsonl')); g=cases_by_failpoint(cs); print(len(cs), *[len(g[a]) for a in ('before_tool','after_tool','after_checkpoint','truncate_tail')])"
+
+# workspace 漂移规则本身（§5.11 的前后对照，在两个 revision 上各跑一次）
+uv run --extra dev python evals/probes/workspace_drift_rule.py
+
 # 评测单测（含泄漏检查与数据集契约）
 uv run --extra dev pytest tests/unit/eval -q
 ```
@@ -1441,3 +1447,7 @@ uv run --extra dev pytest tests/unit/eval -q
    而我们每类固定 8 条，**类内难度未经控制**。
 5. **无「每解决一题的成本」指标**。SWE-bench 原论文也不报，但 Terminal-Bench 把
    性能-成本帕累托前沿作为主轴之一，BFCL 记录 cost/latency。若要声称效率优势，需补此指标。
+   > **2026-09-20 补充**：§5.12 现在量了**恢复分支的成本**（模型调用 / 工具调用 / token /
+   > 本地循环时间），但它量的是**同一题的两个分支之间**的差，**不是**「每解决一题的成本」。
+   > 这条局限**仍然成立**：跨套件的 cost-per-task 依然没有，因此本项目的效率结论只能
+   > 限定在「恢复 vs 重启」这一个决策上。
