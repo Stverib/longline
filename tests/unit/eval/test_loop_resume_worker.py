@@ -22,7 +22,7 @@ from longline.eval.loop_resume_worker import (
     arm,
     instruction_offset,
 )
-from longline.eval.side_effect_journal import KILLED, read_journal
+from longline.eval.side_effect_journal import KILLED, RESUMED, read_journal
 
 FIXTURE = Path("evals/fixtures/resume_repo")
 TASK = 'In {cwd}: fix the bug in src/calc.py and append a line containing "fixed-add" to NOTES.md.'
@@ -250,3 +250,234 @@ def test_arm_declares_the_sandbox_outside_the_real_state_dir(tmp_path: Path) -> 
     arm(spec)
     assert (tmp_path / "claude" / "sessions").is_dir()
     assert not (Path.home() / ".longline" / "sessions" / "loop-resume.jsonl").exists()
+
+
+# --- the resume phase ---
+
+
+def test_check_transcript_structure_accepts_a_paired_transcript() -> None:
+    from longline.eval.loop_resume_worker import check_transcript_structure
+    from longline.models.content_blocks import ToolResultBlock, ToolUseBlock
+    from longline.models.messages import AssistantMessage, UserMessage
+
+    messages = [
+        UserMessage(content="go"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={})], stop_reason="tool_use"
+        ),
+        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="ok", is_error=False)]),
+    ]
+    ok, errors = check_transcript_structure(messages)
+    assert ok is True
+    assert errors == []
+
+
+def test_check_transcript_structure_rejects_an_orphan_tool_use() -> None:
+    from longline.eval.loop_resume_worker import check_transcript_structure
+    from longline.models.content_blocks import ToolUseBlock
+    from longline.models.messages import AssistantMessage, UserMessage
+
+    messages = [
+        UserMessage(content="go"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={})], stop_reason="tool_use"
+        ),
+    ]
+    ok, errors = check_transcript_structure(messages)
+    assert ok is False
+    assert any("without tool_result" in e for e in errors)
+
+
+def test_check_transcript_structure_rejects_role_alternation_violation() -> None:
+    from longline.eval.loop_resume_worker import check_transcript_structure
+    from longline.models.messages import UserMessage
+
+    ok, errors = check_transcript_structure([UserMessage(content="a"), UserMessage(content="b")])
+    assert ok is False
+    assert any("alternation" in e for e in errors)
+
+
+def test_resume_reports_not_found_when_no_checkpoint_exists(tmp_path: Path) -> None:
+    from longline.eval.loop_resume_worker import resume
+
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    report = resume(
+        {
+            "claude_dir": str(claude_dir),
+            "sandbox": str(tmp_path / "s"),
+            "session_id": "loop-resume",
+            "api_key": "offline",
+            "model": "offline-model",
+        }
+    )
+    assert report["checkpoint_loaded"] is False
+    assert report["layer_state_ok"] is False
+
+
+def test_resume_finishes_the_task_the_killed_leg_never_finished(tmp_path: Path) -> None:
+    """The resumed leg does WORK, not a read-back."""
+    from longline.eval.loop_resume_worker import resume
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, BEFORE_MODEL)
+    arm(spec)
+    report = resume(spec)
+
+    assert report["checkpoint_loaded"] is True
+    assert report["structural_errors"] == []
+    assert report["layer_state_ok"] is True
+    assert report["instructions_run"] == 1
+    assert "fixed-add" in (sandbox / "NOTES.md").read_text(encoding="utf-8")
+    assert "return a + b" in (sandbox / "src" / "calc.py").read_text(encoding="utf-8")
+    assert report["task_states"] == {"b-9f8e7d6c": "killed"}
+
+
+def test_after_tool_resume_replays_the_append_the_transcript_never_saw(tmp_path: Path) -> None:
+    """The core measurement, end to end.
+
+    The killed leg appended to NOTES.md and the turn-0 checkpoint has no record
+    of it, so the resumed leg appends again. Both the redundant re-execution
+    and the duplicated side effect must be visible in the journal -- and the
+    file must really carry the line twice, or the metric would be describing
+    something that did not happen.
+    """
+    from longline.eval.loop_resume_worker import resume
+    from longline.eval.side_effect_journal import compute_side_effect_metrics
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, AFTER_TOOL, failpoint_tool="Bash")
+    arm(spec)
+    assert (sandbox / "NOTES.md").read_text(encoding="utf-8").count("fixed-add") == 1
+
+    resume(spec)
+
+    notes = (sandbox / "NOTES.md").read_text(encoding="utf-8")
+    assert notes.count("fixed-add") == 2, "the append was not replayed, so nothing was measured"
+
+    entries = read_journal(tmp_path / "claude" / "journal.jsonl")
+    assert {e.leg for e in entries} == {KILLED, RESUMED}
+    metrics = compute_side_effect_metrics(entries)
+    assert metrics.denominator == 1, "the append is the only state-changing execution"
+    assert metrics.redundant == 1
+    assert metrics.duplicated == 1
+
+
+def test_after_checkpoint_resume_does_not_replay_instruction_one(tmp_path: Path) -> None:
+    """The positive control for the execution layer.
+
+    Instruction 1 was completed and persisted before the kill, so the resumed
+    leg must NOT redo its tools -- and its own work (REPORT.md) must appear.
+    Without this arm the redundant count could never be zero, and the metric
+    would have no way to show it can recognise a clean resume.
+    """
+    from longline.eval.loop_resume_worker import resume
+    from longline.eval.side_effect_journal import compute_side_effect_metrics
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, AFTER_CHECKPOINT)
+    arm(spec)
+    assert (sandbox / "NOTES.md").read_text(encoding="utf-8").count("fixed-add") == 1
+
+    resume(spec)
+
+    assert (sandbox / "REPORT.md").is_file(), "instruction 2 did not run"
+    assert (sandbox / "NOTES.md").read_text(encoding="utf-8").count("fixed-add") == 1, (
+        "instruction 1's append was replayed even though it was on disk"
+    )
+
+    entries = read_journal(tmp_path / "claude" / "journal.jsonl")
+    assert {e.leg for e in entries} == {KILLED, RESUMED}
+    metrics = compute_side_effect_metrics(entries)
+    assert metrics.denominator == 2, "instruction 1 had two state-changing executions"
+    assert metrics.redundant == 0
+    assert metrics.duplicated == 0
+    assert metrics.by_tool == {}
+
+
+def test_a_torn_tail_is_dropped_by_load_session_not_repaired(tmp_path: Path) -> None:
+    """Refutes the design's prediction, and records what actually happens.
+
+    The spec predicted that `truncate_tail` would be the one arm reaching
+    `validate_transcript`'s orphan repair. It is not: `load_session` skips the
+    unparseable line itself (storage.py), so by the time the repair function
+    runs there is no orphaned `tool_use` left for it to fix and `repairs` stays
+    empty. The transcript the resume gets is the LAST COMPLETE RECORD, which is
+    a clean prefix.
+
+    What this arm therefore measures is corruption tolerance -- the run must
+    survive a half-written final record -- and that is worth measuring on its
+    own. The prediction in the spec is wrong and this test is where it is
+    corrected.
+    """
+    from longline.eval.failpoints import truncate_last_line
+    from longline.eval.loop_resume_worker import resume
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, "truncate_tail")
+    arm(spec)
+    session = tmp_path / "claude" / "sessions" / "loop-resume.jsonl"
+    whole = len([ln for ln in session.read_text(encoding="utf-8").splitlines() if ln.strip()])
+    assert whole > 1, "one line would leave nothing to survive the cut"
+
+    truncate_last_line(session)
+    report = resume(spec)
+
+    assert report["checkpoint_loaded"] is True, "the corrupt tail destroyed the session"
+    assert report["num_loaded_messages"] == whole - 1, "the torn record was not the only loss"
+    assert report["transcript_repaired"] is False, (
+        "the repair path was reached after all -- the spec's claim that load_session "
+        "drops the torn line first no longer holds, and both documents need updating"
+    )
+    assert report["repairs"] == []
+    assert report["structural_errors"] == []
+    assert report["layer_state_ok"] is True
+
+
+def test_workspace_drift_goes_undetected(tmp_path: Path) -> None:
+    """The honest result of the drift arm, pinned so a future fix is noticed.
+
+    Production has no workspace identity check: the journal, the transcript and
+    the tools all record nothing about which revision of a file the checkpoint
+    was taken against. So a resumed leg runs happily on top of a workspace that
+    changed underneath it, and no tool error mentions it.
+
+    `tool_errors` is the channel such a check would have to use. Today it stays
+    empty. WHEN THIS TEST FAILS, a detection mechanism has appeared: the arm
+    becomes a real detection rate, and `evals/README.md` must stop saying
+    detection is zero.
+    """
+    from longline.eval.loop_resume_worker import resume
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, "workspace_drift")
+    arm(spec)
+
+    # Another writer touches the workspace after the checkpoint was taken.
+    notes = sandbox / "NOTES.md"
+    notes.write_text(notes.read_text(encoding="utf-8") + "drifted-by-another-writer\n",
+                     encoding="utf-8")
+    report = resume(spec)
+    assert report["tool_errors"] == [], "the runtime noticed the drift; update the README"
+
+    # And the resumed leg happily appends on top of the foreign edit.
+    text = notes.read_text(encoding="utf-8")
+    assert "drifted-by-another-writer" in text
+    assert text.count("fixed-add") == 1
+
+
+def test_resume_runs_validate_transcript_on_the_loaded_messages(tmp_path: Path) -> None:
+    """The production recovery call is made even when it has nothing to do.
+
+    An arm that never calls it would leave `transcript_repaired` permanently
+    False for the wrong reason -- the function would simply never have run.
+    """
+    from longline.eval.loop_resume_worker import resume
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, BEFORE_MODEL)
+    arm(spec)
+    report = resume(spec)
+    assert report["checkpoint_loaded"] is True
+    assert "num_loaded_messages" in report
+    assert report["repairs"] == [], "nothing to repair in a clean turn-0 checkpoint"

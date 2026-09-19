@@ -202,18 +202,28 @@ class FailpointGate:
     armed: bool = True
     reached: int = 0
     block: Callable[[], None] = block_forever
+    # WHICH mechanism fires this gate, when that differs from what the sentinel
+    # should SAY. The two parent-side failpoints have no trigger of their own --
+    # the parent truncates the file or mutates the workspace -- but they still
+    # need the child to stop somewhere, and the sentinel must keep naming the
+    # case's own failpoint so the runner can assert it fired.
+    trigger: str = ""
+
+    @property
+    def _trigger(self) -> str:
+        return self.trigger or self.failpoint
 
     def triggers_model(self, call_index: int) -> bool:
         if not self.armed:
             return False
-        if self.failpoint not in (BEFORE_MODEL, AFTER_CHECKPOINT):
+        if self._trigger not in (BEFORE_MODEL, AFTER_CHECKPOINT):
             return False
         return call_index == self.at_call_index
 
     def triggers_tool(self, tool_name: str) -> bool:
         if not self.armed:
             return False
-        if self.failpoint not in (BEFORE_TOOL, AFTER_TOOL):
+        if self._trigger not in (BEFORE_TOOL, AFTER_TOOL):
             return False
         return bool(self.at_tool_name) and tool_name == self.at_tool_name
 

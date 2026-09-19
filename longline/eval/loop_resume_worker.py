@@ -59,13 +59,16 @@ from typing import TYPE_CHECKING, Any
 from longline.core.events import QueryEvent, TextDelta, ToolUseStart, TurnComplete
 from longline.eval.failpoints import (
     AFTER_CHECKPOINT,
+    BEFORE_MODEL,
+    TRUNCATE_TAIL,
+    WORKSPACE_DRIFT,
     FailpointError,
     FailpointGate,
     FailpointReached,
     block_forever,
     read_sentinel,
 )
-from longline.eval.side_effect_journal import KILLED, SideEffectJournal
+from longline.eval.side_effect_journal import KILLED, RESUMED, SideEffectJournal
 from longline.models.messages import Usage, UserMessage
 
 if TYPE_CHECKING:
@@ -73,6 +76,31 @@ if TYPE_CHECKING:
 
 SESSION_ID = "loop-resume"
 JOURNAL_NAME = "journal.jsonl"
+
+# The failpoints whose stop lands inside INSTRUCTION 2, so instruction 1 must
+# complete and be persisted first.
+#
+# `truncate_tail` is here for a reason found by testing rather than by design:
+# the turn-0 checkpoint is ONE line, so cutting its last line leaves nothing at
+# all and `load_session` returns None -- there is no resume to test. With
+# instruction 1 on disk the file has many lines, the torn one is dropped, and
+# what the arm actually exercises becomes visible (see `resume`).
+#
+# `workspace_drift` is deliberately NOT here: its fault is a mutated workspace,
+# and it only interacts with the run if the resumed leg is replaying instruction
+# 1. It therefore stops at instruction 1's first model call, exactly like
+# `before_model`, which is also its control.
+STOPS_IN_INSTRUCTION_TWO: tuple[str, ...] = (AFTER_CHECKPOINT, TRUNCATE_TAIL)
+
+# Which GATE mechanism parks the child for each failpoint. The two parent-side
+# failpoints reuse a gate because the child still has to stop somewhere for the
+# parent to kill it; what makes them their own failpoint is what the parent does
+# afterwards -- cut the session file, or mutate the workspace.
+_GATE_TRIGGER: dict[str, str] = {
+    AFTER_CHECKPOINT: AFTER_CHECKPOINT,
+    TRUNCATE_TAIL: AFTER_CHECKPOINT,
+    WORKSPACE_DRIFT: BEFORE_MODEL,
+}
 
 # The files the journal digests before and after each tool execution. Only the
 # ones the task mutates: hashing the whole sandbox would make `post_state`
@@ -253,16 +281,28 @@ def _save_checkpoint(engine: Any, claude_dir: Path, session_id: str) -> None:
     )
 
 
-async def _run_instruction(engine: Any) -> int:
+async def _run_instruction(engine: Any) -> list[str]:
     """Run ONE instruction the way production does: a single `run_turn()`.
 
     NOT split into one call per model call -- see the module docstring. The
     agent may make many model calls inside this one call, and production writes
     no checkpoint until it returns.
+
+    Returns the text of every errored tool result, in order. That is what a
+    workspace-identity check would have to produce for a stale checkpoint to be
+    *detected*; with no such mechanism in production the list stays empty, and
+    the drift arm's job is to show that it does.
     """
-    async for _event in engine.run_turn():
-        pass
-    return 1
+    from longline.core.events import ToolResultReady
+
+    names: dict[str, str] = {}
+    errors: list[str] = []
+    async for event in engine.run_turn():
+        if isinstance(event, ToolUseStart):
+            names[event.tool_id] = event.tool_name
+        elif isinstance(event, ToolResultReady) and event.is_error:
+            errors.append(f"{names.get(event.tool_id, '?')}: {event.content}")
+    return errors
 
 
 def _gate_block(spec: dict[str, Any]) -> Callable[[], None]:
@@ -280,16 +320,20 @@ def _gate_block(spec: dict[str, Any]) -> Callable[[], None]:
 
 
 def _build_gate(spec: dict[str, Any], failpoint: str) -> FailpointGate:
+    trigger = _GATE_TRIGGER.get(failpoint, failpoint)
     return FailpointGate(
         claude_dir=Path(spec["claude_dir"]),
+        # The sentinel names the CASE's failpoint, not the mechanism that
+        # stopped the child, so the runner can assert the right one fired.
         failpoint=failpoint,
+        trigger=trigger,
         at_call_index=int(spec.get("at_call_index", 1)),
         at_tool_name=str(spec.get("failpoint_tool", "")),
         # Armed from the start for every arm whose stop is inside instruction 1.
-        # For after_checkpoint it stays disarmed until instruction 1 is saved,
-        # so `GatedModel`'s armed-only counter starts at instruction 2's first
-        # call -- no hand-kept call index to go stale.
-        armed=failpoint != AFTER_CHECKPOINT,
+        # For the two that stop inside instruction 2 it stays disarmed until
+        # instruction 1 is saved, so `GatedModel`'s armed-only counter starts at
+        # instruction 2's first call -- no hand-kept call index to go stale.
+        armed=trigger != AFTER_CHECKPOINT,
         block=_gate_block(spec),
     )
 
@@ -328,8 +372,9 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
     instructions_run = 0
     error = ""
     stopped_at_failpoint = False
+    tool_errors: list[str] = []
     try:
-        if failpoint == AFTER_CHECKPOINT:
+        if failpoint in STOPS_IN_INSTRUCTION_TWO:
             asyncio.run(_run_instruction(engine))
             instructions_run += 1
             _save_checkpoint(engine, claude_dir, session_id)
@@ -337,7 +382,7 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
             sequence.steps = list(SCENARIO_TWO)
             sequence.offset = instruction_offset()
             engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
-        asyncio.run(_run_instruction(engine))
+        tool_errors = asyncio.run(_run_instruction(engine))
         instructions_run += 1
     except FailpointReached:
         # The failpoint fired and `no_block` asked it to unwind instead of
@@ -360,6 +405,170 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
         "instructions_run": instructions_run,
         "checkpoint_messages_before_loop": before_loop,
         "journal_entries": len(journal.entries),
+        "tool_errors": tool_errors,
+        "error": error,
+    }
+
+
+# --- phase 2: resume ---
+
+
+def check_transcript_structure(messages: Sequence[Any]) -> tuple[bool, list[str]]:
+    """Structural validity of a resumed transcript: API pairing + alternation.
+
+    Three independent conditions, each of which the API enforces when the
+    transcript goes back over the wire:
+
+    - every `tool_use` id has a matching `tool_result` (the API rejects the
+      request otherwise, which is what `validate_transcript` exists to fix);
+    - no `tool_result` refers to an id that was never requested;
+    - no two consecutive messages share a role, and the transcript does not end
+      on an assistant message.
+
+    Returns `(valid, errors)` rather than raising, so a broken resume is
+    recorded as a failed case with a reason rather than crashing the suite.
+    """
+    from longline.models.content_blocks import ToolResultBlock, ToolUseBlock
+    from longline.models.messages import AssistantMessage, UserMessage
+
+    errors: list[str] = []
+    tool_use_ids: list[str] = []
+    result_ids: list[str] = []
+
+    for msg in messages:
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock):
+                    tool_use_ids.append(block.id)
+        elif isinstance(msg, UserMessage) and isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, ToolResultBlock):
+                    result_ids.append(block.tool_use_id)
+
+    unanswered = [i for i in tool_use_ids if i not in set(result_ids)]
+    if unanswered:
+        errors.append(f"tool_use without tool_result: {unanswered}")
+    orphan_results = [i for i in result_ids if i not in set(tool_use_ids)]
+    if orphan_results:
+        errors.append(f"tool_result without tool_use: {orphan_results}")
+
+    for i in range(1, len(messages)):
+        if type(messages[i]) is type(messages[i - 1]):
+            errors.append(f"role alternation violated at message {i}")
+    if messages and isinstance(messages[-1], AssistantMessage):
+        errors.append("transcript ends on an assistant message")
+
+    return (not errors), errors
+
+
+def _restore_task_snapshot(snapshot: list[dict[str, Any]] | None) -> dict[str, str]:
+    """Run the production `TaskRegistry.restore()` and report the states it set."""
+    from longline.session.task_registry import TaskRegistry
+
+    registry = TaskRegistry()
+    if snapshot:
+        registry.restore(snapshot)
+    return {r.task_id: r.state.value for r in registry.list_all()}
+
+
+def _not_found(session_id: str, detail: str) -> dict[str, Any]:
+    return {
+        "phase": "resume",
+        "session_id": session_id,
+        "checkpoint_loaded": False,
+        "layer_state_ok": False,
+        "structural_errors": [detail],
+        "transcript_repaired": False,
+        "repairs": [],
+        "instructions_run": 0,
+        "task_states": {},
+        "error": detail,
+    }
+
+
+def resume(spec: dict[str, Any]) -> dict[str, Any]:
+    """Phase 2: load what the dead process left, then FINISH THE TASK.
+
+    The production order and the production functions, in `main.py`'s sequence:
+    `load_session` -> `validate_transcript` -> `load_task_snapshot` ->
+    `TaskRegistry.restore`. Then the loop runs again on the recovered
+    transcript -- which is where a replayed side effect shows up.
+    """
+    from longline.session.recovery import TranscriptRepairReport, validate_transcript
+    from longline.session.storage import load_session, load_task_snapshot
+
+    claude_dir = Path(spec["claude_dir"])
+    sandbox = Path(spec["sandbox"])
+    session_id = str(spec.get("session_id", SESSION_ID))
+    failpoint = str(spec.get("failpoint", ""))
+
+    loaded = load_session(session_id, claude_dir=claude_dir)
+    if loaded is None:
+        return _not_found(session_id, "session not found")
+
+    repair_report = TranscriptRepairReport()
+    repaired = validate_transcript(loaded, report=repair_report)
+    structural_ok, structural_errors = check_transcript_structure(repaired)
+
+    snapshot = load_task_snapshot(session_id, claude_dir=claude_dir)
+    task_states = _restore_task_snapshot(snapshot)
+
+    # Disarmed: the gate is a fixture of the killed leg. Armed here it would
+    # park this process forever and every case would time out.
+    gate = FailpointGate(
+        claude_dir=claude_dir,
+        failpoint=failpoint,
+        at_call_index=int(spec.get("at_call_index", 1)),
+        at_tool_name=str(spec.get("failpoint_tool", "")),
+        armed=False,
+    )
+    journal = SideEffectJournal(claude_dir / JOURNAL_NAME, RESUMED)
+
+    if failpoint in STOPS_IN_INSTRUCTION_TWO:
+        # Instruction 1 is already on the transcript, so the model picks up at
+        # instruction 2's step -- and instruction 2 itself was never persisted
+        # (it was typed and the process died before any save). Re-supplying it
+        # is what a user does after a crash, not a convenience for the harness.
+        sequence = ScriptedToolSequence(steps=list(SCENARIO_TWO), offset=instruction_offset())
+    else:
+        sequence = ScriptedToolSequence(steps=list(SCENARIO_ONE), offset=0)
+
+    engine = build_scenario_engine(
+        str(sandbox),
+        model=str(spec.get("model", "offline-model")),
+        api_key=str(spec.get("api_key", "offline")),
+        gate=gate,
+        journal=journal,
+        sequence=sequence,
+    )
+    engine.messages.extend(repaired)
+    if failpoint in STOPS_IN_INSTRUCTION_TWO:
+        engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
+
+    error = ""
+    instructions_run = 0
+    tool_errors: list[str] = []
+    try:
+        tool_errors = asyncio.run(_run_instruction(engine))
+        instructions_run = 1
+    except BaseException as exc:  # reported, not swallowed
+        error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "phase": "resume",
+        "session_id": session_id,
+        "checkpoint_loaded": True,
+        "num_loaded_messages": len(loaded),
+        "num_repaired_messages": len(repaired),
+        "transcript_repaired": repair_report.repaired,
+        "repairs": list(repair_report.repairs),
+        "structural_ok": structural_ok,
+        "structural_errors": structural_errors,
+        "layer_state_ok": structural_ok and not error,
+        "task_states": task_states,
+        "instructions_run": instructions_run,
+        "journal_entries": len(journal.entries),
+        "tool_errors": tool_errors,
         "error": error,
     }
 
@@ -371,7 +580,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
-    report = arm(spec)
+    report = arm(spec) if args.phase == "arm" else resume(spec)
     # One JSON object on stdout and nothing else, so the parent can parse it
     # even when a later run's process was killed mid-write.
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
