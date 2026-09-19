@@ -1,0 +1,450 @@
+{
+  "DriftRecall": {
+    "ci95_wilson": [
+      0.7224672001371107,
+      0.9999999999999999
+    ],
+    "denominator": 10,
+    "numerator": 10,
+    "value": 1.0
+  },
+  "FalseRejectRate": {
+    "ci95_wilson": [
+      0.0,
+      0.06017185214208986
+    ],
+    "denominator": 60,
+    "numerator": 0,
+    "value": 0.0
+  },
+  "LoopResumeRate": {
+    "ci95_wilson": [
+      0.9286524008666414,
+      1.0
+    ],
+    "denominator": 50,
+    "numerator": 50,
+    "value": 1.0
+  },
+  "WorkspaceDriftDetectionRate": {
+    "ci95_wilson": [
+      0.2992980081982123,
+      0.7007019918017877
+    ],
+    "denominator": 20,
+    "numerator": 10,
+    "value": 0.5
+  },
+  "by_failpoint": {
+    "after_checkpoint": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "after_tool": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "before_model": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "before_tool": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "truncate_tail": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "workspace_drift": {
+      "ci95_wilson": [
+        0.0,
+        0.2775327998628892
+      ],
+      "denominator": 10,
+      "numerator": 0,
+      "value": 0.0
+    },
+    "workspace_drift_unrelated": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    }
+  },
+  "by_failpoint_counts": {
+    "after_checkpoint": 10,
+    "after_tool": 10,
+    "before_model": 10,
+    "before_tool": 10,
+    "truncate_tail": 10,
+    "workspace_drift": 10,
+    "workspace_drift_unrelated": 10
+  },
+  "cases": "evals\\loop_resume.jsonl",
+  "durability": true,
+  "failures": [
+    {
+      "case_id": "lr-workspace-drift#0",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#1",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#2",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#3",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#4",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#5",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#6",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#7",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#8",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#9",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    }
+  ],
+  "label": "restart-vs-resume",
+  "num_runs": 70,
+  "problems": [],
+  "restart_baseline": true,
+  "restart_vs_resume": {
+    "by_failpoint": {
+      "after_checkpoint": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 600.0,
+          "loop_ms": 69.98253000201657,
+          "model_calls": 6.0,
+          "output_tokens": 130.0,
+          "tool_calls": 4.0
+        },
+        "resume": {
+          "input_tokens": 200.0,
+          "loop_ms": 20.162960003654007,
+          "model_calls": 2.0,
+          "output_tokens": 45.0,
+          "tool_calls": 1.0
+        },
+        "saving": {
+          "input_tokens": 0.6666666666666667,
+          "loop_ms": 0.7118858091716175,
+          "model_calls": 0.6666666666666667,
+          "output_tokens": 0.6538461538461539,
+          "tool_calls": 0.75
+        }
+      },
+      "after_tool": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 400.0,
+          "loop_ms": 47.487940001883544,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "resume": {
+          "input_tokens": 200.0,
+          "loop_ms": 13.476010000158567,
+          "model_calls": 2.0,
+          "output_tokens": 45.0,
+          "tool_calls": 1.0
+        },
+        "saving": {
+          "input_tokens": 0.5,
+          "loop_ms": 0.7162224767041051,
+          "model_calls": 0.5,
+          "output_tokens": 0.47058823529411764,
+          "tool_calls": 0.6666666666666667
+        }
+      },
+      "before_model": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 400.0,
+          "loop_ms": 63.7456900003599,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "resume": {
+          "input_tokens": 400.0,
+          "loop_ms": 70.82416999910492,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "saving": {
+          "input_tokens": 0.0,
+          "loop_ms": -0.11104248771493519,
+          "model_calls": 0.0,
+          "output_tokens": 0.0,
+          "tool_calls": 0.0
+        }
+      },
+      "before_tool": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 400.0,
+          "loop_ms": 50.26314999850001,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "resume": {
+          "input_tokens": 300.0,
+          "loop_ms": 50.58123000198975,
+          "model_calls": 3.0,
+          "output_tokens": 65.0,
+          "tool_calls": 2.0
+        },
+        "saving": {
+          "input_tokens": 0.25,
+          "loop_ms": -0.006328294257308409,
+          "model_calls": 0.25,
+          "output_tokens": 0.23529411764705888,
+          "tool_calls": 0.33333333333333337
+        }
+      },
+      "truncate_tail": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 600.0,
+          "loop_ms": 75.80783000012161,
+          "model_calls": 6.0,
+          "output_tokens": 130.0,
+          "tool_calls": 4.0
+        },
+        "resume": {
+          "input_tokens": 200.0,
+          "loop_ms": 19.215690001146868,
+          "model_calls": 2.0,
+          "output_tokens": 45.0,
+          "tool_calls": 1.0
+        },
+        "saving": {
+          "input_tokens": 0.6666666666666667,
+          "loop_ms": 0.7465210387750706,
+          "model_calls": 0.6666666666666667,
+          "output_tokens": 0.6538461538461539,
+          "tool_calls": 0.75
+        }
+      },
+      "workspace_drift": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 400.0,
+          "loop_ms": 49.20457000116585,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "resume": {
+          "input_tokens": 0.0,
+          "loop_ms": 0.0,
+          "model_calls": 0.0,
+          "output_tokens": 0.0,
+          "tool_calls": 0.0
+        },
+        "saving": {
+          "input_tokens": 1.0,
+          "loop_ms": 1.0,
+          "model_calls": 1.0,
+          "output_tokens": 1.0,
+          "tool_calls": 1.0
+        }
+      },
+      "workspace_drift_unrelated": {
+        "n": 10,
+        "restart": {
+          "input_tokens": 400.0,
+          "loop_ms": 59.67421999957878,
+          "model_calls": 4.0,
+          "output_tokens": 85.0,
+          "tool_calls": 3.0
+        },
+        "resume": {
+          "input_tokens": 200.0,
+          "loop_ms": 16.356830002041534,
+          "model_calls": 2.0,
+          "output_tokens": 45.0,
+          "tool_calls": 1.0
+        },
+        "saving": {
+          "input_tokens": 0.5,
+          "loop_ms": 0.725897883505524,
+          "model_calls": 0.5,
+          "output_tokens": 0.47058823529411764,
+          "tool_calls": 0.6666666666666667
+        }
+      }
+    },
+    "n": 70,
+    "restart": {
+      "input_tokens": 457.14285714285717,
+      "loop_ms": 59.452275714803754,
+      "model_calls": 4.571428571428571,
+      "output_tokens": 97.85714285714286,
+      "tool_calls": 3.2857142857142856
+    },
+    "resume": {
+      "input_tokens": 214.28571428571428,
+      "loop_ms": 27.230984286870807,
+      "model_calls": 2.142857142857143,
+      "output_tokens": 47.142857142857146,
+      "tool_calls": 1.2857142857142858
+    },
+    "saving": {
+      "input_tokens": 0.53125,
+      "loop_ms": 0.5419690170061862,
+      "model_calls": 0.53125,
+      "output_tokens": 0.5182481751824817,
+      "tool_calls": 0.6086956521739131
+    }
+  },
+  "side_effects": {
+    "by_tool": {},
+    "denominator": 70,
+    "duplicated": 0,
+    "redundant": 0
+  }
+}
