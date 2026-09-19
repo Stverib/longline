@@ -50,6 +50,7 @@ from longline.eval.failpoints import (
     ALL_FAILPOINTS,
     TRUNCATE_TAIL,
     WORKSPACE_DRIFT,
+    WORKSPACE_DRIFT_UNRELATED,
     FailpointError,
     read_sentinel,
     terminate_and_reap,
@@ -73,9 +74,14 @@ if TYPE_CHECKING:
     from longline.eval.loop_resume import LoopResumeCase
 
 # The failpoints whose result is a DETECTION, not a recovery. Kept separate so
-# the headline rate cannot be moved by a production capability that does not
-# exist.
-DETECTION_FAILPOINTS: tuple[str, ...] = (WORKSPACE_DRIFT,)
+# the headline rate cannot be moved by a capability that answers a different
+# question -- one arm asks "is dependent drift caught", the other "is unrelated
+# drift wrongly refused", and neither is a statement about recovery.
+DETECTION_FAILPOINTS: tuple[str, ...] = (WORKSPACE_DRIFT, WORKSPACE_DRIFT_UNRELATED)
+
+# The arms where drift is SUPPOSED to produce a refusal. Every other arm is the
+# false-reject control: a resume the identity check must let through.
+RELEVANT_DRIFT_FAILPOINTS: tuple[str, ...] = (WORKSPACE_DRIFT,)
 
 CLAUDE_DIR_PREFIX = "loop-resume-claude-"
 SANDBOX_PREFIX = "loop-resume-sandbox-"
@@ -116,8 +122,14 @@ class LoopResumeRun:
     duplicate_side_effects: int = 0
     redundant_re_executions: int = 0
     side_effect_denominator: int = 0
+    drift_injected: bool = False
     workspace_drifted: bool = False
     drift_detected: bool = False
+    workspace_verdict: str = ""
+    workspace_rejected: bool = False
+    false_reject: bool = False
+    workspace_relevant: list[str] = field(default_factory=list)
+    workspace_unrelated: list[str] = field(default_factory=list)
     resume_latency_ms: float = 0.0
     judge_detail: list[dict[str, Any]] = field(default_factory=list)
     structural_errors: list[str] = field(default_factory=list)
@@ -146,8 +158,14 @@ class LoopResumeRun:
             "duplicate_side_effects": self.duplicate_side_effects,
             "redundant_re_executions": self.redundant_re_executions,
             "side_effect_denominator": self.side_effect_denominator,
+            "drift_injected": self.drift_injected,
             "workspace_drifted": self.workspace_drifted,
             "drift_detected": self.drift_detected,
+            "workspace_verdict": self.workspace_verdict,
+            "workspace_rejected": self.workspace_rejected,
+            "false_reject": self.false_reject,
+            "workspace_relevant": self.workspace_relevant,
+            "workspace_unrelated": self.workspace_unrelated,
             "resume_latency_ms": self.resume_latency_ms,
             "judge_detail": self.judge_detail,
             "structural_errors": self.structural_errors,
@@ -215,6 +233,8 @@ class LoopResumeSummary:
 
     loop_resume_rate: Ratio
     workspace_drift_detection_rate: Ratio
+    drift_recall: Ratio
+    false_reject_rate: Ratio
     by_failpoint: dict[str, Ratio]
     side_effects: SideEffectMetrics
     failures: list[dict[str, object]] = field(default_factory=list)
@@ -223,6 +243,8 @@ class LoopResumeSummary:
         return {
             "LoopResumeRate": self.loop_resume_rate.to_dict(),
             "WorkspaceDriftDetectionRate": self.workspace_drift_detection_rate.to_dict(),
+            "DriftRecall": self.drift_recall.to_dict(),
+            "FalseRejectRate": self.false_reject_rate.to_dict(),
             "by_failpoint": {k: v.to_dict() for k, v in self.by_failpoint.items()},
             "side_effects": self.side_effects.to_row(),
             "failures": self.failures,
@@ -269,6 +291,23 @@ def aggregate_loop_resume(runs: Sequence[LoopResumeRun]) -> LoopResumeSummary:
         ),
         workspace_drift_detection_rate=Ratio(
             sum(1 for r in detection if r.drift_detected), len(detection)
+        ),
+        # Recall on the arms where drift is SUPPOSED to refuse, and the false
+        # reject rate on every arm where it is not. Reported as a pair because
+        # either alone is trivially gameable: a detector that always refuses has
+        # perfect recall, and one that never refuses has a perfect false-reject
+        # rate.
+        drift_recall=Ratio(
+            sum(
+                1
+                for r in runs
+                if r.failpoint in RELEVANT_DRIFT_FAILPOINTS and r.workspace_rejected
+            ),
+            sum(1 for r in runs if r.failpoint in RELEVANT_DRIFT_FAILPOINTS),
+        ),
+        false_reject_rate=Ratio(
+            sum(1 for r in runs if r.false_reject),
+            sum(1 for r in runs if r.failpoint not in RELEVANT_DRIFT_FAILPOINTS),
         ),
         by_failpoint=by_failpoint,
         side_effects=side_effects,
@@ -344,18 +383,61 @@ def apply_seed(sandbox: Path, seed: int) -> None:
 
 
 def drift_the_workspace(sandbox: Path) -> None:
-    """Mutate the artifacts between the kill and the resume.
+    """Mutate a file the session has READ, between the kill and the resume.
+
+    `src/calc.py` rather than `NOTES.md`, and the choice is forced rather than
+    arbitrary. The dependent set is built from `Tool.workload`, and `Bash`
+    declares nothing -- so the file the Bash append writes never enters the write
+    set, while the file the `Read` touches does. Drifting a file the session never
+    recorded touching would be testing the UNRELATED arm's question by accident.
 
     Appends rather than overwrites: an appended line leaves every earlier line
-    intact, so a resumed leg that blindly continues from its checkpoint produces
-    a file that is visibly the product of two writers rather than one that
-    merely looks odd.
+    intact, so the file is visibly the product of two writers rather than one that
+    merely looks odd. A comment, so the fixture's own test suite still passes
+    afterwards -- this arm measures detection, not whether the drift broke
+    anything.
     """
-    notes = sandbox / "NOTES.md"
-    if notes.is_file():
-        notes.write_text(
-            notes.read_text(encoding="utf-8") + "drifted-by-another-writer\n",
+    calc = sandbox / "src" / "calc.py"
+    if calc.is_file():
+        calc.write_text(
+            calc.read_text(encoding="utf-8") + "# drifted-by-another-writer\n",
             encoding="utf-8",
+        )
+
+
+def drift_an_unrelated_file(sandbox: Path) -> None:
+    """Create a file the session never touched, between the kill and the resume.
+
+    The opposite question to `drift_the_workspace`: a detector that flags
+    dependent drift but also refuses this one is not a detector, it is a wall.
+    """
+    (sandbox / "src" / "UNRELATED.md").write_text(
+        "a file another writer added\n", encoding="utf-8"
+    )
+
+
+def _init_workspace_repo(sandbox: Path) -> None:
+    """Make the sandbox a git repo, so unrelated drift is detectable at all.
+
+    Without a repo the identity check can still see a DEPENDENT change -- it
+    compares hashes it recorded -- but cannot enumerate anything else, so the
+    unrelated arm would have nothing to measure and would report a clean
+    workspace for a reason that has nothing to do with the runtime.
+
+    Seed FIRST, then commit: the seed's edits belong to the fixture's initial
+    state, so the tree starts clean and any later change is genuinely later.
+    """
+    for args in (
+        ("init",),
+        ("add", "-A"),
+        ("-c", "user.email=eval@longline", "-c", "user.name=eval", "commit", "-m", "fixture"),
+    ):
+        subprocess.run(
+            ["git", *args],
+            cwd=sandbox,
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
 
@@ -493,6 +575,9 @@ async def run_loop_resume_case(
         if case.fixture:
             shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
         apply_seed(sandbox, case.seed)
+        # After the seed, so the fixture's initial commit contains the seeded
+        # content and the tree starts dirty only if the RUNTIME made it dirty.
+        _init_workspace_repo(sandbox)
 
         spec = _build_spec(case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key)
         spec_path = claude_dir / "spec.json"
@@ -512,6 +597,9 @@ async def run_loop_resume_case(
             truncate_last_line(session_file)
         elif case.failpoint == WORKSPACE_DRIFT:
             drift_the_workspace(sandbox)
+            drifted = True
+        elif case.failpoint == WORKSPACE_DRIFT_UNRELATED:
+            drift_an_unrelated_file(sandbox)
             drifted = True
 
         # --- step 5: resume in a fresh interpreter ---
@@ -546,8 +634,25 @@ async def run_loop_resume_case(
             duplicate_side_effects=metrics.duplicated,
             redundant_re_executions=metrics.redundant,
             side_effect_denominator=metrics.denominator,
-            workspace_drifted=drifted and workspace_drifted(after, before),
-            drift_detected=drifted and bool(tool_errors),
+            # Two facts, and the drift arms need them apart. `drift_injected` is
+            # what the parent DID; `workspace_drifted` is whether the declared
+            # artifacts moved, which is true for every arm that does its job. The
+            # dependent arm's mutation lands on a declared artifact so both hold;
+            # the unrelated arm's lands deliberately outside that set.
+            drift_injected=drifted,
+            workspace_drifted=workspace_drifted(after, before),
+            drift_detected=bool(resumed.get("workspace_rejected")),
+            workspace_verdict=str(resumed.get("workspace_verdict", "")),
+            workspace_rejected=bool(resumed.get("workspace_rejected")),
+            # The expensive direction of a detection mechanism is the one that
+            # blocks work that was safe, so it is measured on EVERY arm -- and
+            # every arm except the dependent-drift one is a clean-resume control.
+            false_reject=(
+                bool(resumed.get("workspace_rejected"))
+                and case.failpoint not in RELEVANT_DRIFT_FAILPOINTS
+            ),
+            workspace_relevant=[str(p) for p in resumed.get("workspace_relevant", [])],
+            workspace_unrelated=[str(p) for p in resumed.get("workspace_unrelated", [])],
             resume_latency_ms=resume_ms,
             judge_detail=judge_detail,
             structural_errors=[str(e) for e in resumed.get("structural_errors", [])],
@@ -599,11 +704,13 @@ async def run_loop_resume_suite(
 __all__ = [
     "DETECTION_FAILPOINTS",
     "PER_CASE_FIELDS",
+    "RELEVANT_DRIFT_FAILPOINTS",
     "WORKSPACE_TEST_ARGS",
     "LoopResumeRun",
     "LoopResumeSummary",
     "aggregate_loop_resume",
     "apply_seed",
+    "drift_an_unrelated_file",
     "drift_the_workspace",
     "kill_armed_child",
     "resume_succeeded",

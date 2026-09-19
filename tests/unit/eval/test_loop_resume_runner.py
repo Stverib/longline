@@ -239,10 +239,11 @@ def test_every_row_carries_the_per_case_fields() -> None:
         assert name in row, name
 
 
-def test_dataset_expands_to_sixty_runs_ten_per_failpoint() -> None:
+def test_dataset_expands_to_ten_runs_per_failpoint() -> None:
+    """Derived, not a literal -- see `test_loop_resume_cases` for why."""
     cases = load_loop_resume_cases(DATASET)
     grouped = cases_by_failpoint(cases)
-    assert len(cases) == 60
+    assert len(cases) == len(ALL_FAILPOINTS) * 10
     assert all(len(v) == 10 for v in grouped.values())
 
 

@@ -13,7 +13,8 @@ parent after the kill:
 | after_tool         | a tool returned, before its result is recorded     |
 | after_checkpoint   | entering model call N of a later instruction       |
 | truncate_tail      | (parent) the session JSONL tail is cut mid-line    |
-| workspace_drift    | (parent) the fixture files are mutated             |
+| workspace_drift    | (parent) a file the session DEPENDS ON is mutated  |
+| workspace_drift_unrelated | (parent) an untouched file is mutated        |
 
 `before_model` and `after_checkpoint` are the SAME code point (model-call
 entry). They are separate names because what they assert about the on-disk
@@ -49,7 +50,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from longline.eval.faults import sha256_file
-from longline.tools.base import Tool, ToolResult, ToolSchema
+from longline.tools.base import ReconcileOutcome, Tool, ToolResult, ToolSchema
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
@@ -62,11 +63,21 @@ AFTER_TOOL = "after_tool"
 AFTER_CHECKPOINT = "after_checkpoint"
 TRUNCATE_TAIL = "truncate_tail"
 WORKSPACE_DRIFT = "workspace_drift"
+# The same parent-side action as WORKSPACE_DRIFT, applied to a file the session
+# never touched. It exists as its own name because the two ask opposite questions
+# of the same mechanism: WORKSPACE_DRIFT asks whether dependent drift is CAUGHT,
+# and this asks whether unrelated drift is wrongly REFUSED. A detector that
+# answers yes to both is either useless or is not a detector.
+WORKSPACE_DRIFT_UNRELATED = "workspace_drift_unrelated"
 
 # The four the child's own gate can stop at.
 GATED_FAILPOINTS: tuple[str, ...] = (BEFORE_MODEL, BEFORE_TOOL, AFTER_TOOL, AFTER_CHECKPOINT)
-# The two the parent performs on the child's leftovers after the kill.
-PARENT_FAILPOINTS: tuple[str, ...] = (TRUNCATE_TAIL, WORKSPACE_DRIFT)
+# The three the parent performs on the child's leftovers after the kill.
+PARENT_FAILPOINTS: tuple[str, ...] = (
+    TRUNCATE_TAIL,
+    WORKSPACE_DRIFT,
+    WORKSPACE_DRIFT_UNRELATED,
+)
 ALL_FAILPOINTS: tuple[str, ...] = GATED_FAILPOINTS + PARENT_FAILPOINTS
 
 
@@ -210,20 +221,30 @@ class FailpointGate:
     trigger: str = ""
 
     @property
-    def _trigger(self) -> str:
+    def trigger_kind(self) -> str:
+        """WHICH mechanism fires this gate, as opposed to what the sentinel says.
+
+        The two differ for the parent-side failpoints: `workspace_drift` has no
+        stop of its own -- the parent mutates the workspace after the kill -- but
+        still needs the child to stop somewhere, so its gate's `trigger` is
+        `before_tool` while its `failpoint` (and therefore the sentinel) stays
+        `workspace_drift`. Every decision about WHERE to stop must read this, not
+        `failpoint`; reading `failpoint` worked only while no parent-side failpoint
+        used a tool trigger, and silently stopped firing the moment one did.
+        """
         return self.trigger or self.failpoint
 
     def triggers_model(self, call_index: int) -> bool:
         if not self.armed:
             return False
-        if self._trigger not in (BEFORE_MODEL, AFTER_CHECKPOINT):
+        if self.trigger_kind not in (BEFORE_MODEL, AFTER_CHECKPOINT):
             return False
         return call_index == self.at_call_index
 
     def triggers_tool(self, tool_name: str) -> bool:
         if not self.armed:
             return False
-        if self._trigger not in (BEFORE_TOOL, AFTER_TOOL):
+        if self.trigger_kind not in (BEFORE_TOOL, AFTER_TOOL):
             return False
         return bool(self.at_tool_name) and tool_name == self.at_tool_name
 
@@ -311,13 +332,28 @@ class GatedTool(Tool):
     def get_schema(self) -> ToolSchema:
         return self.inner.get_schema()
 
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        """Forwarded, and NOT optional.
+
+        `Tool.workload` defaults to `{}`, so a wrapper that did not forward would
+        declare nothing for every tool it wraps -- silently emptying the journal's
+        digests, which is what reconciliation and the workspace identity both read.
+        The suite would then report a clean recovery for a runtime that had been
+        blinded, and nothing in the numbers would say so.
+        """
+        return self.inner.workload(tool_input)
+
+    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        """Forwarded for the same reason: the inner tool is what knows its effect."""
+        return self.inner.reconcile(tool_input)
+
     def is_concurrency_safe(self, tool_input: dict[str, Any]) -> bool:
         return self.inner.is_concurrency_safe(tool_input)
 
     async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
         self.calls += 1
         name = self.get_name()
-        if self.gate.triggers_tool(name) and self.gate.failpoint == BEFORE_TOOL:
+        if self.gate.triggers_tool(name) and self.gate.trigger_kind == BEFORE_TOOL:
             self.gate.stop(detail={"tool": name, "tool_call_index": self.calls})
             # Unreachable in a real run; see `GatedModel._serve`. Returning
             # without delegating is what makes `before_tool` mean "the tool
@@ -339,7 +375,7 @@ class GatedTool(Tool):
                 post_state=post_state,
             )
 
-        if self.gate.triggers_tool(name) and self.gate.failpoint == AFTER_TOOL:
+        if self.gate.triggers_tool(name) and self.gate.trigger_kind == AFTER_TOOL:
             self.gate.stop(detail={"tool": name, "tool_call_index": self.calls})
         return result
 
@@ -434,6 +470,7 @@ __all__ = [
     "STOPPED_TOOL_RESULT",
     "TRUNCATE_TAIL",
     "WORKSPACE_DRIFT",
+    "WORKSPACE_DRIFT_UNRELATED",
     "FailpointError",
     "FailpointGate",
     "FailpointReached",

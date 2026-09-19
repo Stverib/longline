@@ -33,7 +33,13 @@ from longline.eval.tool_desc_variants import (
     DescriptionVariantTool,
     steered_tool_names,
 )
-from longline.tools.base import Tool, ToolRegistry, ToolResult, ToolSchema
+from longline.tools.base import (
+    ReconcileOutcome,
+    Tool,
+    ToolRegistry,
+    ToolResult,
+    ToolSchema,
+)
 from longline.tools.bash.bash_tool import BashTool
 from longline.tools.file_edit.file_edit_tool import FileEditTool
 from longline.tools.file_read.file_read_tool import FileReadTool
@@ -226,7 +232,16 @@ class SandboxedTool(Tool):
     def is_concurrency_safe(self, tool_input: dict[str, Any]) -> bool:
         return self._inner.is_concurrency_safe(tool_input)
 
-    async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
+    def _bound(self, tool_input: dict[str, Any]) -> dict[str, Any] | ToolResult:
+        """The tool input with its path argument resolved into the sandbox.
+
+        Returns the refusal `ToolResult` when the path points outside, which is
+        what `execute` reports. All three of `execute`, `workload` and `reconcile`
+        go through here on purpose: `execute` hands the inner tool a REWRITTEN
+        argument, so anything reading the raw one would be describing a different
+        file from the one the tool actually touches -- an empty read/write set, or
+        a digest of a path nothing writes.
+        """
         arg = self._path_arg
         raw = tool_input.get(arg)
         if not raw:
@@ -235,8 +250,8 @@ class SandboxedTool(Tool):
             # process was launched from. The other tools declare the argument
             # required and are left to report that themselves.
             if arg == "path" and raw is None:
-                return await self._inner.execute({**tool_input, arg: str(self._sandbox)})
-            return await self._inner.execute(tool_input)
+                return {**tool_input, arg: str(self._sandbox)}
+            return tool_input
 
         candidate = Path(str(raw))
         resolved = candidate if candidate.is_absolute() else self._sandbox / candidate
@@ -249,7 +264,34 @@ class SandboxedTool(Tool):
                 ),
                 is_error=True,
             )
-        return await self._inner.execute({**tool_input, arg: str(resolved)})
+        return {**tool_input, arg: str(resolved)}
+
+    async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
+        bound = self._bound(tool_input)
+        if isinstance(bound, ToolResult):
+            return bound
+        return await self._inner.execute(bound)
+
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        """The declared paths, resolved exactly as `execute` resolves them.
+
+        Not a pass-through, and not optional: `Tool.workload` defaults to `{}`, so
+        a wrapper that neither forwarded nor re-resolved would leave the journal
+        with no digests at all -- silently disabling reconciliation and the
+        workspace identity, and reporting a clean recovery for a blinded runtime.
+        A refused call touches nothing inside the sandbox, so it declares nothing.
+        """
+        bound = self._bound(tool_input)
+        if isinstance(bound, ToolResult):
+            return {}
+        return self._inner.workload(bound)
+
+    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        """Forwarded with the same resolution, for the same reason."""
+        bound = self._bound(tool_input)
+        if isinstance(bound, ToolResult):
+            return ReconcileOutcome.UNKNOWN
+        return self._inner.reconcile(bound)
 
 
 def build_eval_registry(

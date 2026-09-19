@@ -121,11 +121,21 @@ def test_cases_by_failpoint_groups_every_class() -> None:
 
 
 def test_dataset_runs_ten_per_failpoint() -> None:
+    """Ten runs per arm, and one arm per name in the vocabulary.
+
+    The total is DERIVED from `ALL_FAILPOINTS` rather than written as a literal.
+    A literal would have to be edited every time an arm is added, which is the
+    edit that makes a dataset change look routine -- and the property worth
+    pinning is "every arm is present and none was left at one run", not "there
+    are exactly sixty".
+    """
     cases = load_loop_resume_cases(DATASET)
     grouped = cases_by_failpoint(cases)
     assert set(grouped) == set(ALL_FAILPOINTS)
-    assert all(len(v) == 10 for v in grouped.values())
-    assert len(cases) == 60
+    assert all(len(v) == 10 for v in grouped.values()), {
+        name: len(v) for name, v in grouped.items()
+    }
+    assert len(cases) == len(ALL_FAILPOINTS) * 10
 
 
 def test_every_dataset_case_declares_a_tool_for_gated_tool_failpoints() -> None:

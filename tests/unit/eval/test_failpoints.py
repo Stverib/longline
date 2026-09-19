@@ -386,4 +386,9 @@ def test_failpoint_vocabulary_is_split_into_gated_and_parent() -> None:
         "after_checkpoint",
         "truncate_tail",
         "workspace_drift",
+        # The same parent-side action as `workspace_drift` against a file the
+        # session never touched. Its own name because it asks the opposite
+        # question: not "is dependent drift caught" but "is unrelated drift
+        # wrongly refused".
+        "workspace_drift_unrelated",
     }

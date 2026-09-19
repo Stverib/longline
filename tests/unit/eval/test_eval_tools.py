@@ -269,3 +269,80 @@ class TestNoToolEscapesTheSandbox:
             want = production.get_schema()
             assert got.name == want.name, name
             assert got.input_schema == want.input_schema, name
+
+
+# --- workload / reconcile forwarding ----------------------------------------
+#
+# The wrappers an eval registry installs are the tools the journal actually asks
+# about, and `Tool.workload` defaults to `{}` and `Tool.reconcile` to UNKNOWN. A
+# wrapper that did not forward would declare nothing and verify nothing for every
+# tool it wraps -- silently emptying the journal's digests, which is what
+# reconciliation AND the workspace identity both read. The suite would then report
+# a clean recovery for a runtime that had been blinded, and no number would say
+# so. These tests exist because that is exactly what happened once.
+
+
+def test_the_sandboxed_tool_resolves_the_same_path_execute_does(tmp_path: Path) -> None:
+    """Not a pass-through: `execute` REWRITES the argument before delegating.
+
+    A pass-through would digest a different file from the one the tool touches.
+    """
+    from longline.eval.eval_tools import SandboxedTool
+    from longline.tools.file_read.file_read_tool import FileReadTool
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    wrapper = SandboxedTool(FileReadTool(), str(sandbox), "file_path")
+
+    declared = wrapper.workload({"file_path": "src/calc.py"})
+    assert declared == {str((sandbox / "src" / "calc.py").resolve()): "read"}
+
+
+def test_the_sandboxed_tool_declares_nothing_for_a_refused_path(tmp_path: Path) -> None:
+    """A call that will be refused touches nothing inside the sandbox."""
+    from longline.eval.eval_tools import SandboxedTool
+    from longline.tools.file_write.file_write_tool import FileWriteTool
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    wrapper = SandboxedTool(FileWriteTool(), str(sandbox), "file_path")
+    assert wrapper.workload({"file_path": str(tmp_path / "outside.txt"), "content": "x"}) == {}
+
+
+def test_the_sandboxed_tool_forwards_reconcile(tmp_path: Path) -> None:
+    from longline.eval.eval_tools import SandboxedTool
+    from longline.tools.base import ReconcileOutcome
+    from longline.tools.file_write.file_write_tool import FileWriteTool
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / "a.txt").write_text("written\n", encoding="utf-8")
+    wrapper = SandboxedTool(FileWriteTool(), str(sandbox), "file_path")
+
+    outcome = wrapper.reconcile({"file_path": "a.txt", "content": "written\n"})
+    assert outcome is ReconcileOutcome.APPLIED
+
+
+def test_the_gated_tool_forwards_workload_and_reconcile(tmp_path: Path) -> None:
+    """`GatedTool` is what the loop-resume suite swaps in for every tool.
+
+    It subclasses `Tool`, so it inherits the two defaults -- which is why it has
+    to override them explicitly rather than relying on the inner tool.
+    """
+    from longline.eval.failpoints import BEFORE_TOOL, FailpointGate, GatedTool
+    from longline.tools.base import ReconcileOutcome
+    from longline.tools.file_write.file_write_tool import FileWriteTool
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / "a.txt").write_text("written\n", encoding="utf-8")
+    gate = FailpointGate(claude_dir=tmp_path, failpoint=BEFORE_TOOL, armed=False)
+    gated = GatedTool(inner=FileWriteTool(), gate=gate)
+
+    target = str((sandbox / "a.txt").resolve())
+    assert gated.workload({"file_path": str(sandbox / "a.txt"), "content": "x"}) == {
+        target: "write"
+    }
+    assert gated.reconcile({"file_path": str(sandbox / "a.txt"), "content": "written\n"}) is (
+        ReconcileOutcome.APPLIED
+    )

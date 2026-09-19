@@ -12,38 +12,60 @@ difference from `recovery_worker`: a resume that only re-read a value out of the
 transcript cannot observe whether the agent re-executes a tool, which is what
 this suite measures.
 
-=== One `run_turn()` per instruction, not one per model call ===
+=== One `run_turn()` per instruction, and a checkpoint per STEP ===
 
 `QueryEngine.run_turn()` drives `query_loop`'s own `while` state machine
 (`query_loop.py:165`); the agent may make many model calls inside it. That is
 what `main.py` calls once per user input, and `save_session()` runs after it
-returns (`main.py:806-809`). So production's checkpoint granularity is ONE PER
-INSTRUCTION, and this worker must not invent a finer one: splitting an
-instruction into several `run_turn()` calls would put checkpoints where
-Longline never puts them, and the suite would then be measuring the harness.
+returns (`main.py:809`).
 
-The consequence is the point of the whole experiment: a kill anywhere inside an
-instruction leaves the transcript at the turn-0 floor, so the resumed leg has no
-record of anything the killed leg did.
+That used to mean ONE checkpoint per instruction, and the consequence was the
+point of the first version of this experiment: a kill anywhere inside an
+instruction left the transcript at the turn-0 floor, so the resumed leg had no
+record of anything the killed leg did, and `after_tool` duplicated its side
+effect in 10 of 10 injections.
+
+The runtime now checkpoints per STEP (`query_loop.on_step`), which is what
+`main.py` wires. This worker attaches that callback and must NOT place
+checkpoints of its own: a harness that saved at points the runtime does not would
+be measuring itself.
+
+=== The two records, and why they are not the same record ===
+
+Each leg writes two things:
+
+- `SideEffectJournal` -- the MEASURING INSTRUMENT. It digests the declared
+  artifacts before and after every execution and decides whether a replayed call
+  duplicated anything. Eval-side, and it must stay independent: if the runtime's
+  dedup produced the measurement, the measurement would be circular.
+- `ToolJournal` -- the RUNTIME's own recovery record, written by production code
+  the harness merely attaches. Reconciling it is what the fix does.
 
 === The scripted continuation policy, stated plainly ===
 
 Both legs are driven by `ScriptedToolSequence`, a fixed list of tool calls the
-model "decides" to make. When the resumed leg re-issues a tool call the killed
-leg already executed, that is the SCRIPT's decision, not a model's. What this
-suite measures is the RUNTIME's recovery semantics -- what the runtime does with
-a transcript that does not mention a side effect that really happened -- and it
-must never be reported as "Longline's agent duplicates side effects".
+model "decides" to make, whose progress is read off the transcript. When the
+resumed leg re-issues a tool call the killed leg already executed, that is the
+SCRIPT's decision, not a model's. What this suite measures is the RUNTIME's
+recovery semantics -- what the runtime does with a transcript that does not
+mention a side effect that really happened -- and it must never be reported as
+"Longline's agent duplicates side effects".
+
+The policy is "advance only on a settled step", and the three ways a result can
+be settled are enumerated on `settled_steps`. The one that carries the fix is
+INDETERMINATE: the runtime could not verify whether the operation landed, so the
+script does not repeat it.
 
 === The turn-0 checkpoint, and why it is a deliberate deviation ===
 
-`main.py` saves only after a `run_turn()` returns, so a crash between the user's
-instruction and the first model call leaves no session file at all. Copied
-faithfully, the `before_model` failpoint would have nothing to resume and would
-fail for a reason unrelated to recovery -- a tautology wearing a control group's
-name. So `arm` saves once before starting the loop. This deviation is recorded
-in `evals/README.md` and must not be quietly dropped: it is what makes the
-control arm a control.
+`main.py` saves nothing between the user's instruction and the first model call,
+so a crash there leaves no session file at all. Copied faithfully, the
+`before_model` failpoint would have nothing to resume and would fail for a reason
+unrelated to recovery -- a tautology wearing a control group's name. So `arm`
+saves once before starting the loop. Step-level checkpointing does not remove the
+need: this arm's fault lands BEFORE the first step. The deviation is recorded in
+`evals/README.md` and must not be quietly dropped: it is what makes the control
+arm a control.
 """
 
 from __future__ import annotations
@@ -59,9 +81,10 @@ from typing import TYPE_CHECKING, Any
 from longline.core.events import QueryEvent, TextDelta, ToolUseStart, TurnComplete
 from longline.eval.failpoints import (
     AFTER_CHECKPOINT,
-    BEFORE_MODEL,
+    BEFORE_TOOL,
     TRUNCATE_TAIL,
     WORKSPACE_DRIFT,
+    WORKSPACE_DRIFT_UNRELATED,
     FailpointError,
     FailpointGate,
     FailpointReached,
@@ -72,7 +95,7 @@ from longline.eval.side_effect_journal import KILLED, RESUMED, SideEffectJournal
 from longline.models.messages import Usage, UserMessage
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
 SESSION_ID = "loop-resume"
 JOURNAL_NAME = "journal.jsonl"
@@ -86,20 +109,31 @@ JOURNAL_NAME = "journal.jsonl"
 # instruction 1 on disk the file has many lines, the torn one is dropped, and
 # what the arm actually exercises becomes visible (see `resume`).
 #
-# `workspace_drift` is deliberately NOT here: its fault is a mutated workspace,
-# and it only interacts with the run if the resumed leg is replaying instruction
-# 1. It therefore stops at instruction 1's first model call, exactly like
-# `before_model`, which is also its control.
+# The two drift arms are deliberately NOT here: their fault is a mutated
+# workspace, injected between the kill and the resume, and it is only INTERESTING
+# if the session has already recorded a dependency on a file. They therefore stop
+# inside instruction 1, at the Edit call -- see `_GATE_TRIGGER`.
 STOPS_IN_INSTRUCTION_TWO: tuple[str, ...] = (AFTER_CHECKPOINT, TRUNCATE_TAIL)
 
-# Which GATE mechanism parks the child for each failpoint. The two parent-side
+# Which GATE mechanism parks the child for each failpoint. The three parent-side
 # failpoints reuse a gate because the child still has to stop somewhere for the
 # parent to kill it; what makes them their own failpoint is what the parent does
 # afterwards -- cut the session file, or mutate the workspace.
 _GATE_TRIGGER: dict[str, str] = {
     AFTER_CHECKPOINT: AFTER_CHECKPOINT,
     TRUNCATE_TAIL: AFTER_CHECKPOINT,
-    WORKSPACE_DRIFT: BEFORE_MODEL,
+    # Both drift arms stop at the Edit call -- AFTER the Read and the Bash
+    # append, BEFORE the Edit -- because a drift check can only be relevant to a
+    # file the session has actually touched. Stopping at the first model call, as
+    # the old arm did, left the read/write sets empty and made detection vacuous:
+    # every injected drift looked like somebody else's unrelated change.
+    #
+    # Edit rather than the Bash append, because Bash declares no workload (see
+    # `Tool.workload`), so the file it appends to never enters the write set. The
+    # Read of src/calc.py does, which is what makes the dependent arm's mutation
+    # detectable at all.
+    WORKSPACE_DRIFT: BEFORE_TOOL,
+    WORKSPACE_DRIFT_UNRELATED: BEFORE_TOOL,
 }
 
 # The files the journal digests before and after each tool execution. Only the
@@ -165,23 +199,93 @@ def instruction_offset() -> int:
     return len(SCENARIO_ONE)
 
 
-def _count_tool_uses(messages: Sequence[Any]) -> int:
-    """How many tool_use blocks the transcript already carries.
+def _tool_use_ids(messages: Sequence[Any]) -> list[str]:
+    """Every `tool_use` id the transcript carries, in order.
 
-    Reads the API shape (`to_api_dict` via `normalize_messages_for_api`),
-    because that is what `query_loop` hands the model -- counting the native
-    blocks would work in-process and silently break the moment the transcript
-    came back off disk.
+    Reads the API shape (`to_api_dict` via `normalize_messages_for_api`), because
+    that is what `query_loop` hands the model -- counting the native blocks would
+    work in-process and silently break the moment the transcript came back off
+    disk.
     """
-    total = 0
+    out: list[str] = []
     for message in messages:
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
-        total += sum(
-            1 for block in content if isinstance(block, dict) and block.get("type") == "tool_use"
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                out.append(str(block.get("id")))
+    return out
+
+
+def _results_by_id(messages: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    """The `tool_result` for each `tool_use` id, keyed by id."""
+    out: dict[str, dict[str, Any]] = {}
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                out[str(block.get("tool_use_id"))] = block
+    return out
+
+
+def _block_text(block: Mapping[str, Any]) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
         )
-    return total
+    return ""
+
+
+def settled_steps(messages: Sequence[Any]) -> int:
+    """How many scripted steps are finished with, one way or another.
+
+    Replaces a rule that counted `tool_use` blocks and ignored their results. That
+    rule was correct only while nothing was ever persisted mid-instruction: with
+    step-level checkpoints an unanswered `tool_use` now reaches the resumed
+    transcript, and a count that ignored results would SKIP the step rather than
+    retry it -- turning a recovery into a silent omission.
+
+    A result is settled when the step is done with, one way or another:
+
+    | result                                             | settled | model does |
+    |----------------------------------------------------|---------|------------|
+    | success                                            | yes     | advance    |
+    | `[tool journal] outcome unknown` (indeterminate)    | yes     | advance    |
+    | `[tool journal] already applied`                    | yes     | advance    |
+    | `[tool journal] did not take effect`                | no      | retry      |
+    | any other error, including the placeholder          | no      | retry      |
+
+    The indeterminate row is the one that matters. The runtime could not verify
+    whether the operation landed, so re-running it is the blind replay this whole
+    mechanism exists to prevent; a real model would stop and ask, and the scripted
+    one takes the conservative half of that -- it does not repeat the call.
+
+    The aborted row is the opposite: the runtime PROVED nothing happened, which is
+    the only situation in which a retry is earned.
+    """
+    from longline.session.tool_journal import (
+        RECONCILE_ABORTED_PREFIX,
+        RECONCILE_UNKNOWN_PREFIX,
+    )
+
+    results = _results_by_id(messages)
+    settled = 0
+    for tool_use_id in _tool_use_ids(messages):
+        result = results.get(tool_use_id)
+        if result is None:
+            continue
+        text = _block_text(result)
+        if RECONCILE_ABORTED_PREFIX in text:
+            continue
+        if not result.get("is_error") or RECONCILE_UNKNOWN_PREFIX in text:
+            settled += 1
+    return settled
 
 
 @dataclass
@@ -189,16 +293,17 @@ class ScriptedToolSequence:
     """A scripted model that walks a fixed tool sequence, then answers.
 
     Progress is derived from the transcript rather than from a counter on this
-    object. Two things follow, and both are load-bearing:
+    object. Three things follow, and all of them are load-bearing:
 
     - The resumed leg continues the sequence where the killed leg stopped,
       because the checkpoint is the only progress record that crossed the kill.
-    - When the checkpoint has no record of a side effect that happened (the
-      `after_tool` arm), the resumed leg re-issues that call -- which is the
-      behaviour the duplicate metrics exist to observe.
+    - When the checkpoint has no record of a side effect that happened, the
+      resumed leg re-issues that call -- which is what the duplicate metrics exist
+      to observe.
+    - When the runtime says an operation's outcome is INDETERMINATE, the resumed
+      leg does not re-issue it. That is the fix working, expressed in the script.
 
-    `offset` is how many tool_use blocks earlier instructions already put on the
-    transcript.
+    `offset` is how many settled steps earlier instructions already contributed.
     """
 
     steps: list[dict[str, Any]] = field(default_factory=list)
@@ -209,12 +314,16 @@ class ScriptedToolSequence:
         return self._serve(list(kwargs.get("messages", [])))
 
     async def _serve(self, messages: list[Any]) -> AsyncIterator[QueryEvent]:
-        done = max(0, _count_tool_uses(messages) - self.offset)
+        settled = settled_steps(messages)
+        done = max(0, settled - self.offset)
         if done < len(self.steps):
             step = self.steps[done]
             yield ToolUseStart(
                 tool_name=str(step["tool"]),
-                tool_id=f"tu-{self.offset + done + 1}",
+                # Keyed on how many calls have been ISSUED, not on progress: a
+                # retry has the same progress but must not reuse the id of the
+                # attempt it supersedes.
+                tool_id=f"tu-{len(_tool_use_ids(messages)) + 1}",
                 input=dict(step["input"]),
             )
             yield TurnComplete(
@@ -338,6 +447,32 @@ def _build_gate(spec: dict[str, Any], failpoint: str) -> FailpointGate:
     )
 
 
+def _attach_durability(engine: Any, claude_dir: Path, session_id: str, sandbox: Path) -> Any:
+    """Give the engine the PRODUCTION journal and a step-level checkpoint.
+
+    Distinct from the `SideEffectJournal` the legs also write: that one is the
+    measuring instrument (it digests the artifacts before and after every
+    execution to decide whether a replay duplicated anything), and this one is
+    the runtime's own recovery record. Wiring the instrument into the thing it
+    measures would make the measurement circular.
+
+    The `on_step` callback is `main.py`'s checkpoint, at `main.py`'s position and
+    with its argument shape. The worker no longer needs to call `_save_checkpoint`
+    itself between steps -- and must not, because a harness that placed its own
+    checkpoints would be measuring itself rather than the runtime.
+    """
+    from longline.session.tool_journal import ToolJournal
+    from longline.session.workspace_identity import current_git_head
+
+    tool_journal = ToolJournal(claude_dir, session_id)
+    tool_journal.write_session_header(
+        workspace_root=str(sandbox), git_head=current_git_head(sandbox)
+    )
+    engine.tool_journal = tool_journal
+    engine.on_step = lambda _reason: _save_checkpoint(engine, claude_dir, session_id)
+    return tool_journal
+
+
 def arm(spec: dict[str, Any]) -> dict[str, Any]:
     """Phase 1: build the checkpoint, run instruction 1, and stop at the failpoint.
 
@@ -366,7 +501,14 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
     )
 
     engine.messages.append(UserMessage(content=str(spec["task"])))
+    # The turn-0 save. `main.py` writes no checkpoint between the user's
+    # instruction and the first model call, so `before_model` would have nothing
+    # to resume without this -- and it would fail for a reason unrelated to
+    # recovery, which is a tautology wearing a control group's name. Step-level
+    # checkpointing does not remove the need: the arm's fault lands BEFORE the
+    # first step.
     _save_checkpoint(engine, claude_dir, session_id)
+    _attach_durability(engine, claude_dir, session_id, sandbox)
     before_loop = len(engine.messages)
 
     instructions_run = 0
@@ -498,12 +640,18 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
     """Phase 2: load what the dead process left, then FINISH THE TASK.
 
     The production order and the production functions, in `main.py`'s sequence:
-    `load_session` -> `validate_transcript` -> `load_task_snapshot` ->
-    `TaskRegistry.restore`. Then the loop runs again on the recovered
-    transcript -- which is where a replayed side effect shows up.
+    `load_session` -> build the toolset -> `reconcile_pending` ->
+    `validate_transcript` -> workspace identity -> `load_task_snapshot` ->
+    `TaskRegistry.restore`. Then the loop runs again on the recovered transcript
+    -- which is where a replayed side effect shows up.
+
+    The engine is built BEFORE validation because reconciliation has to ask the
+    TOOLS whether their interrupted calls took effect, and the tools live in the
+    registry. `main.py` gets away with building it first for the same reason.
     """
     from longline.session.recovery import TranscriptRepairReport, validate_transcript
     from longline.session.storage import load_session, load_task_snapshot
+    from longline.session.tool_journal import reconcile_pending
 
     claude_dir = Path(spec["claude_dir"])
     sandbox = Path(spec["sandbox"])
@@ -513,10 +661,6 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
     loaded = load_session(session_id, claude_dir=claude_dir)
     if loaded is None:
         return _not_found(session_id, "session not found")
-
-    repair_report = TranscriptRepairReport()
-    repaired = validate_transcript(loaded, report=repair_report)
-    structural_ok, structural_errors = check_transcript_structure(repaired)
 
     snapshot = load_task_snapshot(session_id, claude_dir=claude_dir)
     task_states = _restore_task_snapshot(snapshot)
@@ -549,6 +693,55 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         journal=journal,
         sequence=sequence,
     )
+    tool_journal = _attach_durability(engine, claude_dir, session_id, sandbox)
+
+    # === Reconciliation, in `main.py`'s position: BEFORE the repair ===
+    # The repair has to write a tool_result for the unanswered tool_use, and only
+    # the operation journal knows whether that result was genuinely lost or
+    # actually took effect. The default placeholder says "internal error", which
+    # is a LIE for a Bash call that already changed the world -- and a model shown
+    # a lie retries, which is the duplicated side effect this whole change exists
+    # to remove.
+    reconciled = reconcile_pending(tool_journal, engine.registry)
+    overrides = {r.tool_call_id: (r.result_text, r.is_error) for r in reconciled}
+
+    repair_report = TranscriptRepairReport()
+    repaired = validate_transcript(
+        loaded, report=repair_report, result_overrides=overrides
+    )
+    structural_ok, structural_errors = check_transcript_structure(repaired)
+
+    # === Workspace identity check, in `main.py`'s position ===
+    # Before the loop resumes, and after reconciliation, because reconciliation
+    # is what turns an interrupted write back into a recorded dependency.
+    from longline.session.workspace_identity import classify_drift
+
+    drift = classify_drift(
+        root=sandbox, header=tool_journal.session_header(), records=tool_journal.records()
+    )
+    if drift.rejected and not spec.get("force_resume"):
+        return {
+            "phase": "resume",
+            "session_id": session_id,
+            "checkpoint_loaded": True,
+            "workspace_verdict": drift.verdict.value,
+            "workspace_rejected": True,
+            "workspace_relevant": drift.relevant,
+            "workspace_unrelated": drift.unrelated,
+            "git_head_changed": drift.git_head_changed,
+            "git_available": drift.git_available,
+            "layer_state_ok": False,
+            "structural_ok": False,
+            "structural_errors": ["refused: dependent workspace drift"],
+            "transcript_repaired": False,
+            "repairs": [],
+            "instructions_run": 0,
+            "task_states": {},
+            "journal_entries": 0,
+            "tool_errors": [],
+            "error": "",
+        }
+
     engine.messages.extend(repaired)
     if failpoint in STOPS_IN_INSTRUCTION_TWO:
         engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
@@ -577,6 +770,12 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         "instructions_run": instructions_run,
         "journal_entries": len(journal.entries),
         "tool_errors": tool_errors,
+        "workspace_verdict": drift.verdict.value,
+        "workspace_rejected": drift.rejected,
+        "workspace_relevant": drift.relevant,
+        "workspace_unrelated": drift.unrelated,
+        "git_head_changed": drift.git_head_changed,
+        "git_available": drift.git_available,
         "error": error,
     }
 
