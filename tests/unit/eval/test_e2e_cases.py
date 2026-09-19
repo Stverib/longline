@@ -738,6 +738,54 @@ class TestACaseIsPassableFromItsOwnFixture:
         assert not judge_case(checks[1]["fn"], tmp_path, checks[1]["args"])
 
 
+# The ticket-number shape the e2e-106 answer key is built from.
+_TICKET = re.compile(r"RET-\d+")
+
+
+def _checks_for(case_id: str) -> list[dict[str, Any]]:
+    """The `checks` list a case declares in the data file."""
+    return next(c for c in load_cases(CASE_FILE) if c.id == case_id).checks
+
+
+class TestE2E106AnswerKeyMatchesItsFixture:
+    """e2e-106 asked for "所有已废弃的功能" and keyed the FULL changelog.
+
+    Measured, not inferred: a probe with the sandbox kept shows the model wrote
+    `RET-4021` and `RET-4062` -- exactly the two entries whose changelog text
+    says "deprecated" or "retired" -- and was scored wrong because RET-4033
+    (a timeout bump), RET-4050 (a cache swap) and RET-4077 (a route rename) are
+    not deprecations under that reading. The model read the task correctly and
+    the key encoded a different reading.
+    """
+
+    def _fixture_tickets(self) -> set[str]:
+        root = FIXTURES_DIR / "retrieval_repo"
+        found: set[str] = set()
+        for path in root.rglob("*"):
+            if path.is_file():
+                found |= set(_TICKET.findall(path.read_text(encoding="utf-8", errors="replace")))
+        return found
+
+    def test_the_key_is_every_ticket_in_the_fixture(self) -> None:
+        """If the key named a subset, the task would have to say which subset."""
+        check = _checks_for("e2e-106")[0]
+        assert check["fn"] == "line_set_equals"
+        assert set(check["args"]["equals"]) == self._fixture_tickets()
+
+    def test_the_task_asks_for_every_ticket_not_a_filtered_subset(self) -> None:
+        """The wording and the key have to agree.
+
+        The answer key is the complete set, so the task must ask for the
+        complete set. A filter word here ("已废弃", "deprecated") narrows the
+        request while the key stays wide, and the case then fails a model that
+        followed it.
+        """
+        task = next(c.task for c in load_cases(CASE_FILE) if c.id == "e2e-106")
+
+        assert re.search(r"所有|全部|每一个|每个", task), task
+        assert not re.search(r"已废弃|废弃|deprecated|不再使用", task), task
+
+
 # A task that names a LINE POSITION ("第一行", "second line") is asserting
 # something a set comparison cannot see: the same lines in the other order
 # satisfy it. This is the class `lines_match` exists for.
