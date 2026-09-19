@@ -56,6 +56,7 @@ from longline.prompts.builder import build_system_prompt   # system prompt 拼�
 from longline.prompts.claudemd import load_claude_md       # 从 cwd 向上搜索 CLAUDE.md 文件
 from longline.session.history import HistoryEntry, add_to_history  # 用户输入历史（~/.longline/history.jsonl）
 from longline.session.storage import save_session          # transcript 持久化到 ~/.longline/sessions/
+from longline.session.workspace_identity import current_git_head
 from longline.skills.loader import load_skills             # 从 ~/.longline/skills/ 加载 skill markdown
 
 # --- 工具层（顶层直接 import 的是 6 个核心文件操作工具）---
@@ -71,6 +72,12 @@ from longline.tools.grep_tool.grep_tool import GrepTool
 from longline.ui.renderer import console, render_event
 
 logger = logging.getLogger(__name__)
+
+# The one place this module names the session directory. `get_sessions_dir(None)`
+# resolves to the same path, so this is not a second source of truth -- it is the
+# same value, written once, so the transcript, the operation journal and the
+# workspace header cannot end up in three different directories.
+SESSION_DIR = Path.home() / ".longline"
 
 
 def _build_registry(cwd: str, call_model_factory: object | None = None, model: str = "") -> ToolRegistry:
@@ -637,18 +644,42 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
     # transcript 末尾可能有 orphaned tool_use（没有配对的 tool_result）
     # → 不修复的话 API 调用会报协议错误
     if resume_id:
+        from longline.session.recovery import TranscriptRepairReport
         from longline.session.storage import load_session, load_task_snapshot
+        from longline.session.tool_journal import ToolJournal, reconcile_pending
 
-        loaded = load_session(resume_id)
+        loaded = load_session(resume_id, claude_dir=SESSION_DIR)
         if loaded:
             from longline.session.recovery import validate_transcript
 
-            repaired = validate_transcript(loaded)
+            # Reconciliation runs BEFORE the repair, and the order is load
+            # bearing. The repair has to write a tool_result for the unanswered
+            # tool_use, and only the operation journal knows whether that result
+            # was genuinely lost or actually took effect. The default placeholder
+            # says "internal error", which is a LIE for a Bash call that already
+            # changed the world -- and a model shown a lie retries, which is
+            # exactly the duplicated side effect this is here to prevent.
+            resume_journal = ToolJournal(SESSION_DIR, resume_id)
+            reconciled = reconcile_pending(resume_journal, engine.registry)
+            overrides = {r.tool_call_id: (r.result_text, r.is_error) for r in reconciled}
+            if reconciled:
+                counts: dict[str, int] = {}
+                for item in reconciled:
+                    counts[item.status] = counts.get(item.status, 0) + 1
+                console.print(
+                    f"[yellow]Reconciled {len(reconciled)} interrupted tool call(s): "
+                    f"{counts}[/]"
+                )
+
+            repair_report = TranscriptRepairReport()
+            repaired = validate_transcript(
+                loaded, report=repair_report, result_overrides=overrides
+            )
             messages.extend(repaired)
 
             # 恢复 TaskRegistry 快照（后台任务状态）
             # 非终态任务（RUNNING/PENDING）会被标记为 KILLED，因为对应的 asyncio.Task 已丢失
-            task_snap = load_task_snapshot(resume_id)
+            task_snap = load_task_snapshot(resume_id, claude_dir=SESSION_DIR)
             if task_snap and hasattr(engine, '_task_registry'):
                 engine._task_registry.restore(task_snap)
 
@@ -663,6 +694,33 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
     print_welcome()
     session_id = resume_id or str(uuid4())[:8]
     claude_md = load_claude_md(cwd)
+
+    # === Step-level checkpoint + tool-operation journal ===
+    # Production used to save once per INSTRUCTION (after run_turn returned), so
+    # a kill anywhere inside an instruction lost the whole instruction. The
+    # granularity drops to per STEP here: once after the model's response, once
+    # after the tool results. The first of those is the one that matters, and its
+    # position is measured rather than assumed (see query_loop.py write point 5):
+    # the assistant message reaches `messages` before any tool body runs, so that
+    # single save is what puts the `tool_use` on disk before the tool can act.
+    # `tool_journal` records each tool call as PREPARED/COMMITTED, which is what
+    # the resume path reconciles instead of blindly replaying.
+    from longline.session.tool_journal import ToolJournal
+
+    tool_journal = ToolJournal(SESSION_DIR, session_id)
+    engine.tool_journal = tool_journal
+    # The session header's git HEAD is the baseline for workspace identity: if
+    # HEAD has moved by the time we resume, the revision this checkpoint was
+    # taken against is gone.
+    tool_journal.write_session_header(
+        workspace_root=cwd, git_head=current_git_head(Path(cwd))
+    )
+
+    def _checkpoint_on_step(_reason: str) -> None:
+        snap = engine._task_registry.snapshot() if hasattr(engine, "_task_registry") else None
+        save_session(session_id, messages, claude_dir=SESSION_DIR, task_snapshot=snap)
+
+    engine.on_step = _checkpoint_on_step
 
     # ==========================================
     # === REPL 主循环开始 ===
@@ -806,7 +864,7 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
         # E1. 持久化 transcript + task 状态
         # 每轮结束都存一次，这样即使下次崩溃也能 resume 恢复
         task_snap = engine._task_registry.snapshot() if hasattr(engine, '_task_registry') else None
-        save_session(session_id, messages, task_snapshot=task_snap)
+        save_session(session_id, messages, claude_dir=SESSION_DIR, task_snapshot=task_snap)
 
         # E2. 后台 memory extraction
         # 用一个低配的 call_model（max_tokens=1024）去扫描最近的对话，

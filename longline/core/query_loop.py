@@ -39,6 +39,16 @@ query_loop 是整个系统的「心脏」——一个 while(true) 状态机，
   5. Phase 4 前: 追加 AssistantMessage（模型本轮的输出）
   6. Phase 4: 追加 UserMessage（工具执行结果）
 
+Each of the six now calls `_step(reason)` when the caller supplied `on_step`, so
+a checkpoint lands per STEP rather than per instruction. Point 5 is the one that
+matters most, and its position is measured rather than assumed: a probe that
+recorded `len(messages)` at the top of a tool's `execute` saw the assistant
+message already present, so this write lands before any tool body can run. An
+unanswered trailing `tool_use` is therefore on disk at every point where a tool
+is executing, which is what `validate_transcript` repairs on resume -- and that
+repair is what stops the resumed leg from re-issuing a call that already
+happened.
+
 === 模块关系 ===
 
   依赖: events.py（事件类型）、token_estimation.py、compact/compact.py、
@@ -93,6 +103,14 @@ MAX_REACTIVE_COMPACTION = 1          # 413 / prompt_too_long 后最多响应式�
 ESCALATED_MAX_TOKENS = 65536         # 第一次 max_tokens 截断时，将限制从 16K 提升到 64K
 DEFAULT_CONTEXT_WINDOW = 200_000     # Claude 3.5 的上下文窗口大小，用于 auto-compact 阈值计算
 
+# The transcript write points at which a caller may persist a checkpoint. Named
+# rather than numbered because a caller that logs the reason should not have to
+# re-derive which integer meant what.
+STEP_MODEL_RESPONSE = "model_response"   # the assistant message was appended
+STEP_TOOL_RESULTS = "tool_results"       # the tool results were appended
+STEP_CONTINUATION = "continuation"       # a truncated output was saved + "please continue"
+STEP_COMPACTED = "compacted"             # the transcript was replaced by a summary
+
 
 async def query_loop(
     *,
@@ -110,6 +128,7 @@ async def query_loop(
     max_reactive_compaction: int = MAX_REACTIVE_COMPACTION,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     journal: object | None = None,  # ToolJournal at runtime
+    on_step: Callable[[str], None] | None = None,
 ) -> AsyncIterator[QueryEvent]:
     """Execute the core conversation loop.
 
@@ -160,6 +179,23 @@ async def query_loop(
     resume, and it means no journal is written at all.
     """
     sleep_fn = sleep if sleep is not None else asyncio.sleep
+
+    def _step(reason: str) -> None:
+        """Persist a checkpoint, if anyone asked for one.
+
+        Swallowing the failure is deliberate. A checkpoint that cannot be written
+        is a durability problem, and the alternative -- propagating -- would turn
+        a full disk into a dead agent: it would trade a guarantee the user did not
+        ask for against one they did. The failure is loud in the log and the run
+        continues.
+        """
+        if on_step is None:
+            return
+        try:
+            on_step(reason)
+        except Exception as e:
+            logger.error("Step checkpoint %r failed: %s", reason, e)
+
     # === 状态机变量初始化 ===
     turn_count = 0                          # 有效轮次计数（成功的 API 调用才 +1）
     retry_count = 0                         # 重试计数器: 与 turn_count 分离, 重试不消耗轮次预算
@@ -195,6 +231,7 @@ async def query_loop(
                     messages.clear()
                     messages.extend(compacted)
                     compact_consecutive_failures = 0
+                    _step(STEP_COMPACTED)
                     yield CompactOccurred(summary_preview="Context auto-compacted")
                     # 压缩后必须重新 normalize，因为 messages 内容已变
                     api_messages = normalize_messages_for_api(messages)
@@ -281,6 +318,7 @@ async def query_loop(
                             # transcript 写入点 2: 响应式压缩替换 messages
                             messages.clear()
                             messages.extend(compacted)
+                            _step(STEP_COMPACTED)
                             yield CompactOccurred(summary_preview="Reactive compact after prompt_too_long")
                             recovered = True
                     except Exception as e:
@@ -303,6 +341,7 @@ async def query_loop(
                             content=[TextBlock(text=accumulated_text)], usage=usage,
                         ))
                         messages.append(UserMessage(content="Please continue from where you left off."))
+                        _step(STEP_CONTINUATION)
                     recovered = True
 
             # 恢复策略 3: 瞬时错误 (429 限流 / 529 过载) → 指数退避重试
@@ -337,6 +376,7 @@ async def query_loop(
             ))
             messages.append(UserMessage(content="Please continue from where you left off."))
             max_output_recovery_count += 1
+            _step(STEP_CONTINUATION)
             if max_output_recovery_count == 1:
                 current_max_tokens = ESCALATED_MAX_TOKENS  # 首次截断时提升限制
             yield TurnComplete(stop_reason="max_tokens", usage=usage, served_model=served_model)
@@ -356,6 +396,14 @@ async def query_loop(
             stop_reason=stop_reason,
         )
         messages.append(assistant_msg)
+        # Checkpoint HERE, before any tool body can run. Measured, not assumed:
+        # a probe recording `len(messages)` at the top of a tool's `execute` saw
+        # the assistant message already present. So this one write is what leaves
+        # the `tool_use` on disk before the tool can change the world -- and an
+        # unanswered trailing `tool_use` is exactly what `validate_transcript`
+        # knows how to repair on resume, which is what stops the resumed leg from
+        # re-issuing the call.
+        _step(STEP_MODEL_RESPONSE)
 
         yield TurnComplete(stop_reason=stop_reason, usage=usage, served_model=served_model)
 
@@ -397,6 +445,7 @@ async def query_loop(
             # 为什么用 UserMessage？因为 Anthropic API 要求 tool_result 在 user role 中
             tool_result_msg = UserMessage(content=list(result_blocks))
             messages.append(tool_result_msg)
+            _step(STEP_TOOL_RESULTS)
             continue  # continue 3: 有工具调用 → 带着结果继续下一轮
 
         # 无工具调用 → 模型主动结束对话，退出循环

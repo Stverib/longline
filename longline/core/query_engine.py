@@ -92,6 +92,8 @@ class QueryEngine:
         permission_ctx: Any | None = None,
         max_turns: int = 50,
         context_window: int = 200_000,
+        tool_journal: Any | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> None:
         # 所有参数使用 keyword-only（*）强制命名传参，防止位置参数错乱
         self._client = client
@@ -103,6 +105,15 @@ class QueryEngine:
         self._max_turns = max_turns
         self._context_window = context_window  # 用于 auto-compact 阈值判断（默认 200K 对应 Claude 3.5）
         self._messages: list[Message] = []  # 整个会话的 transcript，贯穿多轮 submit/run_turn
+        # Durability handles, owned by the caller that knows the session id and
+        # the session directory -- this engine knows neither, and deliberately
+        # holds them as opaque objects rather than importing the persistence
+        # layer. `tool_journal` records every tool call around its execution;
+        # `on_step` is invoked at each transcript write point to persist a
+        # checkpoint. Both are None for every construction path that cannot be
+        # resumed (tests, sub-agents, the eval harness's own in-process engines).
+        self._tool_journal = tool_journal
+        self._on_step = on_step
         # Fault-injection handles (see `longline/eval/faults.py`). Declared here
         # rather than poked on from outside so the harness has a real attribute
         # to set, and so a reader can see at a glance that the engine carries
@@ -160,6 +171,24 @@ class QueryEngine:
     @property
     def client(self) -> anthropic.AsyncAnthropic:
         return self._client
+
+    @property
+    def tool_journal(self) -> Any | None:
+        """The durable tool-operation log, or None when nothing is being recorded."""
+        return self._tool_journal
+
+    @tool_journal.setter
+    def tool_journal(self, value: Any | None) -> None:
+        self._tool_journal = value
+
+    @property
+    def on_step(self) -> Callable[[str], None] | None:
+        """Called at each transcript write point to persist a step checkpoint."""
+        return self._on_step
+
+    @on_step.setter
+    def on_step(self, value: Callable[[str], None] | None) -> None:
+        self._on_step = value
 
     # -- Core API --
 
@@ -233,6 +262,8 @@ class QueryEngine:
             hooks=self._hooks,
             permission_checker=perm_checker,
             sleep=self.sleep_fn,
+            journal=self._tool_journal,
+            on_step=self._on_step,
         ):
             yield event
 
@@ -262,6 +293,12 @@ class QueryEngine:
             max_turns=max_turns or self._max_turns,
             hooks=self._hooks,
             permission_checker=perm_checker,
+            # The journal IS shared: a sub-agent's tool calls are real side
+            # effects in the same session, made against the same workspace. But
+            # `on_step` is deliberately NOT passed -- this path runs on the
+            # CALLER's message list while `on_step` persists the engine's own, so
+            # a checkpoint here would record the wrong conversation.
+            journal=self._tool_journal,
         ):
             yield event
 
@@ -293,6 +330,8 @@ class QueryEngine:
             context_window=self._context_window,
             hooks=self._hooks,
             permission_checker=perm_checker,
+            journal=self._tool_journal,
+            on_step=self._on_step,
         ):
             yield event
 
