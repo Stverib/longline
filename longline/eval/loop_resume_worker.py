@@ -416,17 +416,27 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
 def check_transcript_structure(messages: Sequence[Any]) -> tuple[bool, list[str]]:
     """Structural validity of a resumed transcript: API pairing + alternation.
 
-    Three independent conditions, each of which the API enforces when the
+    Two independent conditions, each of which the API enforces when the
     transcript goes back over the wire:
 
     - every `tool_use` id has a matching `tool_result` (the API rejects the
       request otherwise, which is what `validate_transcript` exists to fix);
     - no `tool_result` refers to an id that was never requested;
-    - no two consecutive messages share a role, and the transcript does not end
-      on an assistant message.
+    - no two consecutive messages share a role.
 
-    Returns `(valid, errors)` rather than raising, so a broken resume is
-    recorded as a failed case with a reason rather than crashing the suite.
+    **Deliberately absent: "the transcript must not end on an assistant
+    message".** `recovery_worker.check_transcript_structure` has that rule and
+    this function was copied from it, but it is wrong here. A checkpoint taken
+    between two instructions legitimately ends on the assistant's final text --
+    that is what `main.py` writes after every `run_turn()`, and the next user
+    message is appended before the next one. The rule cost the
+    `after_checkpoint` arm all ten of its state-layer verdicts, dragging
+    `LoopResumeRate` down for a reason that had nothing to do with recovery.
+
+    The dangerous case it was meant to catch -- a trailing `tool_use` with no
+    result -- is already caught by the pairing rule above, so nothing is lost.
+    `truncate_tail` never tripped it only because the torn final line is
+    dropped, leaving the transcript on a `tool_result` instead.
     """
     from longline.models.content_blocks import ToolResultBlock, ToolUseBlock
     from longline.models.messages import AssistantMessage, UserMessage
@@ -455,8 +465,6 @@ def check_transcript_structure(messages: Sequence[Any]) -> tuple[bool, list[str]
     for i in range(1, len(messages)):
         if type(messages[i]) is type(messages[i - 1]):
             errors.append(f"role alternation violated at message {i}")
-    if messages and isinstance(messages[-1], AssistantMessage):
-        errors.append("transcript ends on an assistant message")
 
     return (not errors), errors
 

@@ -313,6 +313,49 @@ def test_check_transcript_structure_rejects_role_alternation_violation() -> None
     assert any("alternation" in e for e in errors)
 
 
+def test_check_transcript_structure_accepts_a_transcript_ending_on_a_text_reply() -> None:
+    """The between-instructions state, which is NOT a defect.
+
+    `main.py` writes a checkpoint after every `run_turn()`, so the file
+    legitimately ends on the assistant's final text until the next user message
+    is appended. An earlier version of this function rejected that state, and
+    it cost the after_checkpoint arm all ten of its state-layer verdicts --
+    dragging LoopResumeRate down for a reason unrelated to recovery. Caught by
+    the 6x10 sweep, not by any single-run test.
+    """
+    from longline.models.content_blocks import TextBlock
+    from longline.models.messages import AssistantMessage, UserMessage
+
+    from longline.eval.loop_resume_worker import check_transcript_structure
+
+    messages = [
+        UserMessage(content="go"),
+        AssistantMessage(content=[TextBlock(text="done")], stop_reason="end_turn"),
+    ]
+    ok, errors = check_transcript_structure(messages)
+    assert ok is True, errors
+
+
+def test_check_transcript_structure_still_rejects_a_trailing_unanswered_tool_use() -> None:
+    """Removing the "ends on assistant" rule must not lose the dangerous case
+    it was there for: the pairing rule has to catch it on its own."""
+    from longline.models.content_blocks import TextBlock, ToolUseBlock
+    from longline.models.messages import AssistantMessage, UserMessage
+
+    from longline.eval.loop_resume_worker import check_transcript_structure
+
+    messages = [
+        UserMessage(content="go"),
+        AssistantMessage(
+            content=[TextBlock(text="working"), ToolUseBlock(id="t1", name="Read", input={})],
+            stop_reason="tool_use",
+        ),
+    ]
+    ok, errors = check_transcript_structure(messages)
+    assert ok is False
+    assert any("tool_use without tool_result" in e for e in errors)
+
+
 def test_resume_reports_not_found_when_no_checkpoint_exists(tmp_path: Path) -> None:
     from longline.eval.loop_resume_worker import resume
 
