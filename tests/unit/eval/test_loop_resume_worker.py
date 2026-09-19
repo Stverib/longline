@@ -51,9 +51,20 @@ def _api_transcript(tool_uses: int, *, offset: int = 0) -> list[dict[str, Any]]:
     return messages
 
 
-def _sandbox(tmp_path: Path) -> Path:
+def _sandbox(tmp_path: Path, *, seed: int = 0) -> Path:
+    """A seeded sandbox, because an unseeded one never occurs in a real run.
+
+    These tests call `arm` directly instead of going through the runner, so
+    nothing would substitute the fixture's seed placeholders and the sandbox
+    would carry a literal `<seed>` -- a state the worker never sees in a real
+    run, and one that made an assertion here compare against a fixture that no
+    longer exists (found by the full suite, not by this file on its own).
+    """
+    from longline.eval.loop_resume_runner import apply_seed
+
     sandbox = tmp_path / "sandbox"
     shutil.copytree(FIXTURE, sandbox)
+    apply_seed(sandbox, seed)
     return sandbox
 
 
@@ -157,8 +168,13 @@ def test_arm_writes_the_turn_zero_checkpoint_before_the_first_model_call(
     assert report["sentinel"]["failpoint"] == BEFORE_MODEL
     assert report["checkpoint_messages_before_loop"] == 1
     assert (tmp_path / "claude" / "sessions" / "loop-resume.jsonl").is_file()
-    # Nothing ran, so nothing was mutated.
-    assert (sandbox / "NOTES.md").read_text(encoding="utf-8") == "# Notes\n"
+    # Nothing ran, so nothing was appended. Asserted as "the header is intact
+    # and the append is absent" rather than as byte equality with the fixture:
+    # byte equality makes this test a change-detector for the fixture, and it
+    # failed for exactly that reason when the fixture gained a seed line.
+    notes = (sandbox / "NOTES.md").read_text(encoding="utf-8")
+    assert notes.startswith("# Notes\n"), notes
+    assert "fixed-add" not in notes
     assert "return a - b" in (sandbox / "src" / "calc.py").read_text(encoding="utf-8")
 
 
