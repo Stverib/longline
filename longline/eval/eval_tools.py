@@ -286,12 +286,22 @@ class SandboxedTool(Tool):
             return {}
         return self._inner.workload(bound)
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
-        """Forwarded with the same resolution, for the same reason."""
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
+        """Forwarded with the same resolution, for the same reason.
+
+        The refused call keeps UNKNOWN rather than taking `started` into account:
+        `started` describes what the *inner* tool did, and this wrapper refused
+        before the inner tool was ever reached, so the flag is not about this
+        call's outcome. It is still UNKNOWN and not NOT_APPLIED because the
+        resolution itself is a judgement made here, in a process that may not be
+        the one that made it.
+        """
         bound = self._bound(tool_input)
         if isinstance(bound, ToolResult):
             return ReconcileOutcome.UNKNOWN
-        return self._inner.reconcile(bound)
+        return self._inner.reconcile(bound, started=started)
 
 
 def build_eval_registry(

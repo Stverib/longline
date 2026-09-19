@@ -42,6 +42,7 @@ class _Writes(Tool):
     def __init__(self, outcome: ReconcileOutcome) -> None:
         self._outcome = outcome
         self.asked: list[dict[str, Any]] = []
+        self.asked_started: list[bool] = []
 
     def get_name(self) -> str:
         return "Writes"
@@ -52,8 +53,11 @@ class _Writes(Tool):
     async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
         return ToolResult(content="ok")
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
         self.asked.append(tool_input)
+        self.asked_started.append(started)
         return self._outcome
 
 
@@ -63,16 +67,59 @@ def _registry(tool: Tool) -> ToolRegistry:
     return registry
 
 
-def _orphan(tmp_path: Path) -> ToolJournal:
+def _orphan(tmp_path: Path, *, mark_executing: bool = False) -> ToolJournal:
     journal = ToolJournal(tmp_path, "s1")
-    journal.prepare(
+    operation_id = journal.prepare(
         turn_id=1,
         tool_call_id="tu-2",
         tool_name="Writes",
         tool_input={"file_path": "a.txt"},
         workload={"a.txt": "write"},
     )
+    if mark_executing:
+        journal.mark_executing(operation_id)
     return journal
+
+
+def test_the_journal_tells_the_tool_whether_the_call_ever_began(tmp_path: Path) -> None:
+    """The flag reaches `reconcile`, and it is the only thing that lets an
+    unreadable effect be decided at all.
+
+    Without it every interrupted `Bash` call is UNKNOWN, including the ones that
+    died before the shell was ever spawned -- so the model is told "not re-run"
+    about an operation that provably did nothing, and the task never finishes.
+    """
+    never_began = _Writes(ReconcileOutcome.NOT_APPLIED)
+    reconcile_pending(_orphan(tmp_path / "a"), _registry(never_began))
+    assert never_began.asked_started == [False]
+
+    began = _Writes(ReconcileOutcome.NOT_APPLIED)
+    reconcile_pending(_orphan(tmp_path / "b", mark_executing=True), _registry(began))
+    assert began.asked_started == [True]
+
+
+def test_a_tool_that_ignores_the_flag_keeps_its_own_answer() -> None:
+    """The base class's default does not vary with `started`, and must not.
+
+    A tool that never reports a point of no return sees `started=False` on every
+    call it has ever made, so a default that read the flag as evidence would
+    authorise a retry of every interrupted operation of that tool. The default is
+    UNKNOWN under both values, and the omitted argument lands on the pessimistic
+    one.
+    """
+
+    class _Silent(Tool):
+        def get_name(self) -> str:
+            return "Silent"
+
+        def get_schema(self) -> ToolSchema:
+            return ToolSchema(name="Silent", description="", input_schema={})
+
+        async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
+            return ToolResult(content="ok")
+
+    assert _Silent().reconcile({}, started=False) is ReconcileOutcome.UNKNOWN
+    assert _Silent().reconcile({}) is ReconcileOutcome.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -130,7 +177,9 @@ def test_a_tool_whose_reconcile_raises_is_indeterminate(tmp_path: Path) -> None:
     """A broken reconciler must not be able to authorise a retry it did not earn."""
 
     class _Boom(_Writes):
-        def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        def reconcile(
+            self, tool_input: dict[str, Any], *, started: bool = True
+        ) -> ReconcileOutcome:
             raise RuntimeError("boom")
 
     journal = _orphan(tmp_path)

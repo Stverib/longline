@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from longline.session.tool_journal import (
     ABORTED,
     COMMITTED,
+    EXECUTING,
     INDETERMINATE,
     PREPARED,
     RECONCILED,
@@ -123,7 +124,8 @@ def test_pending_returns_only_operations_that_never_committed(tmp_path: Path) ->
         workload={},
     )
 
-    assert [record.operation_id for record in journal.pending()] == [orphan]
+    assert [pending.record.operation_id for pending in journal.pending()] == [orphan]
+    assert journal.pending()[0].started is False
 
 
 def test_a_resolved_operation_is_no_longer_pending(tmp_path: Path) -> None:
@@ -158,11 +160,89 @@ def test_the_pending_record_keeps_the_call_id_the_start_carried(tmp_path: Path) 
         turn_id=4, tool_call_id="tu-8", tool_name="Edit", tool_input={"b": 2}, workload={}
     )
 
-    record = journal.pending()[0]
+    record = journal.pending()[0].record
     assert record.operation_id == orphan
     assert record.tool_call_id == "tu-8"
     assert record.turn_id == 4
     assert record.tool_input == {"b": 2}
+
+
+def test_the_marker_does_not_end_the_operation(tmp_path: Path) -> None:
+    """`EXECUTING` is a third state, not a fourth terminal one.
+
+    An operation that reported its point of no return and then stopped is still
+    unfinished -- it is exactly the case reconciliation exists for. Folding it
+    into the terminal set would quietly resolve every interrupted `Bash` call as
+    "nothing to see here".
+    """
+    journal = _journal(tmp_path)
+    op = journal.prepare(
+        turn_id=1,
+        tool_call_id="tu-1",
+        tool_name="Bash",
+        tool_input={"command": "echo x"},
+        workload={},
+    )
+    journal.mark_executing(op)
+
+    pending = journal.pending()
+    assert [p.record.operation_id for p in pending] == [op]
+    assert pending[0].started is True
+    # The START is still what comes back, because the marker record carries no
+    # call id and the transcript needs one.
+    assert pending[0].record.tool_call_id == "tu-1"
+    assert journal.records()[-1].status == EXECUTING
+
+
+def test_started_separates_entered_from_never_entered(tmp_path: Path) -> None:
+    """The two facts a resume has to tell apart, and could not before.
+
+    Same journal shape, same missing COMMITTED, opposite meanings: one call
+    reached the line past which its effect was possible and one never did. The
+    marker is the whole difference, and it is the difference between an
+    interruption that can be retried and one that cannot.
+    """
+    journal = _journal(tmp_path)
+    never_entered = journal.prepare(
+        turn_id=1, tool_call_id="tu-1", tool_name="Bash",
+        tool_input={"command": "echo a"}, workload={},
+    )
+    entered = journal.prepare(
+        turn_id=1, tool_call_id="tu-2", tool_name="Bash",
+        tool_input={"command": "echo b"}, workload={},
+    )
+    journal.mark_executing(entered)
+
+    by_id = {p.record.operation_id: p.started for p in journal.pending()}
+    assert by_id == {never_entered: False, entered: True}
+
+
+def test_a_marker_does_not_survive_a_commit(tmp_path: Path) -> None:
+    """A call that ran to completion has an answer, so nothing is left to ask."""
+    journal = _journal(tmp_path)
+    op = journal.prepare(
+        turn_id=1, tool_call_id="tu-1", tool_name="Bash",
+        tool_input={"command": "echo x"}, workload={},
+    )
+    journal.mark_executing(op)
+    journal.commit(op, outcome="ok", post_state={})
+    assert journal.pending() == []
+
+
+def test_the_marker_record_contributes_no_workspace_digests(tmp_path: Path) -> None:
+    """It carries an id and a status and nothing else, by construction.
+
+    Repeating the start's `access` into it would be a second copy of a fact a
+    later edit could disagree with -- and the start is what owns that fact.
+    """
+    journal = _journal(tmp_path)
+    op = journal.prepare(
+        turn_id=1, tool_call_id="tu-1", tool_name="Edit",
+        tool_input={}, workload={"src/a.py": "write"},
+    )
+    journal.mark_executing(op)
+    journal.commit(op, outcome="ok", post_state={"src/a.py": "h"})
+    assert workspace_from_records(journal.records())[1] == {"src/a.py": "h"}
 
 
 def test_resolve_refuses_a_non_terminal_status(tmp_path: Path) -> None:

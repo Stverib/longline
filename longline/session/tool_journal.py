@@ -50,13 +50,18 @@ if TYPE_CHECKING:
 OP_JOURNAL_NAME = "tool_ops.jsonl"
 HEADER_NAME = "session_header.json"
 
-# The status machine. PREPARED and COMMITTED are written by the executor; the
-# other three are assigned by a resume, to a PREPARED that never committed.
+# The status machine. PREPARED, EXECUTING and COMMITTED are written by the
+# executor as the call proceeds; the other three are assigned by a resume, to an
+# operation that never committed.
 PREPARED = "PREPARED"
+EXECUTING = "EXECUTING"          # the tool reported its point of no return
 COMMITTED = "COMMITTED"
 RECONCILED = "RECONCILED"        # the effect was verified present
 ABORTED = "ABORTED"              # the effect was verified absent; safe to retry
 INDETERMINATE = "INDETERMINATE"  # the tool cannot read its own effect
+
+# The statuses an unfinished operation can be sitting in.
+UNFINISHED_STATUSES: tuple[str, ...] = (PREPARED, EXECUTING)
 
 # The statuses that mean "this operation is finished, one way or another".
 TERMINAL_STATUSES: tuple[str, ...] = (COMMITTED, RECONCILED, ABORTED, INDETERMINATE)
@@ -246,6 +251,33 @@ class ToolJournal:
             )
         )
 
+    def mark_executing(self, operation_id: str) -> None:
+        """Record that the operation passed its tool's point of no return.
+
+        The distinction this buys is why the recovery path can retry anything at
+        all. `PREPARED` alone says the call was issued; it does not say whether
+        the tool ever began, and for a `Bash` command those two are the
+        difference between "nothing happened" and "something happened that
+        cannot be read back". Adding the third state is what lets a resume tell
+        them apart instead of treating both as the pessimistic case -- which is
+        what made an interrupted-before-start call permanently unrecoverable.
+
+        Written from inside `execute`, by the tool, at its own point of no
+        return; see `longline/tools/base.py:mark_irreversible`.
+        """
+        self._append(
+            OperationRecord(
+                operation_id=operation_id,
+                session_id=self._session_id,
+                turn_id=0,
+                tool_call_id="",
+                tool_name="",
+                input_fingerprint="",
+                status=EXECUTING,
+                timestamp=time.time(),
+            )
+        )
+
     def write_session_header(self, *, workspace_root: str, git_head: str | None) -> None:
         path = header_path(self._claude_dir, self._session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,26 +330,43 @@ class ToolJournal:
             latest[record.operation_id] = record
         return latest
 
-    def pending(self) -> list[OperationRecord]:
+    def pending(self) -> list[PendingOperation]:
         """Operations that started and never committed, in the order they started.
 
-        Returns the START record, not the latest one: the verdict records carry
-        no `tool_call_id`, and that id is what pairs the recovered result with
-        the `tool_use` already sitting on the transcript.
+        `record` is the START record, not the latest one: the `EXECUTING` and
+        verdict records carry no `tool_call_id`, and that id is what pairs the
+        recovered result with the `tool_use` already sitting on the transcript.
 
         Keyed on the OPERATION id rather than the tool call id, because a retried
         tool call is a new operation with its own outcome.
         """
         by_id = self._latest()
         seen: set[str] = set()
-        out: list[OperationRecord] = []
+        out: list[PendingOperation] = []
         for record in self.records():
-            if record.status != PREPARED or record.operation_id in seen:
+            if record.status not in UNFINISHED_STATUSES or record.operation_id in seen:
                 continue
             seen.add(record.operation_id)
-            if by_id[record.operation_id].status == PREPARED:
-                out.append(record)
+            latest = by_id[record.operation_id].status
+            if latest in UNFINISHED_STATUSES:
+                out.append(
+                    PendingOperation(record=record, started=latest == EXECUTING)
+                )
         return out
+
+
+@dataclass(frozen=True)
+class PendingOperation:
+    """An operation that started and never committed.
+
+    The record and the flag travel together on purpose: they are one question in
+    two halves, and a caller able to ask for the first without the second would
+    be a caller able to forget the second -- which is precisely the bug that made
+    `before_tool` unrecoverable.
+    """
+
+    record: OperationRecord
+    started: bool
 
 
 @dataclass(frozen=True)
@@ -353,15 +402,20 @@ def reconcile_pending(journal: ToolJournal, registry: Any) -> list[ReconciledOpe
     tool whose `reconcile` raises answers UNKNOWN for the same reason -- a broken
     reconciler must not be able to block a resume, and it certainly must not be
     able to authorise a retry it did not earn.
+
+    `started` is passed through from the journal, and it is the only thing that
+    lets a tool whose effect cannot be read answer at all. A tool that does not
+    understand it keeps the safe default; see `Tool.reconcile`.
     """
     out: list[ReconciledOperation] = []
-    for record in journal.pending():
+    for pending in journal.pending():
+        record = pending.record
         tool = registry.get(record.tool_name) if registry is not None else None
         if tool is None:
             outcome = ReconcileOutcome.UNKNOWN
         else:
             try:
-                outcome = tool.reconcile(record.tool_input)
+                outcome = tool.reconcile(record.tool_input, started=pending.started)
             except Exception:
                 outcome = ReconcileOutcome.UNKNOWN
         status = OUTCOME_STATUS[outcome]
@@ -427,6 +481,7 @@ __all__ = [
     "ABORTED",
     "COMMITTED",
     "DIGESTED_STATUSES",
+    "EXECUTING",
     "HEADER_NAME",
     "INDETERMINATE",
     "OP_JOURNAL_NAME",
@@ -437,7 +492,9 @@ __all__ = [
     "RECONCILE_APPLIED_PREFIX",
     "RECONCILE_UNKNOWN_PREFIX",
     "TERMINAL_STATUSES",
+    "UNFINISHED_STATUSES",
     "OperationRecord",
+    "PendingOperation",
     "ReconciledOperation",
     "ToolJournal",
     "header_path",

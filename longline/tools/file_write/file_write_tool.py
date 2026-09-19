@@ -38,12 +38,21 @@ class FileWriteTool(Tool):
     def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
         return self._declare(tool_input.get("file_path"), self.ACCESS_WRITE)
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
         """A full overwrite identifies itself: the file is the content, or it is not.
 
         There is no third case to be unsure about -- unlike `Edit`, whose
         `old_string` may survive elsewhere in the file and make the bytes
         compatible with both answers.
+
+        `started` is ignored, and that is not an oversight. This tool never calls
+        `mark_irreversible()`, because it does not need to: its effect is a single
+        `os.replace`, which either happened or did not, and the file it produced
+        says which. Reading the world back is stronger evidence than any marker,
+        and unlike a marker it stays valid across a machine that changed under the
+        session. A tool answers with `started` only when it has nothing better.
         """
         path = Path(str(tool_input.get("file_path") or ""))
         content = str(tool_input.get("content") or "")

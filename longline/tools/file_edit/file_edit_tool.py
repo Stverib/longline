@@ -39,12 +39,21 @@ class FileEditTool(Tool):
     def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
         return self._declare(tool_input.get("file_path"), self.ACCESS_WRITE)
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
         """Read the two strings out of the file: exactly one of them decides it.
 
         Neither present, both present, or the file unreadable: UNKNOWN, never
         NOT_APPLIED. NOT_APPLIED is an authorisation to retry, and it is only
         earned by positive evidence that the old text is still untouched.
+
+        `started` is ignored, and for THIS tool that is load-bearing rather than
+        tidy. `Edit` never calls `mark_irreversible()`, so `started` is False for
+        every operation it has ever performed -- which means treating it as
+        evidence would answer NOT_APPLIED for every interrupted edit, including
+        the ones that landed. The marker is only worth reading from a tool that
+        writes one; see `Tool.reconcile`.
         """
         path = Path(str(tool_input.get("file_path") or ""))
         old = str(tool_input.get("old_string") or "")

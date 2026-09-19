@@ -276,19 +276,29 @@ def test_the_journal_records_the_bash_call_as_started_but_uncommitted(tmp_path: 
     """The other half of the fix, and the reason the checkpoint alone is not enough.
 
     The checkpoint says the call was ISSUED. It cannot say whether the call took
-    effect, because the result never came back. The journal's PREPARED-without-
-    COMMITTED is what turns that into a decidable question on resume.
+    effect, because the result never came back. The journal's
+    started-without-COMMITTED is what turns that into a decidable question on
+    resume.
+
+    The Bash call carries TWO records here, and the second is the one that makes
+    the question decidable rather than merely askable. `PREPARED` alone would
+    also describe a call that died before the shell was ever spawned -- and that
+    call provably did nothing, so a resume that read the two the same way would
+    have to give up on both. `EXECUTING` is the Bash tool reporting that it
+    reached `create_subprocess_shell`, which is why this arm's honest answer is
+    "it may have landed" and the `before_tool` arm's is "it never began".
     """
-    from longline.session.tool_journal import COMMITTED, PREPARED, ToolJournal
+    from longline.session.tool_journal import COMMITTED, EXECUTING, PREPARED, ToolJournal
 
     sandbox = _sandbox(tmp_path)
     spec = _spec(tmp_path, sandbox, AFTER_TOOL, failpoint_tool="Bash")
     arm(spec)
 
     records = ToolJournal(tmp_path / "claude", "loop-resume").records()
-    # Joined on the OPERATION id: the COMMITTED record carries no tool name, on
-    # purpose -- it is the last word on an operation, and repeating the start's
-    # fields into it would be a second copy of a fact that could then disagree.
+    # Joined on the OPERATION id: the COMMITTED and EXECUTING records carry no
+    # tool name, on purpose -- the start is what owns the operation's identity,
+    # and repeating its fields into the later records would be a second copy of
+    # a fact that could then disagree.
     starts = {r.operation_id: r for r in records if r.status == PREPARED}
     statuses: dict[str, list[str]] = {}
     for record in records:
@@ -296,12 +306,51 @@ def test_the_journal_records_the_bash_call_as_started_but_uncommitted(tmp_path: 
         if start is not None:
             statuses.setdefault(start.tool_name, []).append(record.status)
 
-    assert statuses["Bash"] == [PREPARED], "the Bash call started and never reported back"
+    assert statuses["Bash"] == [PREPARED, EXECUTING], "the shell was spawned and never reported"
     assert statuses["Read"] == [PREPARED, COMMITTED]
 
     read_start = next(r for r in records if r.status == PREPARED and r.tool_name == "Read")
     assert read_start.access, "the Read declared the file it touched"
     assert read_start.tool_call_id, "and which call it was"
+
+
+def test_the_before_tool_arm_leaves_a_call_that_provably_never_began(tmp_path: Path) -> None:
+    """The other side of the same distinction, and the one that was lost.
+
+    The gate stops before delegating, so the shell is never spawned and
+    `mark_irreversible()` is never called -- which leaves ONE record, not two.
+    That single record is the proof: nothing about this call can have changed the
+    world, so the resumed leg may retry it.
+
+    Read the two arms together. `after_tool` is `[PREPARED, EXECUTING]` and must
+    not be retried; `before_tool` is `[PREPARED]` and must be. Before the marker
+    existed those were the same record, so the runtime could only give the safe
+    answer to both -- and giving the safe answer here meant the task silently
+    never finished.
+    """
+    from longline.session.tool_journal import ABORTED, ToolJournal
+
+    sandbox = _sandbox(tmp_path)
+    spec = _spec(tmp_path, sandbox, BEFORE_TOOL, failpoint_tool="Bash")
+    arm(spec)
+
+    journal = ToolJournal(tmp_path / "claude", "loop-resume")
+    pending = journal.pending()
+    assert [p.record.tool_name for p in pending] == ["Bash"]
+    assert [p.started for p in pending] == [False], (
+        "the gate stopped before the spawn, so no marker should exist"
+    )
+    operation_id = pending[0].record.operation_id
+    assert pending[0].record.tool_call_id, "the start still carries the id the transcript needs"
+
+    from longline.eval.loop_resume_worker import resume
+
+    resume(spec)
+
+    verdicts = [r for r in journal.records() if r.status == ABORTED]
+    assert [r.operation_id for r in verdicts] == [operation_id], (
+        "a call that provably never began was not declared safe to retry"
+    )
 
 
 def test_after_checkpoint_saves_instruction_one_before_arming_the_gate(tmp_path: Path) -> None:

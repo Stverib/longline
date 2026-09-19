@@ -80,7 +80,7 @@ from longline.core.events import (
     TurnComplete,
 )
 from longline.models.messages import Usage
-from longline.tools.base import Tool, ToolResult, ToolSchema
+from longline.tools.base import ReconcileOutcome, Tool, ToolResult, ToolSchema
 
 # Re-exported, not reimplemented. The runtime hashes the same files this harness
 # does (see `longline/session/tool_journal.py`), and two copies of a digest
@@ -549,6 +549,29 @@ class ToolFaultWrapper(Tool):
 
     def is_concurrency_safe(self, tool_input: dict[str, Any]) -> bool:
         return self.inner.is_concurrency_safe(tool_input)
+
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        """Forwarded, and NOT optional.
+
+        `Tool.workload` defaults to `{}`, so a wrapper that did not forward would
+        declare nothing for every tool it wraps -- silently emptying the durable
+        journal's digests, which reconciliation and the workspace identity both
+        read. The suite would then report a clean recovery for a runtime that had
+        been blinded, and nothing in the numbers would say so. The same trap
+        `GatedTool` documents; this wrapper had it too.
+        """
+        return self.inner.workload(tool_input)
+
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
+        """Forwarded for the same reason, `started` included.
+
+        Forwarding on the FAULTING call is right rather than merely harmless: the
+        injected fault means the inner tool really did not run, so the inner
+        tool's own reading of the world is the correct answer and not a stale one.
+        """
+        return self.inner.reconcile(tool_input, started=started)
 
     async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
         self.calls += 1

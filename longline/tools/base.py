@@ -15,10 +15,15 @@ Corresponds to TS: Tool.ts (ToolDef, buildTool) + tools.ts (assembleToolPool).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 
 @dataclass
@@ -80,6 +85,65 @@ class ReconcileOutcome(Enum):
     APPLIED = "applied"          # the effect is present in the world
     NOT_APPLIED = "not_applied"  # the effect is provably absent; safe to retry
     UNKNOWN = "unknown"          # cannot be read from here; do not retry blindly
+
+
+# The point of no return, as published to the tool that is executing.
+#
+# A tool cannot be handed the journal: `execute(tool_input)` is the tool
+# interface, and widening it would touch every tool and every wrapper. So the
+# executor publishes a marker here for the duration of one call, and a tool that
+# has a point of no return reports it by calling `mark_irreversible()`.
+#
+# A `ContextVar` rather than an attribute on the tool because tools are shared
+# across concurrent calls -- the streaming executor runs up to ten at once -- and
+# an attribute would let one call's marker land on another call's record.
+_current_irreversible_marker: ContextVar[Callable[[], None] | None] = ContextVar(
+    "longline_tool_irreversible_marker", default=None
+)
+
+
+def mark_irreversible() -> None:
+    """Report that the running tool can no longer be un-done.
+
+    Called by a tool at the last line from which its effect is still impossible
+    -- `BashTool` calls it immediately before spawning the shell. Everything
+    above such a line is validation, and a call that was rejected changed
+    nothing; from that line onward the runtime cannot read back what happened.
+    Without this, those two situations are one state in the journal, and the only
+    safe reading of that state is the pessimistic one -- which turns a call that
+    never ran into an interruption that can never be repaired.
+
+    Deliberately NOT best-effort, unlike the journal's prepare and commit: if the
+    marker cannot be written the exception propagates into the tool, which must
+    then abandon the operation. A swallowed failure here would leave a PREPARED
+    with no marker for a call that DID run, and "no marker" is exactly what
+    authorises a retry -- so swallowing would re-open the duplicate this whole
+    mechanism exists to remove.
+
+    A no-op when nothing is publishing a marker, which is every caller that
+    cannot resume: sub-agents, one-shot `--print`, and the unit tests.
+    """
+    marker = _current_irreversible_marker.get()
+    if marker is not None:
+        marker()
+
+
+@contextmanager
+def irreversible_point(marker: Callable[[], None] | None) -> Iterator[None]:
+    """Publish `marker` for the duration of one tool call.
+
+    The executor's side of `mark_irreversible`. `None` means "this call is not
+    being journalled", and leaves any outer marker in place rather than clearing
+    it -- an unjournalled nested call must not erase its caller's.
+    """
+    if marker is None:
+        yield
+        return
+    token = _current_irreversible_marker.set(marker)
+    try:
+        yield
+    finally:
+        _current_irreversible_marker.reset(token)
 
 
 class Tool(ABC):
@@ -180,7 +244,9 @@ class Tool(ABC):
         """
         return text.replace("\r\n", "\n").replace("\r", "\n")
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
         """Whether a call that never reported back took effect.
 
         Asked only for operations the journal shows as started-but-uncommitted.
@@ -188,6 +254,22 @@ class Tool(ABC):
         effect is not readable from the workspace -- `Bash` above all. UNKNOWN
         authorises neither a retry nor a claim of success, so the recovery path
         reports it to the model and re-runs nothing.
+
+        `started` is the journal's answer to a question a tool cannot ask itself:
+        whether the call got as far as its point of no return. A tool that
+        reports one -- by calling `mark_irreversible()` -- may use it to prove
+        NOT_APPLIED, and `BashTool` does exactly that.
+
+        A tool that reports NO point of no return must ignore `started`, and the
+        default here does: for such a tool `started=False` means only "the
+        executor never saw a marker", which is true of every call that tool ever
+        made, so answering NOT_APPLIED there would authorise a retry of an
+        operation that may well have landed. UNKNOWN under both values, and a
+        tool only earns the stronger answer by marking.
+
+        `started` defaults to True because the absent fact and the pessimistic
+        fact are the same fact -- a caller with nothing to say must not be able to
+        authorise a retry by saying nothing.
         """
         return ReconcileOutcome.UNKNOWN
 

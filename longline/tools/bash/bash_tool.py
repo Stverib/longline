@@ -12,7 +12,13 @@ import logging
 import os
 from typing import Any
 
-from longline.tools.base import Tool, ToolResult, ToolSchema
+from longline.tools.base import (
+    ReconcileOutcome,
+    Tool,
+    ToolResult,
+    ToolSchema,
+    mark_irreversible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +148,30 @@ class BashTool(Tool):
         # 再检查双词命令（如 git status, git log 等）
         return len(words) >= 2 and f"{words[0]} {words[1]}" in _READ_ONLY_TWO_WORD
 
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
+        """A shell command cannot be read back -- but a call that never ran can be ruled out.
+
+        Nothing here can look at the workspace and tell whether this command
+        happened. The command is an opaque string: it may have written a file, a
+        thousand files, a database, an email, or nothing at all, and no later
+        reading of the world separates those cases. So the unreadable half stays
+        UNKNOWN, and the runtime reports it to the model rather than replaying it.
+
+        The other half is decidable, and this is the tool that made it worth
+        deciding. `started` is the journal's record of whether the call reached
+        `mark_irreversible()` -- which this tool calls on the line immediately
+        before the spawn. A command that was never spawned did not run, full
+        stop, so NOT_APPLIED and the retry is safe and earns its keep.
+
+        This is the boundary the module header draws. The runtime does not claim
+        exactly-once for an unverifiable side effect; it claims that it will not
+        blindly replay one, and that it can tell the difference between an
+        operation that might have landed and one that provably never began.
+        """
+        return ReconcileOutcome.UNKNOWN if started else ReconcileOutcome.NOT_APPLIED
+
     async def execute(self, tool_input: dict[str, Any]) -> ToolResult:
         command: str = tool_input.get("command", "")
         # 用户可指定超时，但上限硬编码为 600 秒（10 分钟），防止进程长时间挂起
@@ -152,6 +182,18 @@ class BashTool(Tool):
             return ToolResult(content="Error: empty command", is_error=True)
 
         try:
+            # 不可逆点 —— THE POINT OF NO RETURN. It sits here rather than at the
+            # top of this method because everything above it is validation, and a
+            # command that was rejected changed nothing. From the spawn onward
+            # nothing here can read back what the command did, so the two sides of
+            # this line have to remain distinguishable after a kill -- and this
+            # call is the only thing that distinguishes them.
+            #
+            # Inside the `try` deliberately: if the marker cannot be recorded the
+            # exception is caught below and returned as an error, and the shell is
+            # never spawned. Refusing to run is the correct outcome; running an
+            # unrecorded command is not.
+            mark_irreversible()
             # 使用 shell 模式启动子进程，以便支持管道、重定向等 shell 特性
             proc = await asyncio.create_subprocess_shell(
                 command,

@@ -343,9 +343,18 @@ class GatedTool(Tool):
         """
         return self.inner.workload(tool_input)
 
-    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
-        """Forwarded for the same reason: the inner tool is what knows its effect."""
-        return self.inner.reconcile(tool_input)
+    def reconcile(
+        self, tool_input: dict[str, Any], *, started: bool = True
+    ) -> ReconcileOutcome:
+        """Forwarded for the same reason: the inner tool is what knows its effect.
+
+        `started` is forwarded explicitly rather than left to a default. A wrapper
+        that dropped it would hand the inner tool "it started" for a call the
+        journal says never began -- the safe direction, but the exact opposite of
+        the answer the inner tool was written to give, and it would show up as a
+        recovery that mysteriously stopped working rather than as an error.
+        """
+        return self.inner.reconcile(tool_input, started=started)
 
     def is_concurrency_safe(self, tool_input: dict[str, Any]) -> bool:
         return self.inner.is_concurrency_safe(tool_input)

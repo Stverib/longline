@@ -11,9 +11,11 @@ read.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any
 
 from longline.tools.base import ReconcileOutcome, Tool, ToolResult, ToolSchema
+from longline.tools.bash.bash_tool import BashTool
 from longline.tools.file_edit.file_edit_tool import FileEditTool
 from longline.tools.file_write.file_write_tool import FileWriteTool
 
@@ -34,6 +36,87 @@ class _Opaque(Tool):
 
 def test_the_default_cannot_tell() -> None:
     assert _Opaque().reconcile({"command": "rm -rf build"}) is ReconcileOutcome.UNKNOWN
+
+
+def test_the_default_does_not_read_the_marker_as_evidence() -> None:
+    """The safe default, and the reason `started` alone authorises nothing.
+
+    A tool that never calls `mark_irreversible()` gets `started=False` on every
+    call it has ever made. If the default treated that as proof the effect was
+    absent, every interrupted operation of every such tool would be retried --
+    including the ones that already landed.
+    """
+    assert _Opaque().reconcile({}, started=False) is ReconcileOutcome.UNKNOWN
+    assert _Opaque().reconcile({}, started=True) is ReconcileOutcome.UNKNOWN
+
+
+def test_bash_rules_out_a_call_that_never_reached_the_spawn() -> None:
+    """The one thing about a shell command that IS decidable.
+
+    `started=False` is the journal saying the call stopped before
+    `mark_irreversible()`, which `BashTool` calls on the line immediately before
+    `create_subprocess_shell`. A command that was never spawned did not run, so
+    the retry is safe -- and this is what turns an interrupted-before-start call
+    from permanently unrecoverable into recoverable.
+    """
+    assert BashTool().reconcile({"command": "echo x"}, started=False) is (
+        ReconcileOutcome.NOT_APPLIED
+    )
+
+
+def test_bash_stays_unknown_once_the_shell_was_spawned() -> None:
+    """The other half, which no reading of the world can decide.
+
+    The command may have finished, be mid-flight, or have died with its effect
+    half-applied, and the tool has no way to look. UNKNOWN is reported to the
+    model rather than retried: this is the boundary of the mechanism, and the
+    runtime does not claim exactly-once on the far side of it.
+    """
+    assert BashTool().reconcile({"command": "echo x"}, started=True) is (
+        ReconcileOutcome.UNKNOWN
+    )
+    assert BashTool().reconcile({"command": "echo x"}) is ReconcileOutcome.UNKNOWN
+
+
+def test_every_tool_that_overrides_reconcile_accepts_the_marker_flag() -> None:
+    """A signature contract, because breaking it fails SILENTLY and safely-wrong.
+
+    `reconcile_pending` calls `tool.reconcile(input, started=...)` and turns any
+    exception into UNKNOWN. So an override that predates this flag does not
+    crash: it answers UNKNOWN for every operation, and the suite reads that as a
+    recovery that stopped working rather than as a bug. Hence a test that fails
+    loudly here instead.
+    """
+    import importlib
+
+    # Imported for their side effect: a `Tool` subclass only appears in
+    # `__subclasses__` once its module has been loaded. `importlib` rather than
+    # plain imports so the intent is the import and not the name.
+    for module in (
+        "longline.eval.eval_tools",
+        "longline.eval.failpoints",
+        "longline.eval.faults",
+    ):
+        importlib.import_module(module)
+
+    found: list[type[Tool]] = []
+    stack: list[type[Tool]] = [Tool]
+    while stack:
+        for subclass in stack.pop().__subclasses__():
+            found.append(subclass)
+            stack.append(subclass)
+
+    # Guards the walk itself: an empty or truncated subclass list would make the
+    # assertion below vacuous and green.
+    assert {FileWriteTool, FileEditTool, BashTool} <= set(found)
+
+    missing = sorted(
+        cls.__name__
+        for cls in found
+        if "reconcile" in cls.__dict__
+        and "started" not in inspect.signature(cls.reconcile).parameters
+    )
+    assert missing == []
 
 
 def test_write_is_applied_when_the_file_holds_exactly_what_it_wrote(tmp_path: Path) -> None:

@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from longline.utils.hashing import sha256_file
 
-from .base import ToolRegistry, ToolResult
+from .base import ToolRegistry, ToolResult, irreversible_point
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -163,10 +163,19 @@ class StreamingToolExecutor:
                     logger.error("Tool journal PREPARE failed for %s: %s", block.name, e)
                     operation_id = None
 
-            # Execute
+            # Execute. The marker is published around the call so that a tool can
+            # report its own point of no return: the one fact that separates
+            # "died before the effect was possible" from "died with the effect in
+            # flight", and the one fact no layer above this can observe.
             # 与 orchestration.py 一致：异常转为错误 ToolResult，不中断循环
+            marker = (
+                self._irreversible_marker(self._journal, operation_id)
+                if operation_id is not None and self._journal is not None
+                else None
+            )
             try:
-                result = await tool.execute(block.input)
+                with irreversible_point(marker):
+                    result = await tool.execute(block.input)
             except Exception as e:
                 logger.warning("Tool %s failed: %s", block.name, e)
                 result = ToolResult(content=f"Error: {e}", is_error=True)
@@ -218,6 +227,35 @@ class StreamingToolExecutor:
                 result = ToolResult(content=f"Error: {e}", is_error=True)
             results.append((tool_id, result))
         return results
+
+    def _irreversible_marker(
+        self, journal: Any, operation_id: str
+    ) -> Callable[[], None]:
+        """A once-only writer for this operation's point of no return.
+
+        Once-only because a tool may reach its point of no return more than once
+        inside one call -- a retry loop within `execute` -- and the record that
+        matters is the FIRST: after it the operation is in flight, and a second
+        line saying so adds nothing.
+
+        The write is NOT wrapped in `try`/`except`, unlike PREPARE and COMMIT.
+        Those two are best-effort by design -- a session directory that cannot be
+        written must not be the reason a user's edit does not happen. This one is
+        a BARRIER: a tool that cannot record crossing its point of no return must
+        not cross it, so the failure belongs to the tool, which will abandon the
+        operation. Swallowing it would leave a PREPARED with no marker for a call
+        that did run -- and "no marker" is what authorises a retry.
+        """
+        written = False
+
+        def mark() -> None:
+            nonlocal written
+            if written:
+                return
+            journal.mark_executing(operation_id)
+            written = True
+
+        return mark
 
     async def _process_queue(self) -> None:
         """Process queued tools respecting concurrency constraints."""
