@@ -320,9 +320,17 @@ async def test_gated_tool_snapshots_artifacts_around_the_execution(tmp_path: Pat
     assert recorded[0]["pre_state"]["artifact.txt"] != "missing"
 
 
-def test_gated_tool_forwards_name_schema_and_concurrency() -> None:
+def test_gated_tool_forwards_name_schema_and_concurrency(tmp_path: Path) -> None:
+    """`claude_dir` is a tmp_path even though this gate never fires.
+
+    A gate built on the working directory writes its sentinel into the
+    repository root the moment anything arms it, and an earlier version of this
+    test did exactly that -- it left a `failpoint.json` in the checkout.
+    """
     inner = _EchoTool("Custom")
-    gated = GatedTool(inner=inner, gate=FailpointGate(Path("."), AFTER_TOOL, at_tool_name="Custom"))
+    gated = GatedTool(
+        inner=inner, gate=FailpointGate(tmp_path, AFTER_TOOL, at_tool_name="Custom")
+    )
     assert gated.get_name() == "Custom"
     assert gated.get_schema().name == "Custom"
     assert gated.is_concurrency_safe({}) is True
