@@ -872,6 +872,11 @@ FalseRejectRate         0/60             0/60   (分母 = 非 relevant-drift 的
 状态，而**只有工具知道自己的不可逆点在哪**（`BashTool` 在 spawn 子进程之前，
 `FileWriteTool` 在 `os.replace` 之前）。这需要工具配合，是下一步，不是本轮。
 
+> 下一步已经做完：见 §5.10。`before_tool` 回到 10/10，`LoopResumeRate` 回到 50/50，
+> 而这一节表格里的 after 列（`before_tool` 0/10、`LoopResumeRate` 40/50）记的是**修复前**
+> 的那一次运行，作为 v3 的历史保留。同样被 §5.10 取代的还有这一节三条臂的任务判据——
+> 它们当时只有 `contains`，一个任何输入都满足的判据。
+
 #### 结论三：旧的那个 `WorkspaceDriftDetectionRate = 10/10` 测错了东西
 
 §5.8 把它记成 10/10，判据是 `drifted and bool(tool_errors)`——**「恢复腿报了工具错误」**。
@@ -908,7 +913,7 @@ FalseRejectRate         0/60             0/60   (分母 = 非 relevant-drift 的
 ### 5.10 不可逆点：让「没跑过」和「跑了没回话」可区分（2026-09-19）
 
 §5.9 结论二记录的那个洞：`before_tool` 从 10/10 掉到 0/10。本节记录洞的准确形状、修法，
-以及修复过程中查出来的第二个问题——**两条臂的判分器恒真**。
+以及修复过程中查出来的第二个问题——**三条臂的判分器恒真**。
 
 #### 洞的准确形状
 
@@ -977,9 +982,9 @@ wrapper。
 cell 全部重跑**（`loop_resume_v5_*`）。判分器只收紧、不放松，所以这不是把数字改好看，而是把
 一个原先不可能失败的判据变成可以失败的。
 
-> **状态：这一轮重跑被中断，结果待补。** 重跑命令被后台任务的内存回收杀掉（系统内存告急，
-> 与本命令自身的开销无关）。因此下面「实测结果」一节暂时只有 `loop_resume_v3_*` 那一次的数
-> 字，而它是在**旧判据**下取的。
+`contains` 与 `not_contains` 是**一对**：前者要求至少一次，后者排除两次及以上，合起来是
+「恰好一次」。写进文档之前先验过 `judge_file_content` 真的会判假，而不是把一个没人读的
+kwarg 摆在数据里——四种输入的结果是「一次 真 / 相邻两次 假 / 没有 假 / 相隔两次 假」。
 
 补第三条臂这件事本身就是那个检查生效的证据：先把 `after_tool` 的单臂测试改成「凡检查
 `NOTES.md` 内容的臂都必须带 duplicate guard」，它立刻把 `lr-truncate-tail` 指了出来。
@@ -989,37 +994,51 @@ cell 全部重跑**（`loop_resume_v5_*`）。判分器只收紧、不放松，�
 的运行上全部成立**，所以它在 `before_tool` 是 0/10 的那段时间里一直是绿的。已补上
 `layer_task_ok`。「没造成伤害」和「把活干完了」是两个不同的断言，原先只查了前一个。
 
-#### 实测结果
+#### 实测结果（两个 cell 都在收紧后的判据下重跑）
 
-after 列取自 `loop_resume_v3_durability`（7 臂 × 10 = 70 run，`problems = []`，即 70/70 哨兵
-真实触发），**判据是收紧之前的**。before 列沿用 §5.9 的消融 cell，同样没有在新判据下重跑。
+`loop_resume_v5_durability`（`--label durability-point-of-no-return`）与
+`loop_resume_v5_ablation`（`--no-durability`，`--label ablation-point-of-no-return`），
+各 7 臂 × 10 = 70 run，共 140 run，全离线。两个 cell 的 `problems` 都是 `[]`，即 140/140
+个哨兵真实触发——没有一次「注入没落地」被记成失败。
 
 | 臂 | before（消融） | after | after `den` | after `dup` | after `redun` |
 | --- | --- | --- | --- | --- | --- |
 | `before_model` | 10/10 | 10/10 | 0 | 0 | 0 |
-| `before_tool` | 10/10 | **10/10**（§5.9 是 0/10） | 0 | 0 | 0 |
-| `after_tool` | 0/10 | 10/10 | 10 | 0 | 0 |
+| `before_tool` | 10/10 | **10/10**（v3 是 0/10） | 0 | 0 | 0 |
+| `after_tool` | **0/10** | **10/10** | 10 | 0 | 0 |
 | `after_checkpoint` | 10/10 | 10/10 | 20 | 0 | 0 |
 | `truncate_tail` | 10/10 | 10/10 | 20 | 0 | 0 |
-| `workspace_drift`（检测） | 拒绝 0/10 | 拒绝 10/10 | — | — | — |
-| `workspace_drift_unrelated`（检测） | 拒绝 0/10 | 拒绝 0/10 | — | — | — |
+| `workspace_drift`（检测） | 拒绝 0/10 | 拒绝 10/10 | 10 | 0 | 0 |
+| `workspace_drift_unrelated`（检测） | 拒绝 0/10 | 拒绝 0/10 | 10 | 0 | 0 |
 
 ```
-指标                    before(消融)     after(v3)
+指标                    before(消融)     after(v5)
 LoopResumeRate          40/50            50/50
 DriftRecall             0/10             10/10
 FalseRejectRate         0/60             0/60
 ```
 
+**消融 cell 在新判据下一格没动**：`after_tool` 仍是 0/10（`dup = 10`、`redun = 10`），
+`before_tool` 仍是 10/10，`LoopResumeRate` 仍是 40/50。这是必要的对照——判分器只收紧不放松，
+所以如果 after 列的改善是判据变严造出来的，消融列会先动。它没动。
+
+`false_reject` 的两列不能同等读：**消融列的 0/60 是结构性为零**——`--no-durability` 连工作区
+身份一起关掉，那一格里没有任何运行**可能**被误拒。有意义的是 after 列的 0/60：检测器开着，
+60 次里一次该放行的都没拦。
+
 **这套数字支持什么、不支持什么**，逐条写清：
 
-- **支持**：`before_tool` 从 0/10 回到 10/10。恢复段确实重跑了那个没跑过的调用——不重跑的话
-  `NOTES.md` 里不会有 `fixed-add`，而这条判据在改动前正是失败的那一条。
-- **支持**：`after_tool` 的 10/10 没有被这次改动换掉，70 次运行里 `dup = 0`、`redun = 0`。
-  即：**没有一条臂是靠放行一次重复副作用换来分数的**。
-- **不支持**：「重跑恰好发生了一次」。`before_tool` 的 `den = 0`，所以 `DuplicateSideEffectRate`
-  的结构性分母是 0，而旧的任务判据只有 `contains`——两处都看不见「追加了两次」。要支持这个
-  说法必须在收紧后的判据下重跑，这正是被中断的那一轮。
+- **支持**：`before_tool` 从 0/10 回到 10/10。恢复段确实重跑了那个没跑过的调用——不重跑
+  `NOTES.md` 里不会有 `fixed-add`，而这正是 v3 那次失败的那条判据。
+- **支持**（这一次有判据撑着，v3 没有）：「那条 append 恰好落了一次」。`before_tool` 上执行层
+  仍然帮不上忙（`den = 0`），但任务层现在是 `contains` + `not_contains` 一对，10/10 意味着
+  10 次运行里 `NOTES.md` 的 `fixed-add` 都**恰好出现一次**——追加两次会在这里被判假，而那正是
+  这条臂要防的结果。v3 的 10/10 没有这个含义，因为当时只有一个任何输入都能满足的 `contains`。
+- **支持**：`after_tool` 的 10/10 没有被这次改动换掉，两格 140 次运行里 `dup = 0`、
+  `redun = 0`。即：**没有一条臂是靠放行一次重复副作用换来分数的**。
+- **仍然不支持**：「Bash 调用被发出了一次」。判据看的是**产物**，不是调用记录。一次重放如果
+  追加的内容不含 `fixed-add`，两处都看不见。能说清「调用层」的是 `DuplicateSideEffectRate`，
+  而它在这条臂上的分母是 0。要做这个更强的断言，需要一层按调用计数的记账，现在没有。
 
 #### 局限
 
