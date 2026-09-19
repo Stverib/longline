@@ -1,18 +1,22 @@
 # Longline
 
-面向长链路任务的可恢复 Agent Runtime 与多 Agent 执行框架。
+面向长链路复杂任务、以原生 Python/asyncio 独立实现的可恢复 Agent Runtime 与多 Agent 执行框架。
 
 ## 这是什么
 
-一个纯 Python 实现的 agent 内核，解决的问题是：**当一次任务要跑几十轮工具调用、几十分钟、甚至跨进程重启时，怎么保证它不丢状态、能恢复、能被人接管。**
+Longline 解决的问题是：**当一次任务要跑几十轮工具调用、几十分钟、甚至跨进程重启时，怎么保证它不丢状态、能恢复、能被人接管。**
 
 - **可恢复**：session 持久化 + transcript 校验修复，进程挂了能从断点续上
 - **长链路**：token 预算监控 + 自动上下文压缩，长对话不会撑爆窗口
 - **多 Agent**：Team 生命周期、Mailbox 通信、Coordinator 编排，一个 leader 带多个 teammate 并行干活
 
-内核源自对 Claude Code TypeScript 源码（1884 个文件、38 万行）的提取与翻译，因此它**不是封装 API 的 wrapper，而是一个功能对齐的完整 agent 运行时**——26 个内置工具、权限系统、hooks、MCP、skills 都是照着真实产品还原的。
+约 2.1 万行代码（不含空行与注释），覆盖 Agent Loop、26 个内置工具、MCP/Skills、Context Engineering、会话恢复与多 Agent 编排，并自带一套确定性评测体系（见 [Agent 评测](#agent-评测)）。
 
-## 还原了什么
+它没有 Agent 框架依赖：工具编排时序、权限门控、上下文压缩时机、故障注入点都落在自己的代码里，可以直接下断点追到具体状态转换，而不是停在框架回调里——**它不是封装 API 的 wrapper，而是一个完整的 agent 运行时**。
+
+**设计参考**来自对 Claude Code Runtime 的源码分析与架构抽象：能力边界（工具集、权限模型、hooks、MCP、skills）与真实产品对齐，实现与模块划分由本项目独立完成。
+
+## 能力覆盖
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
