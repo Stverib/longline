@@ -54,11 +54,12 @@ longline/
 ├── hooks/              Hooks：配置加载、PreToolUse/PostToolUse
 ├── skills/             Skills：定义加载、slash 命令注册
 ├── session/            会话管理：持久化、TaskRegistry、transcript recovery
+├── eval/               评测子系统：8 个套件、判分器、报告、故障注入与 failpoint 门控
 ├── commands/           Slash 命令：/clear /compact /model /help /cost
 ├── ui/                 终端渲染：Rich 流式输出
 └── main.py             入口：REPL 循环、模块组装、inbox polling
 
-tests/                  541 个测试用例（534 单元 + 7 集成/E2E）
+tests/                  1551 单元测试 + 33 集成/E2E（其中评测单测 1028 个，全离线）
 ```
 
 ### 核心数据流
@@ -167,7 +168,7 @@ LONGLINE_COORDINATOR_MODE=1 uv run python -m longline
 ### 测试
 
 ```bash
-# 全量单元测试（534 个）
+# 全量单元测试（1551 个，不需要 API key）
 uv run pytest tests/unit/ -v
 
 # 集成测试（需要 API key + 网络）
@@ -180,32 +181,69 @@ uv run mypy longline/
 
 ### Agent 评测
 
-> **指标口径已冻结（2026-09-15）。** 正式的公式、分母、排除条件和统计口径见
-> [`evals/README.md`](evals/README.md)。本文档「Agent 评测」一节现存的两组数字
-> 均为 **legacy exploratory**（历史探索性数据，模型 `deepseek-v4-flash`），
-> 它们是「多次运行取稳定区间」的目测结果，**没有分子/分母，也没有 95% CI**，
-> 且所用工具用例存在标签泄漏（任务文本直接点名工具）——**不可与新口径混用**。
+评测是这个仓库的一等子系统，不是事后补的脚本：**8 个套件、全确定性判分、指标可从原始产物离线重算、付费运行可断点续跑**。
+正式口径（公式、分子分母、排除条件、已知局限、业界出处）以 [`evals/README.md`](evals/README.md)
+为唯一准绳，本节只做导航——**任何报告或简历数字若与该文件冲突，以该文件为准**。
 
-内置两层确定性评测（不依赖 LLM 主观打分）：
+| 套件 | 规模 | 测什么 |
+|---|---|---|
+| `tool_selection` | 68 条（56 盲测 + 12 指令跟随，含 8 条弃权） | 工具选择：48 条工具族用例，外加「正确答案是不调工具」的弃权类 |
+| `e2e` | 40 条（5 类 × 8） | 端到端任务成功率 `pass@1`，以及可靠性 `pass^k` |
+| `compression` | 20 条成对 A/B | 自动压缩：压缩比率、关键信息保留、压缩后成功率 |
+| `recovery` | 6 类故障 × 10 次 = 60 run | 进程崩溃后的会话恢复 |
+| `latency` | 3 场景 × buffered/streaming | 流式工具执行相对缓冲执行的时长收益（成对） |
+| `multi_agent` | 24 条（18 受控 + 6 探索） | 单 Agent vs 多 Agent 成对对比 |
+| `safety` | 30 条（15 危险 + 15 正常） | 权限门控的 `DangerousRecall` 与 `FalsePositiveRate` |
+| `loop_resume` | 6 个故障点 × 10 次 = 60 run | 在真实 agent loop 内部被杀之后的恢复语义与副作用重复 |
 
-- **工具调用准确率**（legacy）：`evals/tool_calls.jsonl`（30 条，已标 `legacy`）校验 Agent 是否按序选择正确工具、参数是否匹配正则（Read/Grep/Glob/Write/Edit/Bash）。
-- **端到端任务成功率（pass@1）**：`evals/e2e.jsonl`（10 条）在临时沙箱内跑真实任务，用文件内容/命令退出码判分。该文件**未标 legacy**，将由计划 Task 3 扩充至 40 条。
+方法论——下面每条都有对应实现，不是口号：
 
-<!-- legacy exploratory: 以下数字保留仅为记录历史，不进入正式报告或简历。详见 evals/README.md §7 -->
+- 全确定性判分，不用 LLM 判官作主判；判**最终产物**与退出码，不接受「调用了正确工具即算成功」
+- 每个比例都带**分子 / 分母 / 95% Wilson CI**；每题 3 次运行报均值与区间，**绝不取最好一次**
+- `pass^k` 补上可靠性维度；行为指标（`DedicatedToolPreferenceRate`、`FirstActionConsistency`、稳定性分类）与通过率**分开报**
+- 成对实验（压缩 / 流式 / 多 Agent）在同一任务内做 `off/on`、`buffered/streaming`、`single/multi` 对比，**不留绝对基线**
+- 失败样本逐条归因到 model / runtime / tool / judge / fixture / infra
+- Review Checklist 是可执行的：标签泄漏扫描、judge mutation check（故意破坏正确结果必须判失败）、沙箱隔离、路径逃逸防护
 
-实测（deepseek-v4-flash，均多次运行取稳定区间）：工具调用准确率 **~97–100%**（平均 2.7 轮），E2E pass@1 **~70–90%**（平均 3.4 轮）。报告含逐用例工具轨迹（tool_calls）便于失败归因。
+契约里还写死了几条**报告不得越过的红线**，其中两条是评测自己查出来的：
 
-运行（需要 anthropic 兼容 API key：`ANTHROPIC_API_KEY`/`OPENCODE_API_KEY`，OpenCode 网关经 `OPENCODE_BASE_URL_GO` 自动适配）：
+- 恢复能力指**会话加载 + transcript 修复 + Task 快照**；非终态后台任务恢复后会被标记为 `KILLED`，**不得**表述为「后台任务原地续跑」
+- 生产**没有任何工作区身份校验**，`WorkspaceDriftDetectionRate` 的诚实结果是 **0**，由一条钉住该事实的测试守着；它开始失败时，文档措辞必须跟着改
+
+`loop_resume` 得出的最有价值结论与模型无关：**checkpoint 只在指令边界落盘，一条指令执行期间没有任何中途持久化**，
+因此中断落在指令内部会丢掉整条指令的全部工作——不只是「副作用没去重」。这也是本项目文档里「恢复」一词只承诺会话加载、transcript 修复与 Task 快照的原因。
+
+离线部分零 API 花费：
 
 ```bash
-# 全量两层
-uv run python -m longline.eval --case-file evals/tool_calls.jsonl --md
-# 只跑 e2e，便宜模型，冒烟前 3 条
-uv run python -m longline.eval --type e2e --case-file evals/e2e.jsonl --model deepseek-v4-flash --max-cases 3
+# 1028 个评测单测，含泄漏检查与数据集契约
+uv run pytest tests/unit/eval -q
+
+# 把杀点注入真实 agent loop，父进程真的杀掉子进程，测恢复语义
+uv run pytest tests/integration/test_eval_loop_resume.py -q
 ```
 
-报告输出到 `evals/results/`（JSON + 可选 Markdown）。离线单测不消耗 API：
+付费部分需要 anthropic 兼容 API key（`ANTHROPIC_API_KEY`，或经 OpenCode 网关的 `OPENCODE_API_KEY`，
+网关地址由 `.env` 的 `OPENCODE_BASE_URL_GO` 自动适配）：
 
 ```bash
-uv run pytest tests/unit/eval/ -v
+# 按套件跑，3 次重复，产物落 evals/results/<run-id>/
+uv run python -m longline.eval --suite tool_selection --repeats 3 --run-id <id> --md
+
+# 冒烟：只跑前 3 条
+uv run python -m longline.eval --suite e2e --max-cases 3
+
+# 断点续跑被打断的长跑
+uv run python -m longline.eval --resume-run --run-id <id>
 ```
+
+产物布局 `<out-dir>/<run-id>/{raw.jsonl,summary.json,report.md}`。**`raw.jsonl` 是唯一数据源**，
+`report.md` 不能单独作为基线依据；基线冻结流程与回归门槛见
+[`evals/baselines/README.md`](evals/baselines/README.md)。当前 `evals/baselines/` **尚无冻结基线**，
+所以现阶段只能报绝对值，还不能判回归。
+
+#### 历史数字（legacy exploratory，勿引用）
+
+模型 `deepseek-v4-flash`：工具调用准确率 **~97–100%**（平均 2.7 轮），E2E pass@1 **~70–90%**（平均 3.4 轮）。
+区间式表述说明它们是「多次运行取稳定区间」的目测结果——**没有分子/分母、没有 95% CI、没有 Git SHA**，
+且所用工具用例存在标签泄漏（任务文本直接点名工具）。数字保留仅为记录历史，定性见 `evals/README.md` §7。
