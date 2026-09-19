@@ -1,0 +1,385 @@
+{
+  "DriftRecall": {
+    "ci95_wilson": [
+      0.7224672001371107,
+      0.9999999999999999
+    ],
+    "denominator": 10,
+    "numerator": 10,
+    "value": 1.0
+  },
+  "FalseRejectRate": {
+    "ci95_wilson": [
+      0.0,
+      0.06017185214208986
+    ],
+    "denominator": 60,
+    "numerator": 0,
+    "value": 0.0
+  },
+  "LoopResumeRate": {
+    "ci95_wilson": [
+      0.6696289406777459,
+      0.887562499842239
+    ],
+    "denominator": 50,
+    "numerator": 40,
+    "value": 0.8
+  },
+  "WorkspaceDriftDetectionRate": {
+    "ci95_wilson": [
+      0.2992980081982123,
+      0.7007019918017877
+    ],
+    "denominator": 20,
+    "numerator": 10,
+    "value": 0.5
+  },
+  "by_failpoint": {
+    "after_checkpoint": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "after_tool": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "before_model": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "before_tool": {
+      "ci95_wilson": [
+        0.0,
+        0.2775327998628892
+      ],
+      "denominator": 10,
+      "numerator": 0,
+      "value": 0.0
+    },
+    "truncate_tail": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    },
+    "workspace_drift": {
+      "ci95_wilson": [
+        0.0,
+        0.2775327998628892
+      ],
+      "denominator": 10,
+      "numerator": 0,
+      "value": 0.0
+    },
+    "workspace_drift_unrelated": {
+      "ci95_wilson": [
+        0.7224672001371107,
+        0.9999999999999999
+      ],
+      "denominator": 10,
+      "numerator": 10,
+      "value": 1.0
+    }
+  },
+  "by_failpoint_counts": {
+    "after_checkpoint": 10,
+    "after_tool": 10,
+    "before_model": 10,
+    "before_tool": 10,
+    "truncate_tail": 10,
+    "workspace_drift": 10,
+    "workspace_drift_unrelated": 10
+  },
+  "cases": "evals\\loop_resume.jsonl",
+  "durability": true,
+  "failures": [
+    {
+      "case_id": "lr-before-tool#0",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#1",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#2",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#3",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#4",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#5",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#6",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#7",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#8",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-before-tool#9",
+      "checkpoint_loaded": true,
+      "failpoint": "before_tool",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": true,
+        "task": false,
+        "workspace": true
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#0",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#1",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#2",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#3",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#4",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#5",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#6",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#7",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#8",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    },
+    {
+      "case_id": "lr-workspace-drift#9",
+      "checkpoint_loaded": true,
+      "failpoint": "workspace_drift",
+      "failpoint_reached": true,
+      "layers": {
+        "execution": true,
+        "state": false,
+        "task": false,
+        "workspace": false
+      },
+      "notes": []
+    }
+  ],
+  "label": "durability-on",
+  "num_runs": 70,
+  "problems": [],
+  "side_effects": {
+    "by_tool": {},
+    "denominator": 70,
+    "duplicated": 0,
+    "redundant": 0
+  }
+}

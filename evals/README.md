@@ -766,28 +766,144 @@ WorkspaceDriftDetectionRate  =  0/10 =  0.0%   (95% Wilson:  0.0% – 27.8%)
 
 #### 运行方式
 
-不接 CLI：产出的是 `LoopResumeSummary` 而不是标准 `report.py` 报告，`SUITES` 那条
-`(case_file, type)` 通路接不上。沿用 §5.4 的先例：
+2026-09-19 起有了专用驱动（`longline/eval/loop_resume_cli.py`）。它仍不接
+`longline.eval.cli`：那套 CLI 用 `SUITES` 注册表驱动 token / 工具选择集，有自己的一套
+run 目录布局；本套件产出的是 `LoopResumeSummary`——逐臂比率、副作用日志、漂移判词——
+塞进去会让一个 CLI 有两种互不相干的「一次运行」定义。
+
+```bash
+uv run --extra dev python -m longline.eval.loop_resume_cli --out evals/results/loop_resume
+```
+
+写 `raw.jsonl`（每 run 一行）与 `summary.json`（含 `by_failpoint_counts` 与 `problems`）。
+**任一 run 的 child 没有发出 sentinel，退出码为 1 并在 stderr 打印**：一个没触发的注入
+算出来的比率，和一个触发了的比率长得一模一样，只是更差，而这个差别在数字里看不出来。
+
+`--no-durability` 是消融开关，见 §5.9。
+
+单跑一个故障点：
 
 ```bash
 uv run --extra dev pytest tests/integration/test_eval_loop_resume.py -q
 ```
 
-单跑一个故障点：
+全离线，零 API 花费。**读结果前先读上面「必须逐臂」那一节。**
+
+单跑一个故障点的前 3 个 run：
 
 ```bash
 uv run --extra dev python -c "import asyncio; from pathlib import Path; from longline.eval.loop_resume import cases_by_failpoint, load_loop_resume_cases; from longline.eval.loop_resume_runner import aggregate_loop_resume, run_loop_resume_suite; g=cases_by_failpoint(load_loop_resume_cases(Path('evals/loop_resume.jsonl'))); runs=asyncio.run(run_loop_resume_suite(g['after_tool'][:3], api_key='offline', fixtures_dir=Path('evals/fixtures'))); print(aggregate_loop_resume(runs).to_dict())"
 ```
 
-全离线，零 API 花费。
+---
 
-跑完整 60 run（约 6 分钟）：
+### 5.9 修复轮内持久化与工作区漂移（2026-09-19）
 
-```bash
-uv run --extra dev python -c "import asyncio, json; from pathlib import Path; from longline.eval.loop_resume import load_loop_resume_cases; from longline.eval.loop_resume_runner import aggregate_loop_resume, run_loop_resume_suite; runs=asyncio.run(run_loop_resume_suite(load_loop_resume_cases(Path('evals/loop_resume.jsonl')), api_key='offline', fixtures_dir=Path('evals/fixtures'))); print(json.dumps(aggregate_loop_resume(runs).to_dict(), indent=2))"
+§5.8 打出的两个洞：`after_tool` 10/10 重复副作用、`workspace_drift` 检测率 0。本节记录
+修复、**同装置**的前后对照，以及修复**新开出来的第三个洞**。
+
+#### 运行时改了什么
+
+| 机制 | 位置 | 作用 |
+| --- | --- | --- |
+| 步骤级检查点 | `query_loop.on_step` → `main.py` | 每次 transcript 写入点存一次；关键是**模型响应**那一次——实测工具体运行时 assistant 消息已在 `messages` 里，所以 `tool_use` 在工具动手之前就落盘了 |
+| 持久化工具日志 | `session/tool_journal.py` | 每次调用 `PREPARED`（执行前）→ `COMMITTED`（执行后），逐条 fsync，写在会话目录而不是工作区 |
+| 恢复时对账 | `tool_journal.reconcile_pending` + `Tool.reconcile` | `PREPARED` 无 `COMMITTED` 的操作，问工具「你的效果在不在」，得 `APPLIED` / `NOT_APPLIED` / `UNKNOWN`。`UNKNOWN` **不重放** |
+| 工作区身份 | `session/workspace_identity.py` | 从日志的 read/write 集合 + `git HEAD` 判断漂移属于 `clean` / `unrelated` / `relevant`；只有 `relevant` 拒绝恢复 |
+
+`Tool.reconcile` 与 `Tool.workload` 的默认值分别是 `UNKNOWN` 与 `{}`——**「说不出来」而不是
+「没有」**。Bash 两类都不声明：从这个层次看，「往文件里追加」和「读一个文件」是同一个字符串，
+声称知道就是拿猜测当事实。
+
+#### 前后对照，同一套装置
+
+`--no-durability` 把上表两个机制关掉，其余（harness、用例、判分器、脚本模型、副作用日志）
+全部不变。**不能用「切到改动前的 commit」当 before**：本 harness `import` 了
+`session.tool_journal` 与 `session.workspace_identity`，那些模块在旧版本里不存在，跨版本
+比较会变成跨 harness 比较。
+
+7 臂 × 10 次 = 70 run × 2 cell，全离线：
+
+| 臂 | before 执行层 | after 执行层 | before 任务层 | after 任务层 | after den |
+| --- | --- | --- | --- | --- | --- |
+| `before_model` | 10/10 | 10/10 | 10/10 | 10/10 | 0 |
+| `before_tool` | 10/10 | 10/10 | **10/10** | **0/10** | 0 |
+| `after_tool` | **0/10** | **10/10** | **0/10** | **10/10** | 10 |
+| `after_checkpoint` | 10/10 | 10/10 | 10/10 | 10/10 | 20 |
+| `truncate_tail` | 10/10 | 10/10 | 10/10 | 10/10 | 20 |
+| `workspace_drift`（检测） | 0/10 | 10/10 拒绝 | — | — | — |
+| `workspace_drift_unrelated`（检测） | 0/10 | 0/10 拒绝 | — | — | — |
+
+```
+指标                    before(消融)     after
+LoopResumeRate          40/50            40/50
+DuplicateSideEffect     after_tool 10/10 after_tool 0/10
+DriftRecall             0/10             10/10
+FalseRejectRate         0/60             0/60   (分母 = 非 relevant-drift 的全部 60 run)
 ```
 
-**读结果前先读上面「必须逐臂」那一节。**
+**消融 cell 逐臂复现了改动前的行为**（`after_tool` 0/10、`before_tool` 10/10、
+`LoopResumeRate` 40/50），这是消融可信的证据，不是巧合。
+
+#### 结论一：`after_tool` 的洞堵上了，而且不是空转
+
+`after_tool` 从 0/10 到 10/10，**分母仍是 10**——那一次 Bash 追加真的发生过、真的只追加了
+一次。这是本轮唯一一个「故障注入发现缺陷 → 改运行时 → 原故障消失」的完整闭环。
+
+机制是两层，缺一不可：检查点让恢复方**知道这个调用被发出过**；日志让运行时能说
+「这条操作开始了但没回话」。`Bash` 的判词是 `UNKNOWN` 而不是 `APPLIED`——shell 命令的效果
+读不回来。运行时因此**拒绝重放**，而不是宣称成功。
+
+#### 结论二：我开了一个新洞，`before_tool` 从 10/10 掉到 0/10
+
+`before_tool` 含义是「进程死在工具执行之前」。但日志里 `PREPARED` 无 `COMMITTED` 的窗口
+**同时容纳两种情况**：「进了 `tool.execute` 就跑掉了」和「跑完了但结果没回来」。运行时
+分不出这两者——对一个自己读不回效果的 Bash，它老实地说 `UNKNOWN`。
+
+脚本模型对 `UNKNOWN` 的处置是「不重复调用」（这正是修 after_tool 的那条规则）。于是这一次
+追加**根本没发生**，`NOTES.md` 里没有 `fixed-add`，任务层 10/10 全败。
+
+净效果是 **40/50 对 40/50**：一个重复换成了一个遗漏。
+
+**必须说清楚这两者不等价**：重复的副作用可能不可恢复，遗漏是可以被发现、被重试的；所以
+方向是对的。但**headline 数字没动**，任何「恢复率提升」的说法都是假的。
+
+真正的修法是给运行时一个**不可逆点**信号：`PREPARED` 与「工具真的动手了」之间需要第三个
+状态，而**只有工具知道自己的不可逆点在哪**（`BashTool` 在 spawn 子进程之前，
+`FileWriteTool` 在 `os.replace` 之前）。这需要工具配合，是下一步，不是本轮。
+
+#### 结论三：旧的那个 `WorkspaceDriftDetectionRate = 10/10` 测错了东西
+
+§5.8 把它记成 10/10，判据是 `drifted and bool(tool_errors)`——**「恢复腿报了工具错误」**。
+而恢复腿在没有身份检查时会重放整条指令，`Edit` 的 `old_string` 已经被第一次执行改掉了，
+于是必然报错。那个 10/10 测的是「重放会撞车」，不是「漂移被检测到」。
+
+换成真判据（运行时真的拒绝恢复）之后：修复前 **0/10**，修复后 **10/10**；无关漂移的
+误拒率 **0/60**。三个数字必须一起读——一个「永远拒绝」的检测器召回率满分，一个
+「从不拒绝」的误拒率满分。
+
+#### 口径（与数字同等重要）
+
+这 50 次注入是**确定性重复**，种子变的是输入不是分布。数字只能读作：
+
+> 在五类可恢复故障场景的 50 次故障注入中，40 次满足完整恢复判据；10 次失败全部集中在
+> 「工具已产生副作用但结果未持久化」这一个窗口。
+
+**不能**读作「80% 恢复概率」。§5.8 已记过一次同类误读。
+
+#### 局限
+
+1. **`UNKNOWN` 的代价就是结论二的遗漏。** 运行时在无法验证时选择不重放，这个选择是对的，
+   但它把成本转移给了模型：模型应当去**核实**（读一下 `NOTES.md`），而不是跳过。脚本模型
+   只做了保守的那一半。
+2. **Bash 改变的文件的漂移，看起来像无关漂移。** `Bash` 不声明 workload，所以它写的文件
+   永远进不了 write 集合；`after_tool` / `after_checkpoint` / `truncate_tail` 三条臂因此都
+   带着一条它们不该有的 unrelated 警告。运行时**警告而不是拒绝**，因为拒绝就等于因为一个
+   它无法归因的改动而挡住恢复。这是实测到的限制，不是设计选择。
+3. **步骤级检查点每步都重写整个 transcript**，一个会话是 O(n²) 次写。CLI 会话规模下可以
+   接受；真正的修法是「追加式步骤日志 + 周期性压实」，那是另一个项目。
+4. **无关漂移的检测依赖 git。** 非 git 目录下只能看见依赖文件的变化（自己记了哈希），
+   看不见别的，`DriftReport.git_available` 会如实报 False。
 
 ---
 
