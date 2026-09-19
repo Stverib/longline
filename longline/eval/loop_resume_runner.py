@@ -68,8 +68,15 @@ from longline.eval.failpoints import (
 )
 from longline.eval.faults import sha256_file
 from longline.eval.judges import judge_case
+from longline.eval.leg_cost import COST_FIELDS, LegCost, mean_cost
+from longline.eval.leg_cost import saving as saving_ratio
 from longline.eval.loop_resume import SEED_A_PLACEHOLDER, SEED_B_PLACEHOLDER, SEED_PLACEHOLDER
-from longline.eval.loop_resume_worker import ARTIFACT_PATHS, JOURNAL_NAME, SESSION_ID
+from longline.eval.loop_resume_worker import (
+    ARTIFACT_PATHS,
+    JOURNAL_NAME,
+    SESSION_ID,
+    STOPS_IN_INSTRUCTION_TWO,
+)
 from longline.eval.metrics import Ratio
 from longline.eval.side_effect_journal import (
     SideEffectMetrics,
@@ -140,6 +147,12 @@ class LoopResumeRun:
     workspace_relevant: list[str] = field(default_factory=list)
     workspace_unrelated: list[str] = field(default_factory=list)
     resume_latency_ms: float = 0.0
+    # What this run's two legs cost. `resume_cost` is always present (a refused
+    # resume costs zero, which is a fact about it); `restart_cost` is None unless
+    # the restart baseline was asked for, because "not measured" and "measured
+    # zero" are different claims and a default of zeroes would conflate them.
+    resume_cost: LegCost = field(default_factory=LegCost)
+    restart_cost: LegCost | None = None
     judge_detail: list[dict[str, Any]] = field(default_factory=list)
     structural_errors: list[str] = field(default_factory=list)
     repairs: list[str] = field(default_factory=list)
@@ -176,6 +189,10 @@ class LoopResumeRun:
             "workspace_relevant": self.workspace_relevant,
             "workspace_unrelated": self.workspace_unrelated,
             "resume_latency_ms": self.resume_latency_ms,
+            "resume_cost": self.resume_cost.to_dict(),
+            "restart_cost": (
+                None if self.restart_cost is None else self.restart_cost.to_dict()
+            ),
             "judge_detail": self.judge_detail,
             "structural_errors": self.structural_errors,
             "repairs": self.repairs,
@@ -196,6 +213,10 @@ PER_CASE_FIELDS: tuple[str, ...] = (
     "duplicate_side_effects",
     "redundant_re_executions",
     "resume_latency_ms",
+    # The restart-vs-resume comparison is recomputed from the row too, so both
+    # legs' costs have to travel in it.
+    "resume_cost",
+    "restart_cost",
 )
 
 
@@ -340,8 +361,98 @@ def aggregate_loop_resume(runs: Sequence[LoopResumeRun]) -> LoopResumeSummary:
     )
 
 
-# --- the parent's own actions ---
+@dataclass
+class RestartVsResume:
+    """What resuming cost against redoing the whole task from scratch.
 
+    The killed leg is deliberately absent from both columns. It is SUNK COST: the
+    process died either way, so the work it did before the kill is paid in BOTH
+    branches. Charging it to the resume would make resume look worse than the
+    alternative it actually competes with -- and the alternative, `restart`, pays
+    that work a second time by doing it over.
+
+    What is compared is therefore exactly the decision a crashed session faces:
+    redo the task (`restart`) or continue from the checkpoint (`resume`).
+    """
+
+    n: int = 0
+    restart: dict[str, float] = field(default_factory=dict)
+    resume: dict[str, float] = field(default_factory=dict)
+    by_failpoint: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def saved(self, name: str) -> float | None:
+        """Share of the restart's `name` the resume did not redo.
+
+        None, not 0.0, when there was no restart baseline: "not measured" and
+        "measured, saved nothing" are different claims, and the whole reason this
+        comparison exists is that a 0.0 here is a meaningful result.
+        """
+        baseline = self.restart.get(name, 0.0)
+        if not baseline:
+            return None
+        return saving_ratio(baseline, self.resume.get(name, 0.0))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n": self.n,
+            "restart": self.restart,
+            "resume": self.resume,
+            "saving": {name: self.saved(name) for name in COST_FIELDS},
+            "by_failpoint": self.by_failpoint,
+        }
+
+
+def _cost_pair(restart: Sequence[LegCost], resume: Sequence[LegCost]) -> dict[str, Any]:
+    """One row of the comparison: the two means and the saving between them."""
+    restart_mean = mean_cost(restart)
+    resume_mean = mean_cost(resume)
+    return {
+        "n": len(resume),
+        "restart": restart_mean,
+        "resume": resume_mean,
+        "saving": {
+            name: (
+                saving_ratio(restart_mean[name], resume_mean[name])
+                if restart_mean[name]
+                else None
+            )
+            for name in COST_FIELDS
+        },
+    }
+
+
+def restart_vs_resume(runs: Sequence[LoopResumeRun]) -> RestartVsResume:
+    """The restart baseline against the resume, per failpoint and overall.
+
+    Only runs that HAVE a baseline take part. Folding an unmeasured run in as
+    zeroes would average a real cost with a missing one and report a saving that
+    is an artifact of how many baselines happened to run.
+    """
+    measured = [r for r in runs if r.restart_cost is not None]
+    overall = _cost_pair(
+        [r.restart_cost for r in measured if r.restart_cost is not None],
+        [r.resume_cost for r in measured],
+    )
+
+    by_failpoint: dict[str, dict[str, Any]] = {}
+    for failpoint in ALL_FAILPOINTS:
+        group = [r for r in measured if r.failpoint == failpoint]
+        if not group:
+            continue
+        by_failpoint[failpoint] = _cost_pair(
+            [r.restart_cost for r in group if r.restart_cost is not None],
+            [r.resume_cost for r in group],
+        )
+
+    return RestartVsResume(
+        n=len(measured),
+        restart=overall["restart"],
+        resume=overall["resume"],
+        by_failpoint=by_failpoint,
+    )
+
+
+# --- the parent's own actions ---
 
 def _snapshot_artifacts(sandbox: Path) -> dict[str, str]:
     """Digest the declared artifacts, in `GatedTool.snapshot_artifacts`'s shape."""
@@ -588,6 +699,7 @@ async def run_loop_resume_case(
     fixtures_dir: Path,
     python: str | None = None,
     durability: bool = True,
+    restart_baseline: bool = False,
 ) -> LoopResumeRun:
     """One failpoint injection, end to end."""
     claude_dir = Path(tempfile.mkdtemp(prefix=CLAUDE_DIR_PREFIX))
@@ -640,6 +752,21 @@ async def run_loop_resume_case(
         workspace_ok = bool(judge_case("python_test", sandbox, WORKSPACE_TEST_ARGS))
         tool_errors = [str(e) for e in resumed.get("tool_errors", [])]
 
+        # --- step 7: the restart baseline, if this cell asks for one ---
+        # Last, and in fresh directories, so it cannot perturb anything above it.
+        restart_cost = (
+            _run_restart_baseline(
+                case,
+                api_key=api_key,
+                fixtures_dir=fixtures_dir,
+                python=python,
+                durability=durability,
+                notes=notes,
+            )
+            if restart_baseline
+            else None
+        )
+
         run = LoopResumeRun(
             case_id=case.id,
             failpoint=case.failpoint,
@@ -679,6 +806,8 @@ async def run_loop_resume_case(
             workspace_relevant=[str(p) for p in resumed.get("workspace_relevant", [])],
             workspace_unrelated=[str(p) for p in resumed.get("workspace_unrelated", [])],
             resume_latency_ms=resume_ms,
+            resume_cost=LegCost.from_dict(resumed.get("cost")),
+            restart_cost=restart_cost,
             judge_detail=judge_detail,
             structural_errors=[str(e) for e in resumed.get("structural_errors", [])],
             repairs=[str(e) for e in resumed.get("repairs", [])],
@@ -703,6 +832,56 @@ def _judge_case_checks(case: LoopResumeCase, sandbox: Path) -> tuple[bool, list[
     return case_passed(case.checks, sandbox, mode=case.checks_mode)
 
 
+def _run_restart_baseline(
+    case: LoopResumeCase,
+    *,
+    api_key: str,
+    fixtures_dir: Path,
+    python: str | None,
+    durability: bool,
+    notes: list[str],
+) -> LegCost | None:
+    """Redo the case's task from scratch, in a session of its own.
+
+    Its own `claude_dir` AND its own sandbox, built the same way the killed leg's
+    were: the baseline has to start from the fixture and the seed, not from
+    whatever the killed leg left behind. Sharing either directory would make this
+    a measurement of the resume.
+
+    Returns None -- a missing baseline, not a zero one -- when the leg did not
+    complete the instructions the resume ran. A restart that stopped early is not
+    a cheaper restart, and letting its cost through would understate the baseline
+    and inflate the saving.
+    """
+    claude_dir = Path(tempfile.mkdtemp(prefix=CLAUDE_DIR_PREFIX))
+    sandbox = Path(tempfile.mkdtemp(prefix=SANDBOX_PREFIX))
+    expected = 2 if case.failpoint in STOPS_IN_INSTRUCTION_TWO else 1
+    try:
+        if case.fixture:
+            shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
+        apply_seed(sandbox, case.seed)
+        _init_workspace_repo(sandbox)
+        spec = _build_spec(
+            case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key,
+            durability=durability,
+        )
+        spec_path = claude_dir / "spec.json"
+        spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+        report, rc, _ = run_worker_phase("baseline", spec_path, python=python)
+        if rc != 0 or report.get("error") or report.get("instructions_run") != expected:
+            notes.append(
+                "the restart baseline is not usable: "
+                f"rc={rc}, error={report.get('error')!r}, "
+                f"instructions={report.get('instructions_run')!r} (wanted {expected})"
+            )
+            return None
+        return LegCost.from_dict(report.get("cost"))
+    finally:
+        shutil.rmtree(claude_dir, ignore_errors=True)
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 async def run_loop_resume_suite(
     cases: Sequence[LoopResumeCase],
     *,
@@ -710,6 +889,7 @@ async def run_loop_resume_suite(
     fixtures_dir: Path,
     python: str | None = None,
     durability: bool = True,
+    restart_baseline: bool = False,
 ) -> list[LoopResumeRun]:
     """Run every case serially.
 
@@ -726,6 +906,7 @@ async def run_loop_resume_suite(
                 fixtures_dir=fixtures_dir,
                 python=python,
                 durability=durability,
+                restart_baseline=restart_baseline,
             )
         )
     return runs
@@ -738,11 +919,13 @@ __all__ = [
     "WORKSPACE_TEST_ARGS",
     "LoopResumeRun",
     "LoopResumeSummary",
+    "RestartVsResume",
     "aggregate_loop_resume",
     "apply_seed",
     "drift_an_unrelated_file",
     "drift_the_workspace",
     "kill_armed_child",
+    "restart_vs_resume",
     "resume_succeeded",
     "run_loop_resume_case",
     "run_loop_resume_suite",

@@ -24,10 +24,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from longline.eval.loop_resume import cases_by_failpoint, load_loop_resume_cases
-from longline.eval.loop_resume_runner import aggregate_loop_resume, run_loop_resume_suite
+from longline.eval.loop_resume_runner import (
+    aggregate_loop_resume,
+    restart_vs_resume,
+    run_loop_resume_suite,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from longline.eval.loop_resume_runner import RestartVsResume
 
 DEFAULT_CASES = Path("evals/loop_resume.jsonl")
 DEFAULT_FIXTURES = Path("evals/fixtures")
@@ -49,8 +55,45 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="The ablation: run with the runtime's step checkpoints and journal off.",
     )
+    parser.add_argument(
+        "--restart-baseline",
+        action="store_true",
+        help=(
+            "Also redo each case's task from scratch in a session of its own, so "
+            "the resume can be compared against the alternative it replaces. "
+            "Roughly doubles the cell's wall clock."
+        ),
+    )
     parser.add_argument("--api-key", default="offline")
     return parser.parse_args(argv)
+
+
+def _print_restart_vs_resume(comparison: RestartVsResume) -> None:
+    """The comparison table, printed the way the numbers are read.
+
+    Nothing is printed when no baseline ran: an all-zero table would look like a
+    measurement that came out at zero, which is the one thing it must not be
+    mistaken for.
+    """
+    if not comparison.n:
+        return
+    print(f"[loop-resume] restart vs resume over {comparison.n} run(s)")
+    print(f"[loop-resume]   {'arm':<26} {'metric':<14} {'restart':>9} {'resume':>9} {'saved':>8}")
+    for failpoint, row in comparison.by_failpoint.items():
+        for field in ("model_calls", "tool_calls", "loop_ms"):
+            saved = row["saving"].get(field)
+            share = "n/a" if saved is None else f"{saved:+.1%}"
+            print(
+                f"[loop-resume]   {failpoint:<26} {field:<14} "
+                f"{row['restart'][field]:>9.1f} {row['resume'][field]:>9.1f} {share:>8}"
+            )
+    overall = comparison.saved("model_calls")
+    print(
+        f"[loop-resume]   {'ALL ARMS':<26} {'model_calls':<14} "
+        f"{comparison.restart['model_calls']:>9.1f} "
+        f"{comparison.resume['model_calls']:>9.1f} "
+        f"{'n/a' if overall is None else f'{overall:+.1%}':>8}"
+    )
 
 
 def _check_the_runs_are_real(runs: Sequence[object]) -> list[str]:
@@ -75,9 +118,11 @@ def run(args: argparse.Namespace) -> int:
             api_key=args.api_key,
             fixtures_dir=args.fixtures,
             durability=args.durability,
+            restart_baseline=args.restart_baseline,
         )
     )
     summary = aggregate_loop_resume(runs)
+    comparison = restart_vs_resume(runs)
 
     args.out.mkdir(parents=True, exist_ok=True)
     with (args.out / "raw.jsonl").open("w", encoding="utf-8") as handle:
@@ -93,6 +138,8 @@ def run(args: argparse.Namespace) -> int:
             name: len(group) for name, group in cases_by_failpoint(cases).items()
         },
         "problems": _check_the_runs_are_real(runs),
+        "restart_baseline": args.restart_baseline,
+        "restart_vs_resume": comparison.to_dict(),
         **summary.to_dict(),
     }
     (args.out / "summary.json").write_text(
@@ -106,6 +153,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"[loop-resume] false rej.  = {summary.false_reject_rate}")
     for failpoint, ratio in summary.by_failpoint.items():
         print(f"[loop-resume]   {failpoint:<26} {ratio}")
+    _print_restart_vs_resume(comparison)
     for problem in payload["problems"]:
         print(f"[loop-resume] PROBLEM: {problem}", file=sys.stderr)
     print(f"[loop-resume] raw     -> {args.out / 'raw.jsonl'}")

@@ -74,6 +74,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -91,6 +92,7 @@ from longline.eval.failpoints import (
     block_forever,
     read_sentinel,
 )
+from longline.eval.leg_cost import LegCost
 from longline.eval.side_effect_journal import KILLED, RESUMED, SideEffectJournal
 from longline.models.messages import Usage, UserMessage
 
@@ -99,6 +101,11 @@ if TYPE_CHECKING:
 
 SESSION_ID = "loop-resume"
 JOURNAL_NAME = "journal.jsonl"
+
+# The four tools the scenario uses, and the ones the cost counter watches. Named
+# once so `build_scenario_engine` and `count_tool_calls` cannot disagree about
+# which wrappers exist.
+GATED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write", "Bash")
 
 # The failpoints whose stop lands inside INSTRUCTION 2, so instruction 1 must
 # complete and be persisted first.
@@ -338,6 +345,58 @@ class ScriptedToolSequence:
         )
 
 
+def count_tool_calls(engine: Any) -> int:
+    """How many tool executions this leg's runtime issued.
+
+    Read off the `GatedTool` wrappers `build_scenario_engine` installs, one per
+    tool in `GATED_TOOLS`. `GatedTool.calls` is incremented at the top of
+    `execute`, so it counts attempts -- including a `before_tool` stop that never
+    delegated. That is the right number for a RESUME leg (whose gate is disarmed,
+    so every attempt ran) and the wrong one for the killed leg, which is why the
+    killed leg's tool count is not reported as work done.
+
+    Not read from the transcript: the transcript is written at step boundaries, so
+    it under-reports exactly the leg whose work is in question.
+    """
+    from longline.eval.failpoints import GatedTool
+
+    total = 0
+    for name in GATED_TOOLS:
+        tool = engine.registry.get(name)
+        if isinstance(tool, GatedTool):
+            total += tool.calls
+    return total
+
+
+@dataclass
+class CountingModel:
+    """The scripted model, plus the two numbers the cost comparison needs.
+
+    A wrapper rather than counters on `ScriptedToolSequence` itself: the sequence
+    is the SCRIPT (progress, steps, the answer) and this is the METER, and the
+    meter has to sit where the runtime's calls arrive -- outside, so a future
+    change to how the script decides what to emit cannot move the count.
+
+    It counts a model call when the generator is first advanced, not when it is
+    constructed, so a call the loop abandons before reading anything is not
+    counted as work performed.
+    """
+
+    inner: ScriptedToolSequence
+    cost: LegCost
+
+    def __call__(self, **kwargs: Any) -> AsyncIterator[QueryEvent]:
+        return self._serve(list(kwargs.get("messages", [])))
+
+    async def _serve(self, messages: list[Any]) -> AsyncIterator[QueryEvent]:
+        self.cost.model_calls += 1
+        async for event in self.inner(messages=messages):
+            if isinstance(event, TurnComplete):
+                self.cost.input_tokens += int(event.usage.input_tokens)
+                self.cost.output_tokens += int(event.usage.output_tokens)
+            yield event
+
+
 def build_scenario_engine(
     sandbox: str,
     *,
@@ -346,18 +405,22 @@ def build_scenario_engine(
     gate: FailpointGate,
     journal: SideEffectJournal | None,
     sequence: ScriptedToolSequence,
+    cost: LegCost | None = None,
 ) -> Any:
     """A real `QueryEngine` whose model is scripted and whose tools are gated.
 
     Construction mirrors `faults.fault_engine`: the engine, registry, tools and
     permission context all stay real; only the model transport is replaced.
+
+    `cost` is the meter. Optional so a test can build an engine without one, and
+    the counters are simply not installed when it is absent.
     """
     from longline.eval.engine_factory import build_engine
     from longline.eval.failpoints import GatedModel, GatedTool
 
     engine = build_engine(sandbox=sandbox, model=model, api_key=api_key, tool_profile="core")
 
-    for name in ("Read", "Edit", "Write", "Bash"):
+    for name in GATED_TOOLS:
         inner = engine.registry.get(name)
         if inner is None:
             raise FailpointError(f"tool {name!r} is not in the core profile")
@@ -372,8 +435,9 @@ def build_scenario_engine(
             ),
         )
 
+    scripted: Any = CountingModel(inner=sequence, cost=cost) if cost is not None else sequence
     engine.make_call_model = lambda model=None, max_tokens=16384: GatedModel(
-        inner=sequence, gate=gate
+        inner=scripted, gate=gate
     )
     return engine
 
@@ -696,6 +760,7 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         armed=False,
     )
     journal = SideEffectJournal(claude_dir / JOURNAL_NAME, RESUMED)
+    cost = LegCost()
 
     if failpoint in STOPS_IN_INSTRUCTION_TWO:
         # Instruction 1 is already on the transcript, so the model picks up at
@@ -713,6 +778,7 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         gate=gate,
         journal=journal,
         sequence=sequence,
+        cost=cost,
     )
     tool_journal = _attach_durability(
         engine, claude_dir, session_id, sandbox,
@@ -763,6 +829,10 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
             "task_states": {},
             "journal_entries": 0,
             "tool_errors": [],
+            # A refused resume did no work, and the comparison must show that
+            # rather than omit the row: this arm's whole result is "the resume
+            # never started".
+            "cost": LegCost().to_dict(),
             "error": "",
         }
 
@@ -773,11 +843,14 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
     error = ""
     instructions_run = 0
     tool_errors: list[str] = []
+    started = time.perf_counter()
     try:
         tool_errors = asyncio.run(_run_instruction(engine))
         instructions_run = 1
     except BaseException as exc:  # reported, not swallowed
         error = f"{type(exc).__name__}: {exc}"
+    cost.loop_ms = (time.perf_counter() - started) * 1000.0
+    cost.tool_calls = count_tool_calls(engine)
 
     return {
         "phase": "resume",
@@ -800,18 +873,113 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         "workspace_unrelated": drift.unrelated,
         "git_head_changed": drift.git_head_changed,
         "git_available": drift.git_available,
+        "cost": cost.to_dict(),
+        "error": error,
+    }
+
+
+def baseline(spec: dict[str, Any]) -> dict[str, Any]:
+    """Phase 3: the RESTART baseline -- the same task, from scratch, uninterrupted.
+
+    This is the branch a crashed session is choosing NOT to take. It is one
+    process running the case's task to completion in a session of its own: same
+    fixture, same seed, same script, same runtime and the same durability setting
+    as the killed leg, so the only difference from the resume leg is WHERE IT
+    STARTS.
+
+    Two things it must NOT do, and both would be easy to get wrong:
+
+    - It is never gated. `armed=False` and no failpoint wiring, because a baseline
+      that stopped at the failpoint would be the thing it exists to be the
+      alternative to.
+    - It runs the same number of instructions the RESUME leg runs. For the two
+      arms that stop inside instruction 2, that is two; for the rest it is one.
+      Comparing a one-instruction resume against a two-instruction restart would
+      report a saving that is entirely an artifact of the task being longer.
+
+    It is a real run, not an estimate: the resume leg's cost is measured the same
+    way, and neither number is derived from the other.
+    """
+    claude_dir = Path(spec["claude_dir"])
+    sandbox = Path(spec["sandbox"])
+    session_id = str(spec.get("session_id", SESSION_ID))
+    failpoint = str(spec.get("failpoint", ""))
+    runs_two_instructions = failpoint in STOPS_IN_INSTRUCTION_TWO
+
+    # Disarmed, exactly as in `resume`: the gate is a fixture of the killed leg.
+    gate = FailpointGate(
+        claude_dir=claude_dir,
+        failpoint=failpoint,
+        at_call_index=int(spec.get("at_call_index", 1)),
+        at_tool_name=str(spec.get("failpoint_tool", "")),
+        armed=False,
+    )
+    # No side-effect journal. That instrument exists to compare a killed leg's
+    # executions against a resumed leg's, and a restart has nothing to compare
+    # against: it runs once, so it cannot duplicate anything by construction. Its
+    # journal would be a file nobody reads.
+    journal = None
+    sequence = ScriptedToolSequence(steps=list(SCENARIO_ONE), offset=0)
+    cost = LegCost()
+    engine = build_scenario_engine(
+        str(sandbox),
+        model=str(spec.get("model", "offline-model")),
+        api_key=str(spec.get("api_key", "offline")),
+        gate=gate,
+        journal=journal,
+        sequence=sequence,
+        cost=cost,
+    )
+
+    engine.messages.append(UserMessage(content=str(spec["task"])))
+    _save_checkpoint(engine, claude_dir, session_id)
+    _attach_durability(
+        engine, claude_dir, session_id, sandbox,
+        enabled=bool(spec.get("durability", True)),
+    )
+
+    error = ""
+    instructions_run = 0
+    tool_errors: list[str] = []
+    started = time.perf_counter()
+    try:
+        tool_errors = asyncio.run(_run_instruction(engine))
+        instructions_run = 1
+        if runs_two_instructions:
+            _save_checkpoint(engine, claude_dir, session_id)
+            sequence.steps = list(SCENARIO_TWO)
+            sequence.offset = instruction_offset()
+            engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
+            tool_errors = tool_errors + asyncio.run(_run_instruction(engine))
+            instructions_run = 2
+    except BaseException as exc:  # reported, not swallowed
+        error = f"{type(exc).__name__}: {exc}"
+    cost.loop_ms = (time.perf_counter() - started) * 1000.0
+    cost.tool_calls = count_tool_calls(engine)
+
+    return {
+        "phase": "baseline",
+        "session_id": session_id,
+        "instructions_run": instructions_run,
+        "tool_errors": tool_errors,
+        "cost": cost.to_dict(),
         "error": error,
     }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m longline.eval.loop_resume_worker")
-    parser.add_argument("phase", choices=["arm", "resume"])
+    parser.add_argument("phase", choices=["arm", "resume", "baseline"])
     parser.add_argument("spec", help="Path to the JSON spec file.")
     args = parser.parse_args(argv)
 
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
-    report = arm(spec) if args.phase == "arm" else resume(spec)
+    phases: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+        "arm": arm,
+        "resume": resume,
+        "baseline": baseline,
+    }
+    report = phases[args.phase](spec)
     # One JSON object on stdout and nothing else, so the parent can parse it
     # even when a later run's process was killed mid-write.
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
