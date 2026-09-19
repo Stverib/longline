@@ -1,0 +1,135 @@
+{
+  "DriftRecall": {
+    "ci95_wilson": null,
+    "denominator": 0,
+    "numerator": 0,
+    "value": null
+  },
+  "FalseRejectRate": {
+    "ci95_wilson": [
+      3.469446951953614e-18,
+      0.03699349820698568
+    ],
+    "denominator": 100,
+    "numerator": 0,
+    "value": 0.0
+  },
+  "LoopResumeRate": {
+    "ci95_wilson": [
+      0.9630065017930143,
+      1.0
+    ],
+    "denominator": 100,
+    "numerator": 100,
+    "value": 1.0
+  },
+  "WorkspaceDriftDetectionRate": {
+    "ci95_wilson": null,
+    "denominator": 0,
+    "numerator": 0,
+    "value": null
+  },
+  "by_failpoint": {
+    "after_checkpoint": {
+      "ci95_wilson": [
+        0.8668077490609515,
+        0.9999999999999999
+      ],
+      "denominator": 25,
+      "numerator": 25,
+      "value": 1.0
+    },
+    "after_tool": {
+      "ci95_wilson": [
+        0.8668077490609515,
+        0.9999999999999999
+      ],
+      "denominator": 25,
+      "numerator": 25,
+      "value": 1.0
+    },
+    "before_model": {
+      "ci95_wilson": null,
+      "denominator": 0,
+      "numerator": 0,
+      "value": null
+    },
+    "before_tool": {
+      "ci95_wilson": [
+        0.8668077490609515,
+        0.9999999999999999
+      ],
+      "denominator": 25,
+      "numerator": 25,
+      "value": 1.0
+    },
+    "truncate_tail": {
+      "ci95_wilson": [
+        0.8668077490609515,
+        0.9999999999999999
+      ],
+      "denominator": 25,
+      "numerator": 25,
+      "value": 1.0
+    },
+    "workspace_drift": {
+      "ci95_wilson": null,
+      "denominator": 0,
+      "numerator": 0,
+      "value": null
+    },
+    "workspace_drift_unrelated": {
+      "ci95_wilson": null,
+      "denominator": 0,
+      "numerator": 0,
+      "value": null
+    }
+  },
+  "by_failpoint_counts": {
+    "after_checkpoint": 25,
+    "after_tool": 25,
+    "before_model": 0,
+    "before_tool": 25,
+    "truncate_tail": 25,
+    "workspace_drift": 0,
+    "workspace_drift_unrelated": 0
+  },
+  "cases": "evals\\loop_resume_tasks.jsonl",
+  "durability": true,
+  "failures": [],
+  "label": "task-diversity",
+  "num_runs": 100,
+  "problems": [],
+  "restart_baseline": false,
+  "restart_vs_resume": {
+    "by_failpoint": {},
+    "n": 0,
+    "restart": {
+      "input_tokens": 0.0,
+      "loop_ms": 0.0,
+      "model_calls": 0.0,
+      "output_tokens": 0.0,
+      "tool_calls": 0.0
+    },
+    "resume": {
+      "input_tokens": 0.0,
+      "loop_ms": 0.0,
+      "model_calls": 0.0,
+      "output_tokens": 0.0,
+      "tool_calls": 0.0
+    },
+    "saving": {
+      "input_tokens": null,
+      "loop_ms": null,
+      "model_calls": null,
+      "output_tokens": null,
+      "tool_calls": null
+    }
+  },
+  "side_effects": {
+    "by_tool": {},
+    "denominator": 95,
+    "duplicated": 0,
+    "redundant": 0
+  }
+}
