@@ -40,6 +40,19 @@ TOOL_NAMED_FAILPOINTS: tuple[str, ...] = (BEFORE_TOOL, AFTER_TOOL)
 # unanswerable offline and would fail for a reason unrelated to the failpoint.
 CWD_PLACEHOLDER = "<cwd>"
 
+# Placeholders the FIXTURE must carry for the repeat seed to reach it. Kept
+# here rather than in the runner because they are part of the same contract as
+# CWD_PLACEHOLDER: a fixture that lost them would make every repeat byte
+# identical, and the suite would silently be ten copies of one run.
+SEED_PLACEHOLDER = "<seed>"
+SEED_A_PLACEHOLDER = "<seed_a>"
+SEED_B_PLACEHOLDER = "<seed_b>"
+FIXTURE_SEED_PLACEHOLDERS: tuple[str, ...] = (
+    SEED_PLACEHOLDER,
+    SEED_A_PLACEHOLDER,
+    SEED_B_PLACEHOLDER,
+)
+
 
 @dataclass
 class LoopResumeCase(E2ECase):
@@ -53,6 +66,7 @@ class LoopResumeCase(E2ECase):
     failpoint: str = ""
     failpoint_tool: str = ""
     repeat: int = 1
+    seed: int = 0
 
     def run_id(self, index: int) -> str:
         """The id of repeat `index`. The index IS the seed, so nothing else is stored."""
@@ -109,11 +123,19 @@ class LoopResumeCase(E2ECase):
 
 
 def expand_case(case: LoopResumeCase) -> list[LoopResumeCase]:
-    """One case object per declared run, with unique ids.
+    """One case object per declared run, with unique ids AND distinct seeds.
 
-    The copies share their judge and failpoint config by value; only the id
-    differs. `dataclasses.replace` is not used because the sub-case's id must
-    stay derivable -- the id IS the repeat index, so nothing else is stored.
+    `seed` is the repeat index, and it is the difference between ten runs and
+    one run repeated ten times. `recovery.py`'s `expand_case` copies everything
+    but the id, which makes its ten repeats byte-identical -- a fact this suite
+    cannot afford to inherit, because the whole point of the failpoint matrix is
+    that each run stands on its own evidence.
+
+    What a seed does NOT buy is a distribution. The scenario and the judges are
+    identical across repeats, so the OUTCOME stays deterministic; the seed only
+    varies the INPUT, which is what makes "60 runs, 0 counterexamples" a
+    statement about more than one fixture rather than about one fixture 60
+    times. Reported as a rate, these numbers would be a lie.
     """
     return [
         LoopResumeCase(
@@ -128,6 +150,7 @@ def expand_case(case: LoopResumeCase) -> list[LoopResumeCase]:
             failpoint=case.failpoint,
             failpoint_tool=case.failpoint_tool,
             repeat=1,
+            seed=i,
         )
         for i in range(case.repeat)
     ]
@@ -182,6 +205,10 @@ def cases_by_failpoint(
 
 __all__ = [
     "CWD_PLACEHOLDER",
+    "FIXTURE_SEED_PLACEHOLDERS",
+    "SEED_A_PLACEHOLDER",
+    "SEED_B_PLACEHOLDER",
+    "SEED_PLACEHOLDER",
     "TOOL_NAMED_FAILPOINTS",
     "LoopResumeCase",
     "cases_by_failpoint",

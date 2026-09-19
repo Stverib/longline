@@ -98,6 +98,22 @@ def test_expand_case_yields_one_per_repeat_with_unique_ids() -> None:
     assert {c.task for c in expanded} == {case.task}
 
 
+def test_expand_case_gives_every_repeat_a_distinct_seed() -> None:
+    """The seed is what separates "ten runs" from "one run ten times".
+
+    `recovery.py`'s expand_case copies everything but the id, which makes its
+    repeats byte-identical. Inheriting that would leave this suite's 60 runs
+    standing on one fixture, and its zero-counterexample result would be about
+    that fixture rather than about the runtime.
+    """
+    expanded = expand_case(LoopResumeCase.from_dict(_line(repeat=10)))
+    assert [c.seed for c in expanded] == list(range(10))
+
+
+def test_a_single_run_case_has_seed_zero() -> None:
+    assert LoopResumeCase.from_dict(_line()).seed == 0
+
+
 def test_cases_by_failpoint_groups_every_class() -> None:
     grouped = cases_by_failpoint(load_loop_resume_cases(DATASET))
     assert set(grouped) == set(ALL_FAILPOINTS)

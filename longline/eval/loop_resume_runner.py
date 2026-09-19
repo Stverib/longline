@@ -50,6 +50,7 @@ from longline.eval.failpoints import (
     ALL_FAILPOINTS,
     TRUNCATE_TAIL,
     WORKSPACE_DRIFT,
+    FailpointError,
     read_sentinel,
     terminate_and_reap,
     truncate_last_line,
@@ -57,6 +58,7 @@ from longline.eval.failpoints import (
 )
 from longline.eval.faults import sha256_file
 from longline.eval.judges import judge_case
+from longline.eval.loop_resume import SEED_A_PLACEHOLDER, SEED_B_PLACEHOLDER, SEED_PLACEHOLDER
 from longline.eval.loop_resume_worker import ARTIFACT_PATHS, JOURNAL_NAME, SESSION_ID
 from longline.eval.metrics import Ratio
 from longline.eval.side_effect_journal import (
@@ -109,6 +111,7 @@ class LoopResumeRun:
     layer_workspace_ok: bool
     layer_task_ok: bool
     passed: bool
+    seed: int = 0
     success: bool = False
     duplicate_side_effects: int = 0
     redundant_re_executions: int = 0
@@ -130,6 +133,7 @@ class LoopResumeRun:
         return {
             "case_id": self.case_id,
             "failpoint": self.failpoint,
+            "seed": self.seed,
             "failpoint_reached": self.failpoint_reached,
             "checkpoint_loaded": self.checkpoint_loaded,
             "transcript_repaired": self.transcript_repaired,
@@ -296,6 +300,49 @@ def _snapshot_artifacts(sandbox: Path) -> dict[str, str]:
     return {rel: sha256_file(sandbox / rel) for rel in ARTIFACT_PATHS}
 
 
+def apply_seed(sandbox: Path, seed: int) -> None:
+    """Make this run's starting state different from its siblings'.
+
+    Varies only what the case's checks and the scripted scenario do not pin: a
+    header line in NOTES.md, and the operands in the fixture's own test. The
+    Edit's `old_string` and every judge stay identical, so the seed makes the
+    INPUT different without making the OUTCOME different.
+
+    That is the honest scope of what a repeat count buys here: "60 runs, 0
+    counterexamples" is a statement about 60 fixtures rather than about one
+    fixture sixty times. It is still not a distribution, and reporting it as a
+    rate would be wrong -- the module docstring of `loop_resume` says so.
+
+    Raises rather than quietly substituting nothing when a placeholder is
+    missing: a fixture that lost them would make every repeat byte-identical,
+    and the suite would look like it had sampled when it had not.
+    """
+    notes = sandbox / "NOTES.md"
+    test = sandbox / "tests" / "test_calc.py"
+    a, b = 2 + seed, 3 + seed
+    # b must not be 0, or the buggy `a - b` would already satisfy the test and
+    # the arm would pass without the fix -- measured by the `not_contains` on
+    # the fixed line, which would then never be exercised.
+    if b == 0:  # pragma: no cover - unreachable for the seeds the dataset produces
+        raise FailpointError(f"seed {seed} would make the fixture's test vacuous")
+
+    for path, replacements in (
+        (notes, {SEED_PLACEHOLDER: str(seed)}),
+        (test, {SEED_A_PLACEHOLDER: str(a), SEED_B_PLACEHOLDER: str(b)}),
+    ):
+        if not path.is_file():
+            raise FailpointError(f"the fixture is missing {path.name}")
+        text = path.read_text(encoding="utf-8")
+        for placeholder, value in replacements.items():
+            if placeholder not in text:
+                raise FailpointError(
+                    f"{path.name} does not carry {placeholder!r}; without it every "
+                    "repeat would start from a byte-identical fixture"
+                )
+            text = text.replace(placeholder, value)
+        path.write_text(text, encoding="utf-8")
+
+
 def drift_the_workspace(sandbox: Path) -> None:
     """Mutate the artifacts between the kill and the resume.
 
@@ -445,6 +492,7 @@ async def run_loop_resume_case(
     try:
         if case.fixture:
             shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
+        apply_seed(sandbox, case.seed)
 
         spec = _build_spec(case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key)
         spec_path = claude_dir / "spec.json"
@@ -482,6 +530,7 @@ async def run_loop_resume_case(
         run = LoopResumeRun(
             case_id=case.id,
             failpoint=case.failpoint,
+            seed=case.seed,
             failpoint_reached=sentinel is not None and killed,
             checkpoint_loaded=bool(resumed.get("checkpoint_loaded")),
             transcript_repaired=bool(resumed.get("transcript_repaired")),
@@ -554,6 +603,7 @@ __all__ = [
     "LoopResumeRun",
     "LoopResumeSummary",
     "aggregate_loop_resume",
+    "apply_seed",
     "drift_the_workspace",
     "kill_armed_child",
     "resume_succeeded",

@@ -148,6 +148,91 @@ def test_aggregate_merges_the_per_tool_breakdown() -> None:
     assert summary.side_effects.by_tool["Bash"] == {"redundant": 2, "duplicated": 1}
 
 
+def test_apply_seed_makes_two_runs_start_from_different_fixtures(tmp_path: Path) -> None:
+    """The seed must actually reach the sandbox, not just the case object."""
+    import shutil
+
+    from longline.eval.loop_resume_runner import apply_seed
+
+    texts = []
+    for seed in (0, 7):
+        sandbox = tmp_path / f"s{seed}"
+        shutil.copytree(FIXTURES / "resume_repo", sandbox)
+        apply_seed(sandbox, seed)
+        texts.append(
+            (
+                (sandbox / "NOTES.md").read_text(encoding="utf-8"),
+                (sandbox / "tests" / "test_calc.py").read_text(encoding="utf-8"),
+            )
+        )
+    assert texts[0] != texts[1], "two seeds produced a byte-identical fixture"
+
+    notes, test = texts[1]
+    assert "7" in notes
+    assert "add(9, 10)" in test, test
+
+
+def test_apply_seed_leaves_the_scenarios_edit_target_intact(tmp_path: Path) -> None:
+    """The Edit's `old_string` must survive seeding, or the arm's fix step
+    silently stops applying and the duplicate metric measures the wrong tool."""
+    import shutil
+
+    from longline.eval.loop_resume_runner import apply_seed
+    from longline.eval.loop_resume_worker import SCENARIO_ONE
+
+    sandbox = tmp_path / "s"
+    shutil.copytree(FIXTURES / "resume_repo", sandbox)
+    apply_seed(sandbox, 3)
+    calc = (sandbox / "src" / "calc.py").read_text(encoding="utf-8")
+    old_string = SCENARIO_ONE[2]["input"]["old_string"]
+    assert old_string in calc
+
+
+def test_apply_seed_keeps_the_fixtures_test_failing_before_the_fix(tmp_path: Path) -> None:
+    """The workspace layer runs this test. If the buggy code already passed it,
+    that layer would be vacuous for every seed."""
+    import shutil
+    import subprocess
+    import sys
+
+    from longline.eval.loop_resume_runner import apply_seed
+
+    sandbox = tmp_path / "s"
+    shutil.copytree(FIXTURES / "resume_repo", sandbox)
+    apply_seed(sandbox, 2)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_calc.py", "-q"],
+        cwd=sandbox,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, "the fixture's test passes before the fix"
+
+
+def test_apply_seed_raises_when_a_placeholder_is_gone(tmp_path: Path) -> None:
+    """A fixture that lost its placeholders would make every repeat identical,
+    and the suite would look like it had sampled when it had not."""
+    import shutil
+
+    import pytest
+
+    from longline.eval.failpoints import FailpointError
+    from longline.eval.loop_resume_runner import apply_seed
+
+    sandbox = tmp_path / "s"
+    shutil.copytree(FIXTURES / "resume_repo", sandbox)
+    (sandbox / "NOTES.md").write_text("# Notes\n", encoding="utf-8")
+    with pytest.raises(FailpointError, match="does not carry"):
+        apply_seed(sandbox, 0)
+
+
+def test_the_committed_fixture_carries_every_seed_placeholder() -> None:
+    for name in ("NOTES.md", "tests/test_calc.py"):
+        text = (FIXTURES / "resume_repo" / name).read_text(encoding="utf-8")
+        assert "<seed" in text, f"{name} carries no seed placeholder"
+
+
 def test_every_row_carries_the_per_case_fields() -> None:
     row = _run().to_row()
     for name in PER_CASE_FIELDS:
