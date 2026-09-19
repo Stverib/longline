@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -109,6 +110,42 @@ class Tool(ABC):
         # 而写操作（如 FileEditTool、BashTool）保持 False 以避免竞态条件。
         # 参数 tool_input 允许根据具体输入动态判断，例如 BashTool 可以对只读命令返回 True。
         return False
+
+    # The two access modes `workload` may report.
+    ACCESS_READ = "read"
+    ACCESS_WRITE = "write"
+
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        """The files this call touches, as `{absolute_path: ACCESS_*}`.
+
+        Declared BEFORE execution, so the caller can digest the files both
+        before and after. The default is empty, and empty means "this tool cannot
+        say" rather than "this tool touches nothing" -- a distinction the
+        recovery path depends on, because a tool that touches nothing can be
+        safely retried and a tool that cannot say cannot.
+
+        Bash declares nothing on purpose: from this layer a command that appends
+        to a file and a command that reads one are the same string. Claiming
+        otherwise would be a guess dressed as a fact.
+
+        Keys are absolute so the digester never resolves them against its own
+        working directory, which differs between a killed process and its
+        successor.
+        """
+        return {}
+
+    @classmethod
+    def _declare(cls, raw: object, mode: str) -> dict[str, str]:
+        """One declared path, or nothing when the argument is absent.
+
+        Shared by every file tool, because the four of them differ only in which
+        argument holds the path and which mode it is. An empty argument must
+        yield nothing rather than `Path("")`, which is the current directory --
+        a digest of the whole cwd, from a call that named no file at all.
+        """
+        if not raw:
+            return {}
+        return {str(Path(str(raw)).resolve()): mode}
 
 
 @dataclass

@@ -39,6 +39,11 @@ class FileReadTool(Tool):
     def get_name(self) -> str:
         return FILE_READ_TOOL_NAME
 
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        # A read is a dependency: acting on a file after it changed is acting on
+        # stale input, so the session's read set has to include it.
+        return self._declare(tool_input.get("file_path"), self.ACCESS_READ)
+
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
             name=FILE_READ_TOOL_NAME,

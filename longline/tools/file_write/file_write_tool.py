@@ -35,6 +35,9 @@ class FileWriteTool(Tool):
     def get_name(self) -> str:
         return FILE_WRITE_TOOL_NAME
 
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        return self._declare(tool_input.get("file_path"), self.ACCESS_WRITE)
+
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
             name=FILE_WRITE_TOOL_NAME,

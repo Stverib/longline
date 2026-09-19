@@ -59,6 +59,9 @@ class NotebookEditTool(Tool):
     def get_name(self) -> str:
         return NOTEBOOK_EDIT_TOOL_NAME
 
+    def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
+        return self._declare(tool_input.get("notebook_path"), self.ACCESS_WRITE)
+
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
             name=NOTEBOOK_EDIT_TOOL_NAME,
