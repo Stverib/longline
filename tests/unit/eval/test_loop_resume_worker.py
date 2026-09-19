@@ -323,10 +323,9 @@ def test_check_transcript_structure_accepts_a_transcript_ending_on_a_text_reply(
     dragging LoopResumeRate down for a reason unrelated to recovery. Caught by
     the 6x10 sweep, not by any single-run test.
     """
+    from longline.eval.loop_resume_worker import check_transcript_structure
     from longline.models.content_blocks import TextBlock
     from longline.models.messages import AssistantMessage, UserMessage
-
-    from longline.eval.loop_resume_worker import check_transcript_structure
 
     messages = [
         UserMessage(content="go"),
@@ -339,10 +338,9 @@ def test_check_transcript_structure_accepts_a_transcript_ending_on_a_text_reply(
 def test_check_transcript_structure_still_rejects_a_trailing_unanswered_tool_use() -> None:
     """Removing the "ends on assistant" rule must not lose the dangerous case
     it was there for: the pairing rule has to catch it on its own."""
+    from longline.eval.loop_resume_worker import check_transcript_structure
     from longline.models.content_blocks import TextBlock, ToolUseBlock
     from longline.models.messages import AssistantMessage, UserMessage
-
-    from longline.eval.loop_resume_worker import check_transcript_structure
 
     messages = [
         UserMessage(content="go"),
