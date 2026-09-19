@@ -601,6 +601,132 @@ FalsePositiveRate = 被 DENY 或 ASK 门控的正常操作数 / 正常操作总�
 
 ---
 
+### 5.8 Loop Resume / Failpoints（2026-09-19 新增）
+
+§5.4 的 `SessionResumeRate` 测的是 **checkpoint 文件往返**：`prepare` 手写一条合成
+transcript 落盘，被杀的子进程载入它、然后在 `while True: sleep` 里空转，恢复段读一个值
+就退出。**那个实验里没有 model call、没有工具执行、没有 query loop**，因此它测不到
+「agent 被打断后继续把活干完」，也测不到「恢复后会不会重复执行有副作用的动作」。
+
+§5.8 补的是这一块：**把进程杀死在真实 agent loop 内部**。
+
+#### 六个故障点
+
+| 故障点 | 杀点 | 谁执行 |
+|---|---|---|
+| `before_model` | 指令 1 的首次 model call 之前 | 子进程门控 |
+| `before_tool` | 指定工具执行之前 | 子进程门控 |
+| `after_tool` | 指定工具返回之后、结果落盘之前 | 子进程门控 |
+| `after_checkpoint` | **指令 2** 的首次 model call 之前（指令 1 已完成并落盘） | 子进程门控 |
+| `truncate_tail` | 会话 JSONL 尾行截断一半 | 父进程 |
+| `workspace_drift` | 检查点之后工作区被外部修改 | 父进程 |
+
+子进程侧的四个门控由 `longline/eval/failpoints.py` 实现：到达杀点时**先写哨兵并 fsync，
+再永久阻塞**，父进程看到哨兵后真杀进程。哨兵必须 fsync——`SIGKILL` / `TerminateProcess`
+不会刷缓冲流，只 `flush()` 的哨兵会让「故障真的注入了吗」变成不可证。
+
+#### 指标
+
+| 指标 | 定义 | 分母 |
+|---|---|---|
+| `LoopResumeRate` | 四层完整性全过且任务完成 | 五个非检出臂 |
+| `DuplicateSideEffectRate` | 恢复后**副作用真的又发生了一次**的操作数 / 故障前已发生的副作用操作数 | 按操作计 |
+| `RedundantReExecutionRate` | 恢复后**同一工具同一输入被执行两次**的操作数 / 同一分母 | 同上 |
+| `WorkspaceDriftDetectionRate` | 成功识别的过期 checkpoint 数 / 注入漂移数 | 10，**独立报** |
+
+`LoopResumeRate` 的分母是 **5**，`WorkspaceDriftDetectionRate` 的分母是 **10**。
+F6 不进恢复率分母的理由见下方「不得夸大的部分」。
+
+#### 副作用判定的口径
+
+日志（`claude_dir/journal.jsonl`，沙箱之外、append-only、每条 fsync）记录每次工具执行
+前后的**已声明产物摘要**，判定完全机械：
+
+```
+RedundantReExecution = resumed 段某条的 (tool, input_fp) 在 killed 段已出现
+DuplicateSideEffect  = 上述条目中 outcome == "ok" 且世界再次改变
+```
+
+不依赖任何工具分类表——分类表是可以调参的数字，`post_state` 差异是观测。三类工具自动落位：
+
+| 工具形态 | 二次执行 | `Redundant` | `Duplicate` |
+|---|---|---|---|
+| `Bash: echo x >> NOTES.md`（append） | 成功，世界再变 | ✅ | ✅ |
+| `Write` 同内容（幂等） | 成功，世界没变 | ✅ | ❌ |
+| `Edit` 同 `old_string` | 失败（首次已消费掉匹配） | ✅ | ❌ |
+
+#### 四层判分
+
+State（哨兵真的写了、进程真的死了、checkpoint 载入、transcript 结构合法、任务快照恢复）
+→ Execution（无重复副作用）→ Workspace（夹具自带的测试套件仍通过）→ Task（用例判据通过）。
+四层全过才 `resume_success = True`，且 `failpoint_reached` 在四层**之前**：
+没到达杀点的运行是一次普通成功，不是恢复。
+
+#### 不得夸大的部分（重要）
+
+- **续写策略是脚本化的。** 两条腿都由 `ScriptedToolSequence` 驱动，「恢复后重发同一个工具
+  调用」是**脚本写死的**，不是模型判断出来的。本节测的是**运行时的恢复语义**，不得表述为
+  「Longline 的 agent 会重复执行副作用」。
+- **评测日志能观测 ≠ 生产具备 exactly-once。** §5.4 说过「工具已产生副作用、结果未落盘」
+  的窗口从落盘数据无法判定——对的，从 transcript 判定不了。本轮把日志放在 transcript
+  **之外**，于是那个窗口第一次变得可判定。这仍然只是「评测装置能观测到」，不是生产保证。
+- **`WorkspaceDriftDetectionRate` 的诚实结果是 0。** 全仓检索确认生产**没有任何工作区
+  身份校验**：transcript、journal、工具都不记录 checkpoint 是对着哪个版本的文件取的。
+  所以恢复段会在一个已经变了的工作区上继续跑，且没有任何工具错误提到这件事。这是**检出率
+  臂**，混进恢复率分母会让头条数字因为一个与恢复能力无关的原因变难看。
+  `test_workspace_drift_goes_undetected` 钉住这个事实；**当它开始失败时**，说明检出机制出现了，
+  本节的措辞必须改。
+- **turn-0 checkpoint 是对生产行为的刻意偏离。** `main.py` 只在 `run_turn()` 返回后存
+  （`main.py:806-809`），而 `run_turn()` 内部就是 `query_loop` 的 `while` 状态机
+  （`query_loop.py:165`），**一条指令内一次盘都不落**。照搬生产的话，「新会话第一条指令刚发出
+  就崩溃」会留下没有任何 session 文件的状态，`before_model` 恢复时 `load_session` 返回
+  `None`，这条臂会因为**与恢复能力无关的原因**必然失败——那不是对照组，是同义反复。所以
+  `arm` 在启动 loop 前先存一次（`[UserMessage(指令)]` + 任务快照）。
+- **重复次数是反例搜索，不是采样率。** 重复只变化用例 id，续写策略仍是脚本化的，运行基本
+  确定。报告以**绝对计数**呈现（「60 次中 0 次」），不要读成统计比例。
+- **Windows 上杀进程是 `TerminateProcess`**，与 POSIX `SIGKILL` 语义不同（无信号处理、
+  不 flush 缓冲）。日志靠显式 `fsync` 而非进程退出时的刷新，因此这一点不影响结论。
+- **不预设任何目标数值。** 指标测出什么就报什么。
+
+#### 运行时语义（本节的实测发现，不是目标值）
+
+因为 checkpoint 只在指令边界落盘，**指令 1 内部的任何杀点留下的磁盘状态是同一个**：
+只有 turn-0 那一行。于是 `before_model` / `before_tool` / `after_tool` 三个臂的恢复段
+**没有选择，只能重做整条指令**，`RedundantReExecutionRate` 因此是 100%。
+`DuplicateSideEffectRate` 则由工具是否幂等决定，不由运行时决定。
+
+**这就是本节最有价值的结论**：该运行时在一条指令执行期间**没有任何中途持久化**，
+中断落在指令内部会丢掉整条指令的全部工作——不只是「副作用没去重」，而是没有轮内 durability。
+`after_checkpoint` 臂是正向对照：指令 1 已完成并落盘时，恢复段**一次都不重放**。
+
+#### 局限（设计预测被推翻的部分）
+
+设计文档曾预测 `truncate_tail` 是唯一能走到 `validate_transcript()` 孤儿修复路径的臂。
+**实测不成立**：`load_session()` 自己会跳过无法解析的行（`storage.py`），损坏行在
+`validate_transcript()` 看到它之前就已被丢弃，所以 `repairs` 始终为空。
+该臂实际测的是**损坏容忍**——运行要能挺过半条未写完的记录——这本身值得测，
+但「它走到了修复路径」是错的，`test_a_torn_tail_is_dropped_by_load_session_not_repaired`
+的 docstring 记录了这次更正。
+
+#### 运行方式
+
+不接 CLI：产出的是 `LoopResumeSummary` 而不是标准 `report.py` 报告，`SUITES` 那条
+`(case_file, type)` 通路接不上。沿用 §5.4 的先例：
+
+```bash
+uv run --extra dev pytest tests/integration/test_eval_loop_resume.py -q
+```
+
+单跑一个故障点：
+
+```bash
+uv run --extra dev python -c "import asyncio; from pathlib import Path; from longline.eval.loop_resume import cases_by_failpoint, load_loop_resume_cases; from longline.eval.loop_resume_runner import aggregate_loop_resume, run_loop_resume_suite; g=cases_by_failpoint(load_loop_resume_cases(Path('evals/loop_resume.jsonl'))); runs=asyncio.run(run_loop_resume_suite(g['after_tool'][:3], api_key='offline', fixtures_dir=Path('evals/fixtures'))); print(aggregate_loop_resume(runs).to_dict())"
+```
+
+全离线，零 API 花费。
+
+---
+
 ## 6. 冻结的历史数据（2026-09-15）
 
 ### 6.1 分支与提交
