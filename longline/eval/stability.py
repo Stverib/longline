@@ -208,18 +208,26 @@ def redundant_actions(results: Sequence[CaseResult]) -> dict[str, int]:
 
 
 def notebook_edit_substitution(results: Sequence[CaseResult]) -> int:
-    """Runs that edited a `.ipynb` with Edit instead of NotebookEdit.
+    """Runs that edited a `.ipynb` with Edit and NEVER used NotebookEdit.
 
-    This is the measured cause of three of the four notebook failures in the
-    `task9_tool_selection_clean` run: the agent read the notebook as JSON and
-    reached for a string replacement. A count rather than a rate, because it is
-    a defect signature -- its denominator would be cases that may never have
-    needed a notebook edit at all.
+    "Instead of", not "as well as". A run that reached for Edit first and then
+    corrected itself with NotebookEdit is a recovery, and counting it reports a
+    defect where the agent actually caught its own mistake.
+
+    Measured on the previous model's run: 7 runs touched a notebook with Edit,
+    but only 4 of them never used NotebookEdit -- and those 4 are exactly the
+    notebook failures. The loose reading inflated the count by 75% and measured
+    a routing wobble rather than the defect this metric is named for.
     """
     count = 0
     for result in results:
+        touched_with_edit = False
+        used_notebook_edit = False
         for name, tool_input in result.tool_calls:
-            if name == "Edit" and str(tool_input.get("file_path", "")).endswith(".ipynb"):
-                count += 1
-                break
+            if name == "NotebookEdit":
+                used_notebook_edit = True
+            elif name == "Edit" and str(tool_input.get("file_path", "")).endswith(".ipynb"):
+                touched_with_edit = True
+        if touched_with_edit and not used_notebook_edit:
+            count += 1
     return count

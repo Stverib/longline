@@ -238,3 +238,29 @@ class TestNotebookEditSubstitution:
         ])]
 
         assert notebook_edit_substitution(rows) == 0
+
+    def test_a_corrected_attempt_is_a_recovery_not_a_substitution(self) -> None:
+        """Edit first, then NotebookEdit, is the agent catching its own mistake.
+
+        Counting it would report a defect where the run succeeded. On the
+        previous model's run this loose reading reported 7 substitutions when
+        only 4 runs never used NotebookEdit -- and those 4 were exactly the
+        failures.
+        """
+        rows = [CaseResult(case_id="c", case_type="tool_call", passed=True, tool_calls=[
+            ("Read", {"file_path": "analysis.ipynb"}),
+            ("Edit", {"file_path": "analysis.ipynb"}),
+            ("NotebookEdit", {"notebook_path": "analysis.ipynb"}),
+            ("Bash", {"command": "python -c 'print(1)'"}),
+        ])]
+
+        assert notebook_edit_substitution(rows) == 0
+
+    def test_notebook_edit_before_a_later_edit_still_counts_as_recovered(self) -> None:
+        """Order does not matter: what matters is that the right tool was used."""
+        rows = [CaseResult(case_id="c", case_type="tool_call", passed=False, tool_calls=[
+            ("NotebookEdit", {"notebook_path": "analysis.ipynb"}),
+            ("Edit", {"file_path": "analysis.ipynb"}),
+        ])]
+
+        assert notebook_edit_substitution(rows) == 0
