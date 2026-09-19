@@ -567,7 +567,9 @@ async def _run_print_mode(prompt: str, model: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_repl(model: str, resume_id: str | None = None) -> None:
+async def _run_repl(
+    model: str, resume_id: str | None = None, *, force_resume: bool = False
+) -> None:
     """Interactive REPL mode.
 
     P0.5a: Uses QueryEngine for runtime wiring.
@@ -647,6 +649,7 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
         from longline.session.recovery import TranscriptRepairReport
         from longline.session.storage import load_session, load_task_snapshot
         from longline.session.tool_journal import ToolJournal, reconcile_pending
+        from longline.session.workspace_identity import DriftVerdict, classify_drift
 
         loaded = load_session(resume_id, claude_dir=SESSION_DIR)
         if loaded:
@@ -684,6 +687,37 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
                 engine._task_registry.restore(task_snap)
 
             console.print(f"[dim]Resumed session {resume_id} ({len(messages)} messages)[/]")
+
+            # === 工作区身份检查 ===
+            # checkpoint 记下了这个会话读过/写过哪些文件、以及它们当时的摘要。
+            # 恢复之前先看这些文件现在还是不是那个样子：本会话依赖的文件变了，
+            # 说明这份 checkpoint 描述的世界已经不存在，继续跑就是在过时的前提上
+            # 行动 —— 拒绝恢复。其它文件变了是别人的事，警告后照常恢复：一个
+            # 只要工作区不干净就拒绝恢复的机制，没人能用。
+            drift = classify_drift(
+                root=Path(cwd),
+                header=resume_journal.session_header(),
+                records=resume_journal.records(),
+            )
+            if drift.rejected and not force_resume:
+                console.print(
+                    "[red]Refusing to resume: the workspace changed under this checkpoint."
+                    + (f" Dependent files: {drift.relevant}" if drift.relevant else "")
+                    + (" (git HEAD moved)" if drift.git_head_changed else "")
+                    + "[/]"
+                )
+                console.print("[dim]Pass --force-resume to continue anyway.[/]")
+                return
+            if drift.rejected:
+                console.print(
+                    f"[yellow]--force-resume: continuing over dependent drift "
+                    f"{drift.relevant}[/]"
+                )
+            elif drift.verdict is DriftVerdict.UNRELATED:
+                console.print(
+                    f"[yellow]Warning: {len(drift.unrelated)} unrelated file(s) changed "
+                    "since this session's last checkpoint. Resuming anyway.[/]"
+                )
         else:
             console.print(f"[yellow]Session {resume_id} not found, starting fresh.[/]")
 
@@ -900,12 +934,18 @@ async def _run_repl(model: str, resume_id: str | None = None) -> None:
 @click.option("--model", default="claude-sonnet-4-20250514", help="Model to use")
 @click.option("--verbose", is_flag=True, help="Verbose output")
 @click.option("-c", "--resume", "resume_id", default=None, help="Resume session by ID")
+@click.option(
+    "--force-resume",
+    is_flag=True,
+    help="Resume even when the workspace drifted under the checkpoint",
+)
 @click.argument("prompt", required=False)
 def main(
     print_mode: bool,
     model: str,
     verbose: bool,
     resume_id: str | None,
+    force_resume: bool,
     prompt: str | None,
 ) -> None:
     """longline -- resumable agent runtime for long-horizon tasks.
@@ -925,7 +965,7 @@ def main(
             sys.exit(1)
         asyncio.run(_run_print_mode(prompt, model))
     else:
-        asyncio.run(_run_repl(model, resume_id=resume_id))
+        asyncio.run(_run_repl(model, resume_id=resume_id, force_resume=force_resume))
 
 
 if __name__ == "__main__":
