@@ -8,7 +8,8 @@
    and parks at the failpoint;
 3. wait for the sentinel, then really kill the child;
 4. for `truncate_tail`, cut the session file's last line in half; for
-   `workspace_drift`, mutate the fixture files;
+   `workspace_drift`, mutate a file the session READ; for
+   `workspace_drift_unrelated`, add a file it never touched;
 5. `resume` in a NEW interpreter: production recovery path, then the loop runs
    to completion;
 6. compare the two legs' journal entries and judge the artifacts.
@@ -24,13 +25,21 @@ file contents). **Task** -- the case's deterministic judge passed. All four are
 required, and `failpoint_reached` sits in FRONT of them: a run whose child never
 signalled is not a recovery experiment at all, whatever its judge said.
 
-=== Why `workspace_drift` is reported separately ===
+=== Why the two drift arms are reported separately ===
 
-Production has no workspace identity check -- nothing records which revision of
-a file a checkpoint was taken against. So the honest detection rate is zero, and
-folding a zero into the recovery rate would move the headline for a reason that
-has nothing to do with recovery. It is measured, reported, and kept out of the
-denominator.
+They answer a different question from "did it recover". One asks whether
+dependent drift is CAUGHT; the other asks whether unrelated drift is wrongly
+REFUSED. Folding either into the recovery rate would let a detection result move
+a number that is supposed to be about recovery, so both are measured, reported,
+and kept out of the denominator.
+
+=== The two cells, and why the comparison is an ablation ===
+
+`durability=False` runs the whole suite with the runtime's two new mechanisms
+switched off -- no step-level checkpoint, no operation journal, no workspace
+header. Everything else is identical: the same harness, cases, judges, scripted
+model and instrument. Comparing against a checkout of the pre-change revision
+would not be, because this harness IMPORTS the modules the change added.
 """
 
 from __future__ import annotations
@@ -545,7 +554,14 @@ def kill_armed_child(
 # --- one case ---
 
 
-def _build_spec(case: LoopResumeCase, *, claude_dir: Path, sandbox: Path, api_key: str) -> dict[str, Any]:
+def _build_spec(
+    case: LoopResumeCase,
+    *,
+    claude_dir: Path,
+    sandbox: Path,
+    api_key: str,
+    durability: bool = True,
+) -> dict[str, Any]:
     return {
         "claude_dir": str(claude_dir),
         "sandbox": str(sandbox),
@@ -557,6 +573,11 @@ def _build_spec(case: LoopResumeCase, *, claude_dir: Path, sandbox: Path, api_ke
         "model": "offline-model",
         "task": case.task.replace("<cwd>", sandbox.as_posix()),
         "max_turns": case.max_turns,
+        # The ablation switch. Off means the runtime records nothing: no step
+        # checkpoint, no operation journal, no workspace header. See
+        # `loop_resume_worker._attach_durability` for why this, and not a
+        # worktree at the pre-change revision, is the honest before/after.
+        "durability": durability,
     }
 
 
@@ -566,6 +587,7 @@ async def run_loop_resume_case(
     api_key: str,
     fixtures_dir: Path,
     python: str | None = None,
+    durability: bool = True,
 ) -> LoopResumeRun:
     """One failpoint injection, end to end."""
     claude_dir = Path(tempfile.mkdtemp(prefix=CLAUDE_DIR_PREFIX))
@@ -579,7 +601,10 @@ async def run_loop_resume_case(
         # content and the tree starts dirty only if the RUNTIME made it dirty.
         _init_workspace_repo(sandbox)
 
-        spec = _build_spec(case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key)
+        spec = _build_spec(
+            case, claude_dir=claude_dir, sandbox=sandbox, api_key=api_key,
+            durability=durability,
+        )
         spec_path = claude_dir / "spec.json"
         spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         before = _snapshot_artifacts(sandbox)
@@ -684,6 +709,7 @@ async def run_loop_resume_suite(
     api_key: str,
     fixtures_dir: Path,
     python: str | None = None,
+    durability: bool = True,
 ) -> list[LoopResumeRun]:
     """Run every case serially.
 
@@ -695,7 +721,11 @@ async def run_loop_resume_suite(
     for case in cases:
         runs.append(
             await run_loop_resume_case(
-                case, api_key=api_key, fixtures_dir=fixtures_dir, python=python
+                case,
+                api_key=api_key,
+                fixtures_dir=fixtures_dir,
+                python=python,
+                durability=durability,
             )
         )
     return runs

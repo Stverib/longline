@@ -447,7 +447,9 @@ def _build_gate(spec: dict[str, Any], failpoint: str) -> FailpointGate:
     )
 
 
-def _attach_durability(engine: Any, claude_dir: Path, session_id: str, sandbox: Path) -> Any:
+def _attach_durability(
+    engine: Any, claude_dir: Path, session_id: str, sandbox: Path, *, enabled: bool = True
+) -> Any:
     """Give the engine the PRODUCTION journal and a step-level checkpoint.
 
     Distinct from the `SideEffectJournal` the legs also write: that one is the
@@ -460,11 +462,27 @@ def _attach_durability(engine: Any, claude_dir: Path, session_id: str, sandbox: 
     with its argument shape. The worker no longer needs to call `_save_checkpoint`
     itself between steps -- and must not, because a harness that placed its own
     checkpoints would be measuring itself rather than the runtime.
+
+    `enabled=False` is the ABLATION, and it is how the before/after comparison is
+    taken with ONE instrument rather than two. Nothing is written: no step
+    checkpoint, no operation journal, no workspace header. Every downstream
+    consumer then sees an empty journal, which is exactly what the pre-change
+    runtime produced -- so the same harness, the same cases, the same judges and
+    the same script measure both cells, and the only difference between them is
+    whether the runtime records anything.
+
+    A worktree at the pre-change revision is NOT an option here, and the reason is
+    worth stating: this harness IMPORTS `session.tool_journal` and
+    `session.workspace_identity`, which do not exist there. Comparing across
+    revisions would mean comparing across two harnesses as well.
     """
     from longline.session.tool_journal import ToolJournal
     from longline.session.workspace_identity import current_git_head
 
     tool_journal = ToolJournal(claude_dir, session_id)
+    if not enabled:
+        return tool_journal
+
     tool_journal.write_session_header(
         workspace_root=str(sandbox), git_head=current_git_head(sandbox)
     )
@@ -508,7 +526,10 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
     # checkpointing does not remove the need: the arm's fault lands BEFORE the
     # first step.
     _save_checkpoint(engine, claude_dir, session_id)
-    _attach_durability(engine, claude_dir, session_id, sandbox)
+    _attach_durability(
+        engine, claude_dir, session_id, sandbox,
+        enabled=bool(spec.get("durability", True)),
+    )
     before_loop = len(engine.messages)
 
     instructions_run = 0
@@ -693,7 +714,10 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         journal=journal,
         sequence=sequence,
     )
-    tool_journal = _attach_durability(engine, claude_dir, session_id, sandbox)
+    tool_journal = _attach_durability(
+        engine, claude_dir, session_id, sandbox,
+        enabled=bool(spec.get("durability", True)),
+    )
 
     # === Reconciliation, in `main.py`'s position: BEFORE the repair ===
     # The repair has to write a tool_result for the unanswered tool_use, and only
