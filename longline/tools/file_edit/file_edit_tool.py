@@ -22,7 +22,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
-from longline.tools.base import Tool, ToolResult, ToolSchema
+from longline.tools.base import ReconcileOutcome, Tool, ToolResult, ToolSchema
 
 FILE_EDIT_TOOL_NAME = "Edit"
 
@@ -38,6 +38,35 @@ class FileEditTool(Tool):
 
     def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
         return self._declare(tool_input.get("file_path"), self.ACCESS_WRITE)
+
+    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        """Read the two strings out of the file: exactly one of them decides it.
+
+        Neither present, both present, or the file unreadable: UNKNOWN, never
+        NOT_APPLIED. NOT_APPLIED is an authorisation to retry, and it is only
+        earned by positive evidence that the old text is still untouched.
+        """
+        path = Path(str(tool_input.get("file_path") or ""))
+        old = str(tool_input.get("old_string") or "")
+        new = str(tool_input.get("new_string") or "")
+        if not path.is_file():
+            return ReconcileOutcome.UNKNOWN
+        try:
+            content = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ReconcileOutcome.UNKNOWN
+        # Line endings normalised on all three: a CRLF file on disk versus an LF
+        # argument is the same text, and the edit tool itself reads and writes
+        # bytes, so the endings are the caller's, not this tool's.
+        norm = self._normalise_newlines
+        content, old, new = norm(content), norm(old), norm(new)
+        has_old = bool(old) and old in content
+        has_new = bool(new) and new in content
+        if has_new and not has_old:
+            return ReconcileOutcome.APPLIED
+        if has_old and not has_new:
+            return ReconcileOutcome.NOT_APPLIED
+        return ReconcileOutcome.UNKNOWN
 
     def get_schema(self) -> ToolSchema:
         return ToolSchema(

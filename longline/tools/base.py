@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,20 @@ class ToolResult:
         return "\n".join(
             block.get("text", str(block)) for block in self.content if isinstance(block, dict)
         )
+
+
+class ReconcileOutcome(Enum):
+    """What a tool can say about a call that started and never reported back.
+
+    Three values, and the third is the important one. A two-valued answer would
+    force every tool to claim either "it landed" or "it did not", and a tool that
+    cannot read its own effect would have to pick -- which is exactly the guess
+    that turns a recoverable interruption into a duplicated side effect.
+    """
+
+    APPLIED = "applied"          # the effect is present in the world
+    NOT_APPLIED = "not_applied"  # the effect is provably absent; safe to retry
+    UNKNOWN = "unknown"          # cannot be read from here; do not retry blindly
 
 
 class Tool(ABC):
@@ -146,6 +161,35 @@ class Tool(ABC):
         if not raw:
             return {}
         return {str(Path(str(raw)).resolve()): mode}
+
+    @staticmethod
+    def _normalise_newlines(text: str) -> str:
+        r"""Line endings to `\n`, so written content can be compared with read content.
+
+        The production file writers open their target in TEXT mode (`os.fdopen(fd,
+        "w")` in `FileWriteTool`, and `Path.write_bytes` on already-decoded text
+        in `FileEditTool`), so on Windows a `\n` in the tool's own argument
+        reaches the disk as `\r\n`. Comparing raw bytes would then report a
+        successful write as NOT_APPLIED -- and NOT_APPLIED is an authorisation to
+        retry, so the comparison would authorise exactly the duplicate side
+        effect this mechanism exists to prevent.
+
+        Caught by `test_write_is_non_ascii_safe` on a Windows checkout, not by
+        reading either file: the two halves are in different modules and neither
+        looks wrong on its own.
+        """
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        """Whether a call that never reported back took effect.
+
+        Asked only for operations the journal shows as started-but-uncommitted.
+        The default is UNKNOWN, which is the correct answer for every tool whose
+        effect is not readable from the workspace -- `Bash` above all. UNKNOWN
+        authorises neither a retry nor a claim of success, so the recovery path
+        reports it to the model and re-runs nothing.
+        """
+        return ReconcileOutcome.UNKNOWN
 
 
 @dataclass

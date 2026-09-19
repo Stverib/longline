@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from longline.tools.base import Tool, ToolResult, ToolSchema
+from longline.tools.base import ReconcileOutcome, Tool, ToolResult, ToolSchema
 
 FILE_WRITE_TOOL_NAME = "Write"
 
@@ -37,6 +37,26 @@ class FileWriteTool(Tool):
 
     def workload(self, tool_input: dict[str, Any]) -> dict[str, str]:
         return self._declare(tool_input.get("file_path"), self.ACCESS_WRITE)
+
+    def reconcile(self, tool_input: dict[str, Any]) -> ReconcileOutcome:
+        """A full overwrite identifies itself: the file is the content, or it is not.
+
+        There is no third case to be unsure about -- unlike `Edit`, whose
+        `old_string` may survive elsewhere in the file and make the bytes
+        compatible with both answers.
+        """
+        path = Path(str(tool_input.get("file_path") or ""))
+        content = str(tool_input.get("content") or "")
+        if not path.is_file():
+            return ReconcileOutcome.NOT_APPLIED
+        try:
+            on_disk = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ReconcileOutcome.UNKNOWN
+        # Compared with line endings normalised: the writer opens in text mode, so
+        # on Windows the bytes on disk are not the bytes in the argument.
+        matches = self._normalise_newlines(on_disk) == self._normalise_newlines(content)
+        return ReconcileOutcome.APPLIED if matches else ReconcileOutcome.NOT_APPLIED
 
     def get_schema(self) -> ToolSchema:
         return ToolSchema(
