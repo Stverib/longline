@@ -83,6 +83,7 @@ from longline.core.events import QueryEvent, TextDelta, ToolUseStart, TurnComple
 from longline.eval.failpoints import (
     AFTER_CHECKPOINT,
     BEFORE_TOOL,
+    STOPS_IN_INSTRUCTION_TWO,
     TRUNCATE_TAIL,
     WORKSPACE_DRIFT,
     WORKSPACE_DRIFT_UNRELATED,
@@ -107,20 +108,14 @@ JOURNAL_NAME = "journal.jsonl"
 # which wrappers exist.
 GATED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write", "Bash")
 
-# The failpoints whose stop lands inside INSTRUCTION 2, so instruction 1 must
-# complete and be persisted first.
+# `STOPS_IN_INSTRUCTION_TWO` is imported rather than defined here: the dataset
+# loader refuses a case that declares one of those failpoints on a one-instruction
+# task, and two copies of the tuple would drift into a case that can never fire.
 #
-# `truncate_tail` is here for a reason found by testing rather than by design:
-# the turn-0 checkpoint is ONE line, so cutting its last line leaves nothing at
-# all and `load_session` returns None -- there is no resume to test. With
-# instruction 1 on disk the file has many lines, the torn one is dropped, and
-# what the arm actually exercises becomes visible (see `resume`).
-#
-# The two drift arms are deliberately NOT here: their fault is a mutated
+# The two drift arms are deliberately NOT in it: their fault is a mutated
 # workspace, injected between the kill and the resume, and it is only INTERESTING
 # if the session has already recorded a dependency on a file. They therefore stop
 # inside instruction 1, at the Edit call -- see `_GATE_TRIGGER`.
-STOPS_IN_INSTRUCTION_TWO: tuple[str, ...] = (AFTER_CHECKPOINT, TRUNCATE_TAIL)
 
 # Which GATE mechanism parks the child for each failpoint. The three parent-side
 # failpoints reuse a gate because the child still has to stop somewhere for the
@@ -143,46 +138,55 @@ _GATE_TRIGGER: dict[str, str] = {
     WORKSPACE_DRIFT_UNRELATED: BEFORE_TOOL,
 }
 
-# The files the journal digests before and after each tool execution. Only the
-# ones the task mutates: hashing the whole sandbox would make `post_state`
-# differ for reasons unrelated to the tool under observation.
-ARTIFACT_PATHS: tuple[str, ...] = ("NOTES.md", "src/calc.py", "REPORT.md")
+@dataclass
+class Plan:
+    """The case's scripted behaviour, read out of the spec it arrived in.
 
-# Instruction 2 exists only for the `after_checkpoint` failpoint, whose whole
-# point is that instruction 1's completed work is on disk at the moment of the
-# kill and must NOT be replayed. Instruction 1 is the case's own task text --
-# the dataset owns it, not this module.
-INSTRUCTION_TWO = "Now write a short REPORT.md summarising what you changed."
+    Every field here used to be a module constant in this file, and that was the
+    finding item 6 acted on: with the sequence hardcoded, all seven arms ran the
+    SAME three steps against the SAME fixture, so "the runtime recovered" could
+    only ever be a statement about one script. The plan now travels with the case.
 
-# Instruction 1's fixed tool sequence. Read first so the model has seen the bug,
-# then the append (the side effect the after_tool arm duplicates), then the
-# edit. Only forms both `cmd.exe` and `/bin/sh` accept: `BashTool` runs whatever
-# `create_subprocess_shell` picks, and the two shells are not the same language.
-SCENARIO_ONE: tuple[dict[str, Any], ...] = (
-    {"tool": "Read", "input": {"file_path": "src/calc.py"}},
-    {"tool": "Bash", "input": {"command": "echo fixed-add >> NOTES.md"}},
-    {
-        "tool": "Edit",
-        "input": {
-            "file_path": "src/calc.py",
-            "old_string": "return a - b",
-            "new_string": "return a + b",
-        },
-    },
-)
+    `instructions[0]` is the case's own task text (the parent substitutes the
+    sandbox into it); any further entries are the follow-ups. `steps[i]` is
+    instruction `i`'s tool sequence.
+    """
 
-# Instruction 2's sequence. It gives the after_checkpoint arm something to do
-# AFTER the resumed leg has loaded instruction 1's completed work.
-SCENARIO_TWO: tuple[dict[str, Any], ...] = (
-    {
-        "tool": "Write",
-        "input": {
-            "file_path": "REPORT.md",
-            "content": "# Report\n\nFixed add() so it sums its arguments.\n",
-        },
-    },
-)
+    instructions: list[str]
+    steps: list[list[dict[str, Any]]]
+    artifacts: tuple[str, ...]
+    answer: str = ""
 
+    @classmethod
+    def from_spec(cls, spec: Mapping[str, Any]) -> Plan:
+        raw = spec.get("scenario")
+        if not isinstance(raw, dict):
+            raise FailpointError(
+                "the spec carries no scenario. The tool sequence has to travel with "
+                "the case -- a worker that fell back to a built-in one would silently "
+                "run some other task and report its result under this case's name"
+            )
+        return cls(
+            instructions=[str(spec["task"])] + [str(x) for x in raw["followups"]],
+            steps=[[dict(step) for step in group] for group in raw["steps"]],
+            artifacts=tuple(str(x) for x in raw["artifacts"]),
+            answer=str(raw.get("answer", "")),
+        )
+
+    def offset_for(self, instruction: int) -> int:
+        """How many tool_use blocks the instructions BEFORE `instruction` contribute.
+
+        Instruction 2's scripted sequence needs it: progress is derived from the
+        transcript, and after instruction 1 the transcript already carries this
+        many tool_use blocks. Without the offset the model would read instruction
+        1's tool uses as its own progress and answer without doing anything.
+        """
+        return sum(len(group) for group in self.steps[:instruction])
+
+
+# A task snapshot in the shape `TaskRegistry` persists. Unrelated to the scenario:
+# the registry's own crash-recovery path is a different mechanism, and this is the
+# state it is asked to restore.
 RUNNING_TASK_SNAPSHOT: list[dict[str, Any]] = [
     {
         "task_id": "b-9f8e7d6c",
@@ -193,17 +197,6 @@ RUNNING_TASK_SNAPSHOT: list[dict[str, Any]] = [
         "metadata": {"command": "sleep 600"},
     },
 ]
-
-
-def instruction_offset() -> int:
-    """How many tool_use blocks instruction 1 contributes.
-
-    Instruction 2's scripted sequence needs it: progress is derived from the
-    transcript, and after instruction 1 the transcript already carries this many
-    tool_use blocks. Without the offset the model would read instruction 1's
-    tool uses as its own progress and answer without doing anything.
-    """
-    return len(SCENARIO_ONE)
 
 
 def _tool_use_ids(messages: Sequence[Any]) -> list[str]:
@@ -405,6 +398,7 @@ def build_scenario_engine(
     gate: FailpointGate,
     journal: SideEffectJournal | None,
     sequence: ScriptedToolSequence,
+    artifact_paths: tuple[str, ...],
     cost: LegCost | None = None,
 ) -> Any:
     """A real `QueryEngine` whose model is scripted and whose tools are gated.
@@ -430,7 +424,7 @@ def build_scenario_engine(
                 inner=inner,
                 gate=gate,
                 journal=journal,
-                artifact_paths=ARTIFACT_PATHS,
+                artifact_paths=artifact_paths,
                 artifact_root=sandbox,
             ),
         )
@@ -571,8 +565,9 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
     failpoint = str(spec["failpoint"])
 
     gate = _build_gate(spec, failpoint)
+    plan = Plan.from_spec(spec)
     journal = SideEffectJournal(claude_dir / JOURNAL_NAME, KILLED)
-    sequence = ScriptedToolSequence(steps=list(SCENARIO_ONE), offset=0)
+    sequence = ScriptedToolSequence(steps=list(plan.steps[0]), offset=0, answer=plan.answer)
     engine = build_scenario_engine(
         str(sandbox),
         model=str(spec.get("model", "offline-model")),
@@ -580,6 +575,7 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
         gate=gate,
         journal=journal,
         sequence=sequence,
+        artifact_paths=plan.artifacts,
     )
 
     engine.messages.append(UserMessage(content=str(spec["task"])))
@@ -606,9 +602,9 @@ def arm(spec: dict[str, Any]) -> dict[str, Any]:
             instructions_run += 1
             _save_checkpoint(engine, claude_dir, session_id)
             gate.armed = True
-            sequence.steps = list(SCENARIO_TWO)
-            sequence.offset = instruction_offset()
-            engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
+            sequence.steps = list(plan.steps[1])
+            sequence.offset = plan.offset_for(1)
+            engine.messages.append(UserMessage(content=plan.instructions[1]))
         tool_errors = asyncio.run(_run_instruction(engine))
         instructions_run += 1
     except FailpointReached:
@@ -760,6 +756,7 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         armed=False,
     )
     journal = SideEffectJournal(claude_dir / JOURNAL_NAME, RESUMED)
+    plan = Plan.from_spec(spec)
     cost = LegCost()
 
     if failpoint in STOPS_IN_INSTRUCTION_TWO:
@@ -767,9 +764,13 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         # instruction 2's step -- and instruction 2 itself was never persisted
         # (it was typed and the process died before any save). Re-supplying it
         # is what a user does after a crash, not a convenience for the harness.
-        sequence = ScriptedToolSequence(steps=list(SCENARIO_TWO), offset=instruction_offset())
+        sequence = ScriptedToolSequence(
+            steps=list(plan.steps[1]), offset=plan.offset_for(1), answer=plan.answer
+        )
     else:
-        sequence = ScriptedToolSequence(steps=list(SCENARIO_ONE), offset=0)
+        sequence = ScriptedToolSequence(
+            steps=list(plan.steps[0]), offset=0, answer=plan.answer
+        )
 
     engine = build_scenario_engine(
         str(sandbox),
@@ -778,6 +779,7 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
         gate=gate,
         journal=journal,
         sequence=sequence,
+        artifact_paths=plan.artifacts,
         cost=cost,
     )
     tool_journal = _attach_durability(
@@ -838,7 +840,7 @@ def resume(spec: dict[str, Any]) -> dict[str, Any]:
 
     engine.messages.extend(repaired)
     if failpoint in STOPS_IN_INSTRUCTION_TWO:
-        engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
+        engine.messages.append(UserMessage(content=plan.instructions[1]))
 
     error = ""
     instructions_run = 0
@@ -919,7 +921,8 @@ def baseline(spec: dict[str, Any]) -> dict[str, Any]:
     # against: it runs once, so it cannot duplicate anything by construction. Its
     # journal would be a file nobody reads.
     journal = None
-    sequence = ScriptedToolSequence(steps=list(SCENARIO_ONE), offset=0)
+    plan = Plan.from_spec(spec)
+    sequence = ScriptedToolSequence(steps=list(plan.steps[0]), offset=0, answer=plan.answer)
     cost = LegCost()
     engine = build_scenario_engine(
         str(sandbox),
@@ -928,6 +931,7 @@ def baseline(spec: dict[str, Any]) -> dict[str, Any]:
         gate=gate,
         journal=journal,
         sequence=sequence,
+        artifact_paths=plan.artifacts,
         cost=cost,
     )
 
@@ -947,9 +951,9 @@ def baseline(spec: dict[str, Any]) -> dict[str, Any]:
         instructions_run = 1
         if runs_two_instructions:
             _save_checkpoint(engine, claude_dir, session_id)
-            sequence.steps = list(SCENARIO_TWO)
-            sequence.offset = instruction_offset()
-            engine.messages.append(UserMessage(content=INSTRUCTION_TWO))
+            sequence.steps = list(plan.steps[1])
+            sequence.offset = plan.offset_for(1)
+            engine.messages.append(UserMessage(content=plan.instructions[1]))
             tool_errors = tool_errors + asyncio.run(_run_instruction(engine))
             instructions_run = 2
     except BaseException as exc:  # reported, not swallowed

@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from longline.eval.failpoints import ALL_FAILPOINTS, BEFORE_TOOL, WORKSPACE_DRIFT
+from longline.eval.failpoints import (
+    AFTER_CHECKPOINT,
+    ALL_FAILPOINTS,
+    BEFORE_TOOL,
+    WORKSPACE_DRIFT,
+)
 from longline.eval.loop_resume import (
     LoopResumeCase,
     cases_by_failpoint,
@@ -18,6 +23,17 @@ from longline.eval.types import CaseParseError
 DATASET = Path("evals/loop_resume.jsonl")
 
 
+def _scenario(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "followups": [],
+        "steps": [[{"tool": "Bash", "input": {"command": "echo x >> NOTES.md"}}]],
+        "artifacts": ["NOTES.md"],
+        "workspace_test": {"command": ["python", "-m", "pytest"], "path": "tests/t.py"},
+    }
+    base.update(overrides)
+    return base
+
+
 def _line(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "id": "lr-x",
@@ -26,6 +42,7 @@ def _line(**overrides: object) -> dict[str, object]:
         "failpoint": BEFORE_TOOL,
         "failpoint_tool": "Bash",
         "checks": [{"fn": "file_exists", "args": {"path": "NOTES.md"}}],
+        "scenario": _scenario(),
     }
     base.update(overrides)
     return base
@@ -67,6 +84,73 @@ def test_non_tool_failpoints_must_not_carry_a_tool_name() -> None:
 def test_parent_failpoints_require_no_tool_name() -> None:
     case = LoopResumeCase.from_dict(_line(failpoint=WORKSPACE_DRIFT, failpoint_tool=""))
     assert case.failpoint == WORKSPACE_DRIFT
+
+
+def test_a_case_without_a_scenario_is_refused() -> None:
+    """Before item 6 the tool sequence was a module constant, so every case in the
+    suite was the same task with a different place to die -- a matrix with one
+    row. A case that carried no scenario would silently get that back."""
+    line = _line()
+    del line["scenario"]
+    with pytest.raises(CaseParseError, match="scenario"):
+        LoopResumeCase.from_dict(line)
+
+
+def test_a_gate_that_could_never_fire_is_refused() -> None:
+    """`failpoint_tool` names a tool the task has to actually call.
+
+    Otherwise the gate never fires, and the run is recorded as a failed recovery
+    for a reason that has nothing to do with recovery -- the defect class this
+    suite exists to catch, and one that would be baked into the dataset."""
+    line = _line(scenario=_scenario(steps=[[{"tool": "Read", "input": {}}]]))
+    with pytest.raises(CaseParseError, match="could never fire"):
+        LoopResumeCase.from_dict(line)
+
+
+def test_an_instruction_two_failpoint_needs_a_second_instruction() -> None:
+    """The kill has to land somewhere. On a one-instruction task these arms have
+    nothing to stop in, and would report a failure for a reason unrelated to
+    recovery."""
+    line = _line(failpoint=AFTER_CHECKPOINT, failpoint_tool="")
+    with pytest.raises(CaseParseError, match="nothing for it to stop in"):
+        LoopResumeCase.from_dict(line)
+
+
+def test_step_lists_must_match_the_instruction_count() -> None:
+    with pytest.raises(CaseParseError, match="step lists"):
+        LoopResumeCase.from_dict(
+            _line(scenario=_scenario(followups=["and then"]))
+        )
+
+
+def test_a_scenario_needs_at_least_one_artifact() -> None:
+    """With no artifacts the journal digests nothing, `den` is zero on every arm,
+    and no run can fail on a duplicated execution. That is the shape of a number
+    that means nothing, so it is refused at load time rather than reported."""
+    with pytest.raises(CaseParseError, match="artifacts"):
+        LoopResumeCase.from_dict(_line(scenario=_scenario(artifacts=[])))
+
+
+def test_a_scenario_needs_a_workspace_test() -> None:
+    """It is a different question from the case's checks: not "did the checks
+    pass" but "is the repository still working"."""
+    with pytest.raises(CaseParseError, match="workspace_test"):
+        LoopResumeCase.from_dict(_line(scenario=_scenario(workspace_test={})))
+
+
+def test_a_step_without_a_tool_or_input_is_refused() -> None:
+    with pytest.raises(CaseParseError, match="tool"):
+        LoopResumeCase.from_dict(_line(scenario=_scenario(steps=[[{"input": {}}]])))
+    with pytest.raises(CaseParseError, match="input"):
+        LoopResumeCase.from_dict(_line(scenario=_scenario(steps=[[{"tool": "Read"}]])))
+
+
+def test_expand_case_keeps_the_scenario() -> None:
+    """The repeats are runs of the SAME task. Dropping the scenario on expansion
+    would make every repeat fail at spec-build time -- or worse, not."""
+    case = LoopResumeCase.from_dict(_line(repeat=2))
+    expanded = expand_case(case)
+    assert all(c.scenario == case.scenario for c in expanded)
 
 
 def test_task_must_name_the_cwd_placeholder() -> None:
@@ -198,3 +282,51 @@ def test_loader_rejects_a_foreign_case_type(tmp_path: Path) -> None:
     path.write_text('{"id":"a","type":"e2e","task":"t","checks":[]}\n', encoding="utf-8")
     with pytest.raises(CaseParseError, match="unknown case type"):
         load_loop_resume_cases(path, fixtures_root=tmp_path)
+
+
+# --- dataset-level shape, now that the scenario is data rather than code ---
+
+
+def test_every_dataset_case_carries_a_scenario() -> None:
+    for case in load_loop_resume_cases(DATASET):
+        assert case.scenario is not None, case.id
+        assert case.scenario.artifacts, case.id
+        assert case.scenario.steps[0], case.id
+
+
+def test_the_after_tool_arm_gates_on_the_step_whose_side_effect_gets_replayed() -> None:
+    """The `after_tool` arm gates on Bash, and the FIRST Bash is the append, so
+    the killer leg's only state-changing execution is the append itself -- exactly
+    the side effect the resumed leg used to replay.
+
+    If someone reorders the sequence so a read-only command comes first, the
+    denominator drops to zero and the metric silently measures nothing while still
+    reporting 10/10. This is the assertion that stands between those two.
+    """
+    case = cases_by_failpoint(load_loop_resume_cases(DATASET))["after_tool"][0]
+    assert case.scenario is not None
+    steps = list(case.scenario.steps[0])
+    tools = [str(s["tool"]) for s in steps]
+    assert tools[0] == "Read", "a read must not be the gated step"
+    first_bash = tools.index("Bash")
+    assert ">>" in str(steps[first_bash]["input"]["command"]), (
+        "the gated Bash call has to be the one that changes a file"
+    )
+    assert "Edit" in tools
+
+
+def test_the_artifacts_cover_every_file_the_scenario_mutates() -> None:
+    """The journal digests the declared artifacts only. A file the scenario writes
+    but does not declare is invisible to every side-effect metric -- the run would
+    look clean because nothing was being watched."""
+    for case in load_loop_resume_cases(DATASET):
+        assert case.scenario is not None
+        declared = set(case.scenario.artifacts)
+        for group in case.scenario.steps:
+            for step in group:
+                tool = str(step["tool"])
+                target = str(
+                    step["input"].get("file_path") or step["input"].get("path") or ""
+                )
+                if tool in ("Edit", "Write") and target:
+                    assert target in declared, f"{case.id}: {target} is not an artifact"

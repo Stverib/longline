@@ -80,6 +80,21 @@ PARENT_FAILPOINTS: tuple[str, ...] = (
 )
 ALL_FAILPOINTS: tuple[str, ...] = GATED_FAILPOINTS + PARENT_FAILPOINTS
 
+# The failpoints whose stop lands inside a task's SECOND instruction, so the
+# first must complete and be persisted before the gate is even armed.
+#
+# It lives here, with the vocabulary, rather than in the worker that acts on it:
+# the dataset loader needs the same fact to refuse a case that declares this
+# failpoint on a one-instruction task, and two copies of it would drift into a
+# case that can never fire.
+#
+# `truncate_tail` is here for a reason found by testing rather than by design:
+# the turn-0 checkpoint is ONE line, so cutting its last line leaves nothing at
+# all and `load_session` returns None -- there is no resume to test. With
+# instruction 1 on disk the file has many lines, the torn one is dropped, and what
+# the arm actually exercises becomes visible.
+STOPS_IN_INSTRUCTION_TWO: tuple[str, ...] = (AFTER_CHECKPOINT, TRUNCATE_TAIL)
+
 
 class FailpointError(RuntimeError):
     """The failpoint could not be armed as specified (a wiring bug, not a result)."""

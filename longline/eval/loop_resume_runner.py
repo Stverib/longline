@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 
 from longline.eval.failpoints import (
     ALL_FAILPOINTS,
+    STOPS_IN_INSTRUCTION_TWO,
     TRUNCATE_TAIL,
     WORKSPACE_DRIFT,
     WORKSPACE_DRIFT_UNRELATED,
@@ -71,12 +72,7 @@ from longline.eval.judges import judge_case
 from longline.eval.leg_cost import COST_FIELDS, LegCost, mean_cost
 from longline.eval.leg_cost import saving as saving_ratio
 from longline.eval.loop_resume import SEED_A_PLACEHOLDER, SEED_B_PLACEHOLDER, SEED_PLACEHOLDER
-from longline.eval.loop_resume_worker import (
-    ARTIFACT_PATHS,
-    JOURNAL_NAME,
-    SESSION_ID,
-    STOPS_IN_INSTRUCTION_TWO,
-)
+from longline.eval.loop_resume_worker import JOURNAL_NAME, SESSION_ID
 from longline.eval.metrics import Ratio
 from longline.eval.side_effect_journal import (
     SideEffectMetrics,
@@ -87,7 +83,7 @@ from longline.eval.side_effect_journal import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from longline.eval.loop_resume import LoopResumeCase
+    from longline.eval.loop_resume import LoopResumeCase, Scenario
 
 # The failpoints whose result is a DETECTION, not a recovery. Kept separate so
 # the headline rate cannot be moved by a capability that answers a different
@@ -454,9 +450,9 @@ def restart_vs_resume(runs: Sequence[LoopResumeRun]) -> RestartVsResume:
 
 # --- the parent's own actions ---
 
-def _snapshot_artifacts(sandbox: Path) -> dict[str, str]:
-    """Digest the declared artifacts, in `GatedTool.snapshot_artifacts`'s shape."""
-    return {rel: sha256_file(sandbox / rel) for rel in ARTIFACT_PATHS}
+def _snapshot_artifacts(sandbox: Path, artifacts: Sequence[str]) -> dict[str, str]:
+    """Digest the case's declared artifacts, in `GatedTool.snapshot_artifacts`'s shape."""
+    return {rel: sha256_file(sandbox / rel) for rel in artifacts}
 
 
 def apply_seed(sandbox: Path, seed: int) -> None:
@@ -665,6 +661,21 @@ def kill_armed_child(
 # --- one case ---
 
 
+def _scenario_of(case: LoopResumeCase) -> Scenario:
+    """The case's scenario, or a loud failure.
+
+    A run that reached the worker without one would be running some other task
+    under this case's name, and nothing in the metrics could tell: the failpoint
+    would fire, the layers would pass, and the row would be about a different job.
+    """
+    if case.scenario is None:
+        raise FailpointError(
+            f"{case.id}: no scenario. The case's tool sequence travels with the case, "
+            "and a run without one would silently be some other task"
+        )
+    return case.scenario
+
+
 def _build_spec(
     case: LoopResumeCase,
     *,
@@ -673,6 +684,7 @@ def _build_spec(
     api_key: str,
     durability: bool = True,
 ) -> dict[str, Any]:
+    scenario = _scenario_of(case)
     return {
         "claude_dir": str(claude_dir),
         "sandbox": str(sandbox),
@@ -683,6 +695,10 @@ def _build_spec(
         "api_key": api_key,
         "model": "offline-model",
         "task": case.task.replace("<cwd>", sandbox.as_posix()),
+        # The case's own instructions, tool sequence, artifacts and workspace
+        # test. The sandbox is substituted here, once, rather than in the worker:
+        # two places resolving the same placeholder would eventually disagree.
+        "scenario": scenario.to_spec(sandbox),
         "max_turns": case.max_turns,
         # The ablation switch. Off means the runtime records nothing: no step
         # checkpoint, no operation journal, no workspace header. See
@@ -705,6 +721,7 @@ async def run_loop_resume_case(
     claude_dir = Path(tempfile.mkdtemp(prefix=CLAUDE_DIR_PREFIX))
     sandbox = Path(tempfile.mkdtemp(prefix=SANDBOX_PREFIX))
     notes: list[str] = []
+    scenario = _scenario_of(case)
     try:
         if case.fixture:
             shutil.copytree(fixtures_dir / case.fixture, sandbox, dirs_exist_ok=True)
@@ -719,7 +736,7 @@ async def run_loop_resume_case(
         )
         spec_path = claude_dir / "spec.json"
         spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
-        before = _snapshot_artifacts(sandbox)
+        before = _snapshot_artifacts(sandbox, scenario.artifacts)
 
         # --- steps 2 and 3: arm in a child, wait for the sentinel, kill it ---
         killed = kill_armed_child(claude_dir, spec_path=spec_path, python=python)
@@ -747,9 +764,9 @@ async def run_loop_resume_case(
         # --- step 6: the journal comparison and the four layers ---
         entries = read_journal(claude_dir / JOURNAL_NAME)
         metrics = compute_side_effect_metrics(entries)
-        after = _snapshot_artifacts(sandbox)
+        after = _snapshot_artifacts(sandbox, scenario.artifacts)
         judge_ok, judge_detail = _judge_case_checks(case, sandbox)
-        workspace_ok = bool(judge_case("python_test", sandbox, WORKSPACE_TEST_ARGS))
+        workspace_ok = bool(judge_case("python_test", sandbox, scenario.workspace_test))
         tool_errors = [str(e) for e in resumed.get("tool_errors", [])]
 
         # --- step 7: the restart baseline, if this cell asks for one ---

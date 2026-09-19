@@ -174,18 +174,30 @@ def test_apply_seed_makes_two_runs_start_from_different_fixtures(tmp_path: Path)
 
 def test_apply_seed_leaves_the_scenarios_edit_target_intact(tmp_path: Path) -> None:
     """The Edit's `old_string` must survive seeding, or the arm's fix step
-    silently stops applying and the duplicate metric measures the wrong tool."""
+    silently stops applying and the duplicate metric measures the wrong tool.
+
+    Read from the DATASET's scenario rather than from a copy: the Edit's target
+    now lives in the case, and a copy here would keep passing after the dataset
+    changed to a different file.
+    """
     import shutil
 
+    from longline.eval.loop_resume import cases_by_failpoint, load_loop_resume_cases
     from longline.eval.loop_resume_runner import apply_seed
-    from longline.eval.loop_resume_worker import SCENARIO_ONE
 
     sandbox = tmp_path / "s"
     shutil.copytree(FIXTURES / "resume_repo", sandbox)
     apply_seed(sandbox, 3)
     calc = (sandbox / "src" / "calc.py").read_text(encoding="utf-8")
-    old_string = SCENARIO_ONE[2]["input"]["old_string"]
-    assert old_string in calc
+    case = cases_by_failpoint(load_loop_resume_cases(DATASET))["after_tool"][0]
+    assert case.scenario is not None
+    edits = [
+        step
+        for step in case.scenario.steps[0]
+        if step["tool"] == "Edit" and step["input"].get("file_path") == "src/calc.py"
+    ]
+    assert edits, "the scenario no longer edits src/calc.py"
+    assert str(edits[0]["input"]["old_string"]) in calc
 
 
 def test_apply_seed_keeps_the_fixtures_test_failing_before_the_fix(tmp_path: Path) -> None:

@@ -24,7 +24,13 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from longline.eval.failpoints import AFTER_TOOL, ALL_FAILPOINTS, BEFORE_TOOL, GATED_FAILPOINTS
+from longline.eval.failpoints import (
+    AFTER_TOOL,
+    ALL_FAILPOINTS,
+    BEFORE_TOOL,
+    GATED_FAILPOINTS,
+    STOPS_IN_INSTRUCTION_TWO,
+)
 from longline.eval.types import CaseParseError, E2ECase
 
 if TYPE_CHECKING:
@@ -53,6 +59,128 @@ FIXTURE_SEED_PLACEHOLDERS: tuple[str, ...] = (
     SEED_B_PLACEHOLDER,
 )
 
+# What the model says once the scripted sequence runs out. The empty string is
+# what the sequence has always defaulted to, and it is the right default for any
+# task whose deliverable is a FILE rather than an answer. A task whose deliverable
+# IS the answer -- a read-only analysis, say -- has to set this explicitly, or its
+# transcript ends with the model saying nothing.
+DEFAULT_ANSWER = ""
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """The scripted agent behaviour for one case, as data.
+
+    Item 6 moved this out of `loop_resume_worker`, and the reason is about
+    evidence rather than tidiness. While the tool sequence was a module constant,
+    every arm of every case ran the same three steps against the same fixture, so
+    "the runtime recovered" could only ever be a statement about one script. A
+    scenario per case is what makes a failpoint matrix a matrix.
+
+    `steps[0]` is instruction 1's tool sequence and `steps[i]` belongs to
+    `followups[i - 1]`. Instruction 1's TEXT is the case's own `task`, so it is
+    not repeated here -- there is no way for the two to disagree.
+
+    `artifacts` is what the side-effect journal digests before and after every
+    execution, and `workspace_test` is the fixture's own test suite, which is how
+    the workspace layer asks "is this repository still working" rather than "did
+    the checks pass".
+    """
+
+    followups: tuple[str, ...]
+    steps: tuple[tuple[dict[str, Any], ...], ...]
+    artifacts: tuple[str, ...]
+    workspace_test: dict[str, Any]
+    answer: str = DEFAULT_ANSWER
+
+    def __post_init__(self) -> None:
+        if len(self.steps) != len(self.followups) + 1:
+            raise CaseParseError(
+                f"a scenario with {len(self.followups)} follow-up instruction(s) needs "
+                f"{len(self.followups) + 1} step lists, got {len(self.steps)}"
+            )
+        # Two is what the kill/resume choreography implements: the arm stops in
+        # instruction 2 and the resume re-supplies instruction 2. A third would be
+        # silently ignored rather than rejected, so it is rejected here instead.
+        if len(self.followups) > 1:
+            raise CaseParseError(
+                f"a scenario supports one follow-up instruction, got {len(self.followups)}"
+            )
+
+    @property
+    def instruction_count(self) -> int:
+        """How many user instructions this task is, in total."""
+        return len(self.steps)
+
+    def to_spec(self, sandbox: object) -> dict[str, Any]:
+        """The scenario as the worker receives it, with the sandbox resolved.
+
+        Resolved here and not in the worker for the same reason `spec['task']` is:
+        the working directory is a fresh temp dir known only to the parent, and
+        two places doing the substitution would eventually disagree about it.
+        """
+        root = str(sandbox).replace("\\", "/")
+        return {
+            "followups": [text.replace(CWD_PLACEHOLDER, root) for text in self.followups],
+            "steps": [[dict(step) for step in group] for group in self.steps],
+            "artifacts": list(self.artifacts),
+            "workspace_test": dict(self.workspace_test),
+            "answer": self.answer,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any], *, case_id: str) -> Scenario:
+        raw_followups = d.get("followups", [])
+        if not isinstance(raw_followups, list) or not all(
+            isinstance(x, str) and x for x in raw_followups
+        ):
+            raise CaseParseError(f"{case_id}: scenario 'followups' must be a list of strings")
+
+        raw_steps = d.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise CaseParseError(f"{case_id}: scenario 'steps' must be a non-empty list")
+        steps: list[tuple[dict[str, Any], ...]] = []
+        for index, group in enumerate(raw_steps):
+            if not isinstance(group, list) or not group:
+                raise CaseParseError(
+                    f"{case_id}: scenario steps[{index}] must be a non-empty list"
+                )
+            parsed: list[dict[str, Any]] = []
+            for step in group:
+                if not isinstance(step, dict):
+                    raise CaseParseError(f"{case_id}: every step must be an object")
+                tool = step.get("tool")
+                if not isinstance(tool, str) or not tool:
+                    raise CaseParseError(f"{case_id}: every step needs a 'tool' name")
+                if not isinstance(step.get("input"), dict):
+                    raise CaseParseError(f"{case_id}: step {tool!r} needs an 'input' object")
+                parsed.append({"tool": tool, "input": dict(step["input"])})
+            steps.append(tuple(parsed))
+
+        raw_artifacts = d.get("artifacts")
+        if not isinstance(raw_artifacts, list) or not raw_artifacts:
+            raise CaseParseError(
+                f"{case_id}: scenario 'artifacts' must be a non-empty list; with none, "
+                "every side-effect metric has a denominator of zero and the case "
+                "cannot fail on a duplicated execution"
+            )
+
+        workspace_test = d.get("workspace_test")
+        if not isinstance(workspace_test, dict) or not workspace_test:
+            raise CaseParseError(
+                f"{case_id}: scenario 'workspace_test' must be a non-empty object; it is "
+                "the fixture's own test suite, which is a different question from the "
+                "case's checks"
+            )
+
+        return cls(
+            followups=tuple(str(x) for x in raw_followups),
+            steps=tuple(steps),
+            artifacts=tuple(str(x) for x in raw_artifacts),
+            workspace_test=dict(workspace_test),
+            answer=str(d.get("answer", DEFAULT_ANSWER)),
+        )
+
 
 @dataclass
 class LoopResumeCase(E2ECase):
@@ -67,6 +195,7 @@ class LoopResumeCase(E2ECase):
     failpoint_tool: str = ""
     repeat: int = 1
     seed: int = 0
+    scenario: Scenario | None = None
 
     def run_id(self, index: int) -> str:
         """The id of repeat `index`. The index IS the seed, so nothing else is stored."""
@@ -103,6 +232,32 @@ class LoopResumeCase(E2ECase):
                 "the real path is a fresh temp dir known only at run time"
             )
 
+        raw_scenario = d.get("scenario")
+        if not isinstance(raw_scenario, dict):
+            raise CaseParseError(
+                f"{base.id}: a loop_resume case requires a 'scenario'. The tool sequence "
+                "used to be a module constant, which made every case in the suite the "
+                "same task with a different place to die -- a matrix with one row"
+            )
+        scenario = Scenario.from_dict(raw_scenario, case_id=base.id)
+
+        # The gate can only fire on a tool the task actually calls. A case whose
+        # failpoint can never fire reports a failed recovery for a reason that has
+        # nothing to do with recovery, which is the defect class this suite exists
+        # to catch -- and here it would be baked into the dataset.
+        instruction_one_tools = {str(step["tool"]) for step in scenario.steps[0]}
+        if failpoint in TOOL_NAMED_FAILPOINTS and tool not in instruction_one_tools:
+            raise CaseParseError(
+                f"{base.id}: failpoint_tool {tool!r} is not among instruction 1's tools "
+                f"({sorted(instruction_one_tools)}); the gate could never fire"
+            )
+        if failpoint in STOPS_IN_INSTRUCTION_TWO and scenario.instruction_count < 2:
+            raise CaseParseError(
+                f"{base.id}: failpoint {failpoint!r} stops inside instruction 2, but the "
+                f"scenario declares {scenario.instruction_count} instruction(s) -- there "
+                "is nothing for it to stop in"
+            )
+
         repeat = d.get("repeat", 1)
         if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
             raise CaseParseError(f"{base.id}: repeat must be an int >= 1, got {repeat!r}")
@@ -119,6 +274,7 @@ class LoopResumeCase(E2ECase):
             failpoint=failpoint,
             failpoint_tool=tool,
             repeat=repeat,
+            scenario=scenario,
         )
 
 
@@ -151,6 +307,7 @@ def expand_case(case: LoopResumeCase) -> list[LoopResumeCase]:
             failpoint_tool=case.failpoint_tool,
             repeat=1,
             seed=i,
+            scenario=case.scenario,
         )
         for i in range(case.repeat)
     ]

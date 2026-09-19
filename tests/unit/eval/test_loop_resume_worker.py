@@ -15,19 +15,32 @@ from longline.eval.failpoints import (
     BEFORE_TOOL,
     read_sentinel,
 )
+from longline.eval.loop_resume import cases_by_failpoint, load_loop_resume_cases
 from longline.eval.loop_resume_worker import (
-    ARTIFACT_PATHS,
-    SCENARIO_ONE,
-    SCENARIO_TWO,
+    Plan,
     ScriptedToolSequence,
     arm,
-    instruction_offset,
     settled_steps,
 )
 from longline.eval.side_effect_journal import KILLED, RESUMED, read_journal
 
 FIXTURE = Path("evals/fixtures/resume_repo")
+DATASET = Path("evals/loop_resume.jsonl")
 TASK = 'In {cwd}: fix the bug in src/calc.py and append a line containing "fixed-add" to NOTES.md.'
+
+
+def _canonical_scenario(sandbox: Path) -> dict[str, Any]:
+    """The DATASET's scenario for this task, resolved the way the runner does.
+
+    Not a copy written out here. These tests drive the real worker, and the
+    scenario is now data the dataset owns -- a second copy in this file would be
+    free to drift from the thing production actually runs, and the tests would
+    keep passing while the suite ran something else.
+    """
+    cases = cases_by_failpoint(load_loop_resume_cases(DATASET))
+    scenario = cases["after_tool"][0].scenario
+    assert scenario is not None
+    return scenario.to_spec(sandbox)
 
 
 def _drain(agen: Any) -> list[Any]:
@@ -107,6 +120,7 @@ def _spec(tmp_path: Path, sandbox: Path, failpoint: str, **overrides: Any) -> di
         "api_key": "offline",
         "model": "offline-model",
         "task": TASK.format(cwd=sandbox.as_posix()),
+        "scenario": _canonical_scenario(sandbox),
         "no_block": True,
     }
     spec.update(overrides)
@@ -154,29 +168,36 @@ def test_scripted_sequence_honours_the_offset() -> None:
     assert starts[0].tool_id == "tu-4", "tool ids must stay unique across instructions"
 
 
-def test_scenario_one_gates_on_the_step_whose_side_effect_gets_replayed() -> None:
-    """The after_tool arm gates on Bash, and the FIRST Bash is the append. So
-    the killed leg's only state-changing execution is the append itself --
-    exactly the side effect the resumed leg replays. If someone reorders the
-    sequence so a read-only command comes first, the denominator drops to zero
-    and the metric silently measures nothing."""
-    tools = [s["tool"] for s in SCENARIO_ONE]
-    assert tools[0] == "Read", "a read must not be the gated step"
-    first_bash = tools.index("Bash")
-    assert ">>" in SCENARIO_ONE[first_bash]["input"]["command"]
-    assert "Edit" in tools
+def test_the_plan_reads_the_dataset_scenario_and_resolves_its_offsets() -> None:
+    """`offset_for(1)` is how many tool_use blocks instruction 1 contributes.
+
+    Instruction 2's sequence needs it: after instruction 1 the transcript already
+    carries that many, and without it the model would read instruction 1's tool
+    uses as its own progress and answer without doing anything.
+    """
+    spec = {
+        "task": "one",
+        "scenario": {
+            "followups": ["two"],
+            "steps": [[{"tool": "Read", "input": {}}], [{"tool": "Write", "input": {}}]],
+            "artifacts": ["NOTES.md"],
+        },
+    }
+    plan = Plan.from_spec(spec)
+    assert plan.instructions == ["one", "two"]
+    assert plan.offset_for(0) == 0
+    assert plan.offset_for(1) == 1
 
 
-def test_scenario_two_is_a_single_write() -> None:
-    assert [s["tool"] for s in SCENARIO_TWO] == ["Write"]
+def test_a_spec_without_a_scenario_is_refused() -> None:
+    """Falling back to a built-in scenario would run some other task under this
+    case's name, and every metric here would still say the run was fine."""
+    import pytest
 
+    from longline.eval.failpoints import FailpointError
 
-def test_instruction_offset_is_scenario_one_length() -> None:
-    assert instruction_offset() == len(SCENARIO_ONE) == 3
-
-
-def test_artifact_paths_cover_every_mutated_file() -> None:
-    assert set(ARTIFACT_PATHS) == {"NOTES.md", "src/calc.py", "REPORT.md"}
+    with pytest.raises(FailpointError, match="no scenario"):
+        Plan.from_spec({"task": "one"})
 
 
 # --- the arm phase ---
