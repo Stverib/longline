@@ -491,6 +491,202 @@ MODIFICATION_SPECS: tuple[ModificationSpec, ...] = (
 )
 
 
+# --- the six dependent cases -------------------------------------------------
+
+DEPENDENT_ROLLOUT_TEMPLATE = """# Rollout checklist
+
+Four sign-off sections, each with the owner accountable for it:
+
+| section | owner |
+|---|---|
+| design reviewed | alice |
+| tests green | bob |
+| rollback rehearsed | carol |
+| owner assigned | alice |
+"""
+
+
+@dataclass(frozen=True)
+class DependentSpec:
+    """One `dependent` case: a serial chain whose steps consume each other.
+
+    Every step but the first writes a path an earlier step already wrote, which
+    is what makes the chain a chain rather than a fan-out with an order
+    attached. The loader allows that overlap for this category alone.
+
+    The owners are fixed by the fixture rather than chosen by the model, so the
+    final artifacts have exactly one correct answer and the judges can assert
+    it. A chain whose intermediate values were free would only be gradeable by
+    a judge that reimplemented the task.
+    """
+
+    case_id: str
+    repo_name: str
+
+    @property
+    def owners(self) -> tuple[str, ...]:
+        return ("alice", "bob", "carol")
+
+    @property
+    def task(self) -> str:
+        return (
+            f"Work through the {self.repo_name} rollout checklist one step at a "
+            "time. Each step depends on the artifact the previous step wrote: "
+            "extract the four sign-off sections, attach each section's owner, "
+            "count the sections per owner, then write the summary. Do not skip "
+            "ahead."
+        )
+
+    @property
+    def hidden_test_path(self) -> str:
+        return f"{PAIR_SUBDIR}/{self.case_id}_hidden/test_hidden.py"
+
+    @property
+    def steps(self) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+        """`(id, instruction, writes)` per step, in chain order."""
+        return (
+            (
+                "s1",
+                "Read notes/rollout.md and write out/notes/checklist.json as a "
+                'JSON object with one key per section, each value {"section": '
+                '<name>}.',
+                ("out/notes/checklist.json",),
+            ),
+            (
+                "s2",
+                "Read out/notes/checklist.json and notes/rollout.md, then rewrite "
+                "out/notes/checklist.json adding an \"owner\" field to each entry.",
+                ("out/notes/checklist.json",),
+            ),
+            (
+                "s3",
+                "Read out/notes/checklist.json and write out/notes/owners.json "
+                "mapping each owner to the number of sections they own.",
+                ("out/notes/owners.json",),
+            ),
+            (
+                "s4",
+                "Read out/notes/owners.json and write out/notes/summary.md naming "
+                "every owner and their count.",
+                ("out/notes/summary.md",),
+            ),
+        )
+
+
+def build_dependent_fixture(root: Path, spec: DependentSpec) -> None:
+    """Write one dependent fixture tree: a README and the annotated checklist.
+
+    The tree carries the SOURCE facts (sections and their owners) but none of
+    the artifacts the chain produces, so a judge asserting the final state is
+    asserting work rather than a copy of the fixture.
+    """
+    notes_dir = root / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    (root / "README.md").write_text(
+        README_TEMPLATE.format(
+            repo=spec.repo_name,
+            count=4,
+            rows="\n".join(
+                f"| `{name}` | `notes/{name}.md` |" for name in spec.owners
+            ),
+        ),
+        encoding="utf-8",
+    )
+    (notes_dir / "rollout.md").write_text(
+        DEPENDENT_ROLLOUT_TEMPLATE, encoding="utf-8"
+    )
+
+
+def _dependent_case(spec: DependentSpec) -> dict[str, Any]:
+    """One dependent case in the loader's on-disk shape."""
+    out_dir = "out/notes"
+    subtasks = []
+    for index, (sid, instruction, writes) in enumerate(spec.steps):
+        entry: dict[str, Any] = {
+            "id": sid,
+            "instruction": instruction,
+            "writes": writes[0],
+        }
+        if index:
+            entry["depends_on"] = [spec.steps[index - 1][0]]
+        subtasks.append(entry)
+    return {
+        "type": "multi_agent",
+        "id": spec.case_id,
+        "task": spec.task,
+        "group": "controlled",
+        "category": "dependent",
+        "workers": 1,
+        "subtasks": subtasks,
+        "merge": "write_required",
+        "merge_file": f"{out_dir}/manifest.txt",
+        "hidden_test": spec.hidden_test_path,
+        "fixture_single": f"pair/{spec.case_id}_single",
+        "fixture_multi": f"pair/{spec.case_id}_multi",
+        "max_turns": 16,
+        "tags": ["pair", "dependent", "serial-chain"],
+        "checks": [
+            {"fn": "file_exists", "args": {"path": f"{out_dir}/checklist.json"}},
+            {"fn": "file_exists", "args": {"path": f"{out_dir}/owners.json"}},
+            {"fn": "file_exists", "args": {"path": f"{out_dir}/summary.md"}},
+            {"fn": "python_test", "args": {
+                "command": ["python", "-m", "pytest", "test_hidden.py", "-q"],
+                "allowed_commands": ["python"],
+                "interpreter": "python",
+                "timeout_s": 120,
+            }},
+        ],
+    }
+
+
+DEPENDENT_SPECS: tuple[DependentSpec, ...] = (
+    DependentSpec(case_id="pd-001", repo_name="release-ops"),
+    DependentSpec(case_id="pd-002", repo_name="compliance-review"),
+    DependentSpec(case_id="pd-003", repo_name="incident-followup"),
+    DependentSpec(case_id="pd-004", repo_name="migration-plan"),
+    DependentSpec(case_id="pd-005", repo_name="vendor-onboarding"),
+    DependentSpec(case_id="pd-006", repo_name="quarterly-audit"),
+)
+
+DEPENDENT_HIDDEN_TEST = '''"""Hidden judge for a dependent chain: the final artifacts must agree.
+
+Generated from the same fixture template that wrote `notes/rollout.md`, so the
+expected owners cannot drift from the source the chain reads. Asserting the
+COUNTS rather than only the names is what distinguishes a chain that carried
+values forward from one that invented plausible ones: `alice` owns two sections
+and the other two own one each, and a summary that says so had to have counted.
+"""
+
+import json
+from pathlib import Path
+
+EXPECTED_COUNTS = {"alice": 2, "bob": 1, "carol": 1}
+
+
+def test_checklist_carries_every_section_and_its_owner():
+    entries = json.loads(Path("out/notes/checklist.json").read_text(encoding="utf-8"))
+    owners = {
+        entry["owner"] for entry in entries.values()
+        if isinstance(entry, dict) and "owner" in entry
+    }
+    assert owners == set(EXPECTED_COUNTS), (
+        "checklist.json must carry an owner for every section; step two added "
+        "these, so a missing one means the chain did not carry forward"
+    )
+
+
+def test_owners_are_counted_not_guessed():
+    counts = json.loads(Path("out/notes/owners.json").read_text(encoding="utf-8"))
+    assert counts == EXPECTED_COUNTS
+
+
+def test_summary_names_every_owner():
+    summary = Path("out/notes/summary.md").read_text(encoding="utf-8")
+    for owner in EXPECTED_COUNTS:
+        assert owner in summary, f"summary.md never mentions {{owner}}"
+'''
+
+
 # --- case emission -----------------------------------------------------------
 
 
@@ -601,6 +797,7 @@ def _cases() -> list[dict[str, Any]]:
     return [
         *[_analysis_case(spec) for spec in ANALYSIS_SPECS],
         *[_modification_case(spec) for spec in MODIFICATION_SPECS],
+        *[_dependent_case(spec) for spec in DEPENDENT_SPECS],
     ]
 
 
@@ -631,6 +828,16 @@ def generate(out_root: Path = DEFAULT_OUT) -> GeneratedCorpus:
                 modules=[m.name for m in mod_spec.modules],
             ),
             encoding="utf-8",
+        )
+    for dep_spec in DEPENDENT_SPECS:
+        for side in ("single", "multi"):
+            build_dependent_fixture(
+                fixtures / PAIR_SUBDIR / f"{dep_spec.case_id}_{side}", dep_spec,
+            )
+        hidden_dir = fixtures / PAIR_SUBDIR / f"{dep_spec.case_id}_hidden"
+        hidden_dir.mkdir(parents=True, exist_ok=True)
+        (hidden_dir / "test_hidden.py").write_text(
+            DEPENDENT_HIDDEN_TEST, encoding="utf-8",
         )
 
     cases_file = out_root / CASES_NAME

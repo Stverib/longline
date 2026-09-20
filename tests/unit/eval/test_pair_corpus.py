@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import itertools
+import json
 import shutil
 import subprocess
 import sys
@@ -29,8 +31,10 @@ from typing import Any
 
 from longline.eval.multi_agent import (
     CATEGORY_ANALYSIS,
+    CATEGORY_DEPENDENT,
     CATEGORY_MODIFICATION,
     assert_fixtures_identical,
+    chain_order,
     load_multi_agent_cases,
 )
 
@@ -245,6 +249,104 @@ class TestModificationCategory:
             assert proc.returncode == 0, (
                 f"{case.id}: the hidden test cannot be satisfied even by a "
                 f"correct implementation\n{proc.stdout}\n{proc.stderr}"
+            )
+
+
+class TestDependentCategory:
+    def test_there_are_six_dependent_cases(self, tmp_path: Path) -> None:
+        root = gen.generate(tmp_path)
+        cases = load_multi_agent_cases(
+            root.cases_file, fixtures_root=root.fixtures_dir
+        )
+
+        counts = Counter(c.category for c in cases)
+        assert counts[CATEGORY_DEPENDENT] == 6
+
+    def test_every_dependent_case_declares_a_total_order(self, tmp_path: Path) -> None:
+        """`chain_order` is the loader's own walk, run over the generated cases."""
+        root = gen.generate(tmp_path)
+        for case in _cases_in(root, CATEGORY_DEPENDENT):
+            order = chain_order(case.subtasks)
+            assert len(order) == len(case.subtasks), case.id
+            assert order[0].depends_on == (), case.id
+            for previous, current in itertools.pairwise(order):
+                assert current.depends_on == (previous.id,), case.id
+
+    def test_dependent_steps_actually_consume_each_other(self, tmp_path: Path) -> None:
+        """A chain whose steps do not touch the same path is not a chain.
+
+        Without this, the `dependent` category would be N independent subtasks
+        that happen to declare an order -- and it would measure the fan-out's
+        overhead while claiming to measure the handoff tax. The loader permits
+        overlapping writes for exactly this category, so the overlap is the
+        evidence that the category means anything.
+        """
+        root = gen.generate(tmp_path)
+        for case in _cases_in(root, CATEGORY_DEPENDENT):
+            targets = [s.writes for s in case.subtasks]
+            assert len(set(targets)) < len(targets), (
+                f"{case.id}: no two steps write the same path, so no step can "
+                "consume a predecessor's output"
+            )
+
+    def test_the_fixture_does_not_already_contain_the_answer(self, tmp_path: Path) -> None:
+        """The chain's artifacts must be WORK, not a copy of the fixture.
+
+        A fixture that shipped `out/notes/owners.json` would make every judge
+        pass before the agent ran, and the case would report a success rate
+        that is a property of the generator.
+        """
+        root = gen.generate(tmp_path)
+        for case in _cases_in(root, CATEGORY_DEPENDENT):
+            for side in ("single", "multi"):
+                tree = root.fixtures_dir / "pair" / f"{case.id}_{side}"
+                assert not (tree / "out").exists(), (
+                    f"{case.id}: the {side} fixture already contains out/"
+                )
+
+    def test_the_hidden_test_is_satisfied_by_a_correct_chain(self, tmp_path: Path) -> None:
+        """The judge must be PASSABLE, and the check is a written-out answer.
+
+        This is the half that a "fails on the untouched fixture" assertion
+        cannot see: a judge with an ImportError fails there too, and the case
+        would report 0% forever while looking like a hard task. The artifacts
+        written here are what a correct chain produces, and they are derived
+        from the fixture's own owner table rather than from the judge.
+        """
+        root = gen.generate(tmp_path)
+        for case in _cases_in(root, CATEGORY_DEPENDENT):
+            tree = root.fixtures_dir / "pair" / f"{case.id}_single"
+            out = tree / "out" / "notes"
+            out.mkdir(parents=True)
+            counts = {"alice": 2, "bob": 1, "carol": 1}
+            (out / "checklist.json").write_text(
+                json.dumps({
+                    f"section{i}": {"section": f"section {i}", "owner": owner}
+                    for i, owner in enumerate(
+                        ["alice", "bob", "carol", "alice"], start=1
+                    )
+                }),
+                encoding="utf-8",
+            )
+            (out / "owners.json").write_text(json.dumps(counts), encoding="utf-8")
+            (out / "summary.md").write_text(
+                "\n".join(f"- {owner}: {n}" for owner, n in counts.items()),
+                encoding="utf-8",
+            )
+
+            proc = _run_hidden_test(tree, root.fixtures_dir / case.hidden_test)
+            assert proc.returncode == 0, (
+                f"{case.id}: the dependent judge rejects a correct chain\n"
+                f"{proc.stdout}\n{proc.stderr}"
+            )
+
+    def test_the_hidden_test_fails_on_the_untouched_fixture(self, tmp_path: Path) -> None:
+        root = gen.generate(tmp_path)
+        for case in _cases_in(root, CATEGORY_DEPENDENT):
+            tree = root.fixtures_dir / "pair" / f"{case.id}_single"
+            proc = _run_hidden_test(tree, root.fixtures_dir / case.hidden_test)
+            assert proc.returncode != 0, (
+                f"{case.id}: the dependent judge passes with no work done"
             )
 
 

@@ -59,6 +59,7 @@ from longline.eval.multi_agent import (
     CATEGORY_DEPENDENT,
     CATEGORY_MODIFICATION,
     CONTROLLED,
+    DEPENDENT_WORKERS,
     EXPLORATORY,
     MULTI,
     SINGLE,
@@ -868,26 +869,45 @@ class TestCategoryAxis:
         """A constant in `CATEGORIES` that the loader rejects is a dead branch."""
         for category in CATEGORIES:
             case = MultiAgentCase.from_dict(
-                _case_dict(category=category, subtasks=_subtasks_for(category))
+                _case_dict(**_category_overrides(category))
             )
             assert case.category == category
 
     def test_group_and_category_are_independent(self) -> None:
         """Four combinations, all valid -- the axes do not constrain each other.
 
-        Note what this test does NOT claim: that one subtask list is legal in
-        every category. `dependent` requires a total order and the others
-        require the absence of one, so the list has to move with the category.
-        That mutual exclusion is the loader's actual shape, and hiding it here
-        would make this test assert something false.
+        Note what this test does NOT claim: that one subtask list, or one
+        `workers` value, is legal in every category. `dependent` requires a
+        total order over overlapping writes and exactly one worker; the others
+        require the absence of both. That mutual exclusion is the loader's
+        actual shape, and hiding it here would make this test assert something
+        false.
         """
         for group in (CONTROLLED, EXPLORATORY):
             for category in CATEGORIES:
                 case = MultiAgentCase.from_dict(_case_dict(
-                    group=group, category=category,
-                    subtasks=_subtasks_for(category),
+                    group=group, **_category_overrides(category),
                 ))
                 assert (case.group, case.category) == (group, category)
+
+    def test_a_chain_must_declare_exactly_one_worker(self) -> None:
+        """`workers` is reported as the agent count, so a chain cannot claim 2.
+
+        A chain runs step N+1 only after step N has finished. Recording a higher
+        number would put a parallelism the case forbids into the run metadata,
+        where the report reads it back as if it were a measurement.
+        """
+        with pytest.raises(CaseParseError, match=r"workers|one teammate"):
+            MultiAgentCase.from_dict(_case_dict(
+                category=CATEGORY_DEPENDENT,
+                subtasks=_chain(("s1", "a.py"), ("s2", "a.py")),
+                workers=2,
+            ))
+
+    def test_a_non_chain_may_not_declare_one_worker(self) -> None:
+        """The rule cuts both ways: sub-two workers leaves nothing to fan out."""
+        with pytest.raises(CaseParseError, match="workers"):
+            MultiAgentCase.from_dict(_case_dict(workers=1))
 
 
 def _chain(*specs: tuple[str, str]) -> list[dict[str, Any]]:
@@ -922,8 +942,9 @@ class TestDependentChainValidation:
 
     def test_legal_chain_loads(self) -> None:
         case = MultiAgentCase.from_dict(_case_dict(
-            category=CATEGORY_DEPENDENT,
-            subtasks=_chain(("s1", "src/a.py"), ("s2", "src/a.py"), ("s3", "src/a.py")),
+            **_category_overrides(
+                CATEGORY_DEPENDENT, subtasks=_chain(("s1", "src/a.py"), ("s2", "src/a.py"), ("s3", "src/a.py")),
+            ),
         ))
 
         assert [s.id for s in case.subtasks] == ["s1", "s2", "s3"]
@@ -932,8 +953,9 @@ class TestDependentChainValidation:
 
     def test_chain_order_is_the_declared_order(self) -> None:
         case = MultiAgentCase.from_dict(_case_dict(
-            category=CATEGORY_DEPENDENT,
-            subtasks=_chain(("s1", "a.py"), ("s2", "a.py"), ("s3", "a.py")),
+            **_category_overrides(
+                CATEGORY_DEPENDENT, subtasks=_chain(("s1", "a.py"), ("s2", "a.py"), ("s3", "a.py")),
+            ),
         ))
 
         assert [s.id for s in chain_order(case.subtasks)] == ["s1", "s2", "s3"]
@@ -1066,7 +1088,7 @@ def _dependent_case(*, n_steps: int = 3, case_id: str = "ma-chain") -> MultiAgen
         task="Build the note up one step at a time",
         category=CATEGORY_DEPENDENT,
         subtasks=subtasks,
-        workers=2,
+        workers=DEPENDENT_WORKERS,
         merge_file=f"{dirname}/manifest.txt",
         fixture_single="parallel_repo_single",
         fixture_multi="parallel_repo_multi",
@@ -1240,6 +1262,27 @@ class TestDependentArmIsSerial:
             _cleanup(claude_dir)
 
         assert calls == ["serial"], "the multi arm must use the serial scheduler"
+
+
+def _category_overrides(
+    category: str, *, subtasks: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """The per-category fields that must agree with the category.
+
+    `workers` is not free alongside `subtasks`: a chain declares exactly one
+    worker, everything else declares two to four. Keeping the pairing in one
+    place means a test that varies the category does not have to know which
+    fields move with it -- and it cannot forget one.
+
+    `subtasks` may be overridden for a test that needs a specific list; the
+    `workers` value still comes from the category, which is the part that has to
+    agree with it.
+    """
+    return {
+        "category": category,
+        "subtasks": subtasks if subtasks is not None else _subtasks_for(category),
+        "workers": 1 if category == CATEGORY_DEPENDENT else 2,
+    }
 
 
 def _subtasks_for(category: str) -> list[dict[str, Any]]:

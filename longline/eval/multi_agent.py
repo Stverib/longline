@@ -92,6 +92,11 @@ CATEGORIES: tuple[str, ...] = (
     CATEGORY_DEPENDENT,
 )
 
+# The only `workers` value a `dependent` case may declare. Not a concurrency
+# limit -- a serial chain has none -- but the number the run metadata reports as
+# the agent count, and reporting 2 would claim a parallelism the case forbids.
+DEPENDENT_WORKERS = 1
+
 # Contract §5.6: "2~4 个子 Agent 并行执行". A controlled case must declare at
 # least two subtasks (below that there is nothing to fan out) and at most four
 # workers run concurrently. The upper bound is a contract number, not a
@@ -263,7 +268,18 @@ class MultiAgentCase(E2ECase):
         workers = d.get("workers", MIN_WORKERS)
         if isinstance(workers, bool) or not isinstance(workers, int):
             raise CaseParseError(f"{cid}: 'workers' must be an int, got {workers!r}")
-        if not MIN_WORKERS <= workers <= MAX_WORKERS:
+        if category == CATEGORY_DEPENDENT:
+            # A declared chain has no concurrency limit to declare: step N+1
+            # starts only after step N has finished, so the honest value is 1.
+            # Accepting 2..4 here would put a number in the run metadata that
+            # claims a parallelism the case forbids, and "agent count" is one of
+            # the fields the report reads.
+            if workers != DEPENDENT_WORKERS:
+                raise CaseParseError(
+                    f"{cid}: a {CATEGORY_DEPENDENT!r} case runs one teammate at a "
+                    f"time, so 'workers' must be {DEPENDENT_WORKERS}, got {workers}"
+                )
+        elif not MIN_WORKERS <= workers <= MAX_WORKERS:
             raise CaseParseError(
                 f"{cid}: 'workers' must be in [{MIN_WORKERS}, {MAX_WORKERS}] per "
                 f"contract §5.6, got {workers}"
