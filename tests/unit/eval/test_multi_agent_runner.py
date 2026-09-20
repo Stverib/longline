@@ -71,6 +71,7 @@ from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
     _apply_live_counting,
     _in_sandbox,
+    _spawn_workers_serial,
     aggregate_multi_agent,
     leader_prompt,
     merge_instruction,
@@ -78,6 +79,7 @@ from longline.eval.multi_agent_runner import (
     subtask_prompt,
 )
 from longline.models.messages import Usage
+from longline.session.task_registry import TaskRegistry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = PROJECT_ROOT / "evals" / "fixtures"
@@ -1037,6 +1039,206 @@ class TestDependentChainValidation:
                      "depends_on": ["s1", "s2"]},
                 ],
             ))
+
+
+def _dependent_case(*, n_steps: int = 3, case_id: str = "ma-chain") -> MultiAgentCase:
+    """A `dependent` case whose steps all write the same file, in order.
+
+    Overlapping writes are the category's shape rather than an oversight: each
+    step consumes what the previous one produced, so there is only one artifact
+    and it changes hands. The chain must be declared here rather than through
+    the loader, because a `MultiAgentCase` built directly never goes through
+    `_parse_subtasks`.
+    """
+    dirname = f"out/{case_id}"
+    subtasks = [
+        Subtask(
+            id=f"s{index}",
+            instruction=f"Extend the note (step {index})",
+            writes=f"{dirname}/note.md",
+            depends_on=() if index == 1 else (f"s{index - 1}",),
+        )
+        for index in range(1, n_steps + 1)
+    ]
+    return MultiAgentCase(
+        id=case_id,
+        task="Build the note up one step at a time",
+        category=CATEGORY_DEPENDENT,
+        subtasks=subtasks,
+        workers=2,
+        merge_file=f"{dirname}/manifest.txt",
+        fixture_single="parallel_repo_single",
+        fixture_multi="parallel_repo_multi",
+        max_turns=12,
+        tags=["multi-agent"],
+        checks=[{"fn": "file_exists", "args": {"path": f"{dirname}/manifest.txt"}}],
+    )
+
+
+class TestDependentArmIsSerial:
+    """`dependent` fans out one teammate at a time, in chain order.
+
+    Concurrency here would defeat the case: a chain exists to measure what a
+    fresh context per step costs, and running two steps at once makes them race
+    on the same file rather than hand work forward.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_step_spawns_only_after_its_predecessor_landed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The observable is the predecessor's ARTIFACT, not a call order.
+
+        A fake spawn returns immediately, so "was it awaited" is not visible
+        from the calls alone. What IS visible is whether the previous step's
+        file already existed when the next step started -- which is the
+        property the chain needs, and it fails for a concurrent implementation
+        whether or not that implementation happens to call spawn in order.
+        """
+        case = _dependent_case(n_steps=3)
+        sandbox = tmp_path / "sbx-chain"
+        sandbox.mkdir()
+        by_id = {s.id: s for s in case.subtasks}
+        prompt_to_subtask = {subtask_prompt(case, s): s for s in case.subtasks}
+        observed: list[tuple[str, bool]] = []
+
+        async def _fake_spawn(*args: Any, **kwargs: Any) -> str:
+            prompt = str(kwargs.get("prompt") or args[2])
+            subtask = prompt_to_subtask[prompt]
+            predecessor_landed = all(
+                (sandbox / by_id[pid].writes).exists()
+                for pid in subtask.depends_on
+            )
+            observed.append((subtask.id, predecessor_landed))
+            target = sandbox / subtask.writes
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"{subtask.id}\n", encoding="utf-8")
+            return subtask.id
+
+        monkeypatch.setattr("longline.swarm.spawn.spawn_teammate", _fake_spawn)
+
+        await _spawn_workers_serial(
+            case,
+            counted=None,
+            ledger=UsageLedger(),
+            registry=TaskRegistry(),
+            claude_dir=None,
+            spawned_ids=[],
+            sandbox=sandbox,
+            failures={},
+        )
+
+        assert [sid for sid, _ in observed] == ["s1", "s2", "s3"], "chain order"
+        assert all(landed for _, landed in observed), "s1 has no predecessor"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_step_does_not_stop_the_chain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stopping early would make "gave up" and "produced nothing" the same row.
+
+        The case's judges run against the final workspace, so a chain that dies
+        at step 2 has to look different from one that never started. Aborting
+        would erase that difference and charge the missing steps to the model.
+        """
+        case = _dependent_case(n_steps=3)
+        sandbox = tmp_path / "sbx-fail"
+        sandbox.mkdir()
+        prompt_to_subtask = {subtask_prompt(case, s): s for s in case.subtasks}
+        attempted: list[str] = []
+
+        async def _fake_spawn(*args: Any, **kwargs: Any) -> str:
+            prompt = str(kwargs.get("prompt") or args[2])
+            subtask = prompt_to_subtask[prompt]
+            attempted.append(subtask.id)
+            if subtask.id == "s2":
+                raise RuntimeError("step two exploded")
+            return subtask.id
+
+        monkeypatch.setattr("longline.swarm.spawn.spawn_teammate", _fake_spawn)
+
+        failures: dict[str, BaseException] = {}
+        await _spawn_workers_serial(
+            case,
+            counted=None,
+            ledger=UsageLedger(),
+            registry=TaskRegistry(),
+            claude_dir=None,
+            spawned_ids=[],
+            sandbox=sandbox,
+            failures=failures,
+        )
+
+        assert attempted == ["s1", "s2", "s3"], "step three must still be attempted"
+        assert list(failures) == ["worker2"], "the failure is recorded by agent name"
+
+    @pytest.mark.asyncio
+    async def test_every_step_gets_its_own_spawn_counter_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Serial does not mean unaccounted: the §5.6 red line still applies."""
+        case = _dependent_case(n_steps=3)
+        sandbox = tmp_path / "sbx-ledger"
+        sandbox.mkdir()
+        prompt_to_subtask = {subtask_prompt(case, s): s for s in case.subtasks}
+
+        async def _fake_spawn(*args: Any, **kwargs: Any) -> str:
+            prompt = str(kwargs.get("prompt") or args[2])
+            return prompt_to_subtask[prompt].id
+
+        monkeypatch.setattr("longline.swarm.spawn.spawn_teammate", _fake_spawn)
+
+        ledger = UsageLedger()
+        spawned: list[str] = []
+        await _spawn_workers_serial(
+            case,
+            counted=None,
+            ledger=ledger,
+            registry=TaskRegistry(),
+            claude_dir=None,
+            spawned_ids=spawned,
+            sandbox=sandbox,
+            failures={},
+        )
+
+        assert spawned == ["worker1", "worker2", "worker3"]
+        assert sorted(ledger.spawned) == ["worker1", "worker2", "worker3"]
+
+    @pytest.mark.asyncio
+    async def test_the_runner_routes_a_dependent_case_to_the_serial_arm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wiring, not behaviour: the three tests above cannot see this.
+
+        Every one of them drives `_spawn_workers_serial` directly, so all three
+        would still pass if `run_multi_variant` handed a chain to the
+        concurrent scheduler. This is the assertion that the dispatch exists.
+        """
+        case = _dependent_case(n_steps=2)
+        claude_dir = _temp_claude_dir()
+        calls: list[str] = []
+
+        async def _record_serial(*args: Any, **kwargs: Any) -> None:
+            calls.append("serial")
+
+        async def _record_concurrent(*args: Any, **kwargs: Any) -> None:
+            calls.append("concurrent")
+
+        monkeypatch.setattr(
+            "longline.eval.multi_agent_runner._spawn_workers_serial", _record_serial,
+        )
+        monkeypatch.setattr(
+            "longline.eval.multi_agent_runner._spawn_workers", _record_concurrent,
+        )
+        try:
+            await run_multi_agent_case(
+                case, api_key="offline", fixtures_dir=FIXTURES_DIR,
+                claude_dir=claude_dir,
+            )
+        finally:
+            _cleanup(claude_dir)
+
+        assert calls == ["serial"], "the multi arm must use the serial scheduler"
 
 
 def _subtasks_for(category: str) -> list[dict[str, Any]]:

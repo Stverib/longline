@@ -89,11 +89,13 @@ from longline.eval.child_usage import (
 from longline.eval.judges import case_passed
 from longline.eval.metrics import Ratio
 from longline.eval.multi_agent import (
+    CATEGORY_DEPENDENT,
     CONTROLLED,
     MULTI,
     SINGLE,
     MultiAgentCase,
     Subtask,
+    chain_order,
 )
 from longline.eval.runner import _prepare_sandbox
 
@@ -768,7 +770,16 @@ async def run_multi_variant(
         # teammates of one variant are supposed to work in one tree.
         with _in_sandbox(sandbox):
             spawned_ids.append(LEADER)
-            await _spawn_workers(
+            # Which scheduler runs is a property of the CASE, not a parameter:
+            # a `dependent` case driven concurrently would race on the one file
+            # its steps share, and a concurrent case driven serially would stop
+            # measuring parallelism while still reporting a Speedup for it.
+            spawn = (
+                _spawn_workers_serial
+                if case.category == CATEGORY_DEPENDENT
+                else _spawn_workers
+            )
+            await spawn(
                 case, counted=counted, ledger=ledger, registry=registry,
                 claude_dir=claude_dir, spawned_ids=spawned_ids, sandbox=Path(sandbox),
                 failures=worker_outcomes,
@@ -892,6 +903,74 @@ async def _spawn_workers(
         # concurrency limit is decorative. Exceptions are swallowed here
         # because `_one` already recorded them, by name.
         await asyncio.gather(*wave_tasks, return_exceptions=True)
+
+
+async def _spawn_workers_serial(
+    case: MultiAgentCase,
+    *,
+    counted: Any,
+    ledger: UsageLedger,
+    registry: Any,
+    claude_dir: Path | None,
+    spawned_ids: list[str],
+    sandbox: Path,
+    failures: dict[str, BaseException],
+) -> None:
+    """Run a `dependent` case's subtasks one teammate at a time, in chain order.
+
+    Deliberately NOT `_spawn_workers` with `workers=1`. That function derives
+    its order from `case.subtasks` and its concurrency limit from
+    `case.workers`, so a later edit to `workers` would silently parallelise a
+    chain -- and the case would go on reporting a handoff cost it no longer
+    measures. Here the order comes from `chain_order` and there is no
+    concurrency parameter to get wrong.
+
+    The scope note from `_spawn_workers` still applies and is why `agent_scope`
+    is entered inside the coroutine rather than around it: `spawn_teammate`
+    calls `asyncio.create_task` for the teammate, which copies the context at
+    that moment, so the scope has to be live when the spawn happens.
+
+    A failed step does NOT stop the chain. The case's judges run against the
+    final workspace, so a chain that dies at step 2 has to look different from
+    one that never started; aborting would make "the model gave up" and "the
+    model produced nothing" the same reported result.
+
+    Each step gets a fresh teammate, handed its own subtask's instruction and
+    nothing else -- the previous step's artifact is what carries the work
+    forward, through the sandbox rather than through a shared context. That
+    handoff is the cost this category exists to price, and it is one number on
+    purpose: separating "new context" from "what the handoff cost" would need a
+    third arm this suite does not have.
+    """
+    from longline.swarm.spawn import spawn_teammate
+
+    order = chain_order(case.subtasks, case_id=case.id)
+    for index, subtask in enumerate(order, start=1):
+        agent_name = f"worker{index}"
+        ledger.note_spawned(agent_name)
+        spawned_ids.append(agent_name)
+
+        async def _one(subtask: Subtask = subtask, agent_name: str = agent_name) -> Any:
+            with agent_scope(agent_name):
+                try:
+                    task_id = await spawn_teammate(
+                        team_name=case.id,
+                        agent_name=agent_name,
+                        prompt=subtask_prompt(case, subtask),
+                        call_model_factory=counted,
+                        parent_registry=_registry_for_sandbox(sandbox),
+                        claude_dir=claude_dir,
+                        task_registry=registry,
+                    )
+                    return await _await_teammate(task_id)
+                except BaseException as exc:  # recorded against its own name
+                    failures[agent_name] = exc
+                    return None
+
+        # Awaited directly rather than gathered: the chain's whole point is that
+        # step N+1 consumes step N's artifact, so starting two at once would
+        # race on the shared path instead of handing work forward.
+        await _one()
 
 
 async def _await_teammate(task_id: str) -> Any:
