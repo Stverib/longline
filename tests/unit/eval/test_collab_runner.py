@@ -28,12 +28,14 @@ from pathlib import Path
 
 from longline.eval.collab_cases import (
     CollabCase,
+    CollabSuite,
     ConflictCase,
     DurabilityCase,
     OrphanCase,
     WorktreeCase,
 )
 from longline.eval.collab_runner import (
+    run_collab_suite,
     run_conflict,
     run_inbox_durability,
     run_mailbox_integrity,
@@ -389,3 +391,40 @@ class TestConflictHandling:
         assert len(failed) == 1
         assert "old_string not found" in failed[0].error
         assert failed[0].survived is False
+
+
+class TestCollabSuite:
+    """The whole suite, against one scratch root, with nothing spent.
+
+    The two figures that are EXPECTED to look bad are asserted as such. Writing
+    the expectation down in advance is what stops a later run from explaining
+    the result away -- and it is also what stops `CrossWorktreeLeakRate=1.0`
+    from being read as a broken test rather than as a finding about the runtime.
+    """
+
+    def test_every_measurement_arrives_with_an_expectation_attached(
+        self, tmp_path: Path
+    ) -> None:
+        payload = run_collab_suite(CollabSuite(root=tmp_path)).to_dict()
+
+        assert payload["message_loss_rate"] == 0.0
+        assert payload["duplicate_message_rate"] == 0.0
+        assert payload["inbox_durability_loss_rate"] == 1.0
+        assert payload["inbox_durability_reported"] is True
+        assert payload["inbox_durability_control_loss_rate"] == 0.0
+        assert payload["orphan_task_rate"] == 0.0
+        assert payload["cross_worktree_leak_rate"] == 1.0, (
+            "if this is no longer 1.0, worktree isolation was wired up and both "
+            "the report line here and the README's §5.14 must be rewritten"
+        )
+
+    def test_both_conflict_shapes_are_measured(self, tmp_path: Path) -> None:
+        """One shape alone is not a result about conflicts: they fail oppositely."""
+        payload = run_collab_suite(CollabSuite(root=tmp_path)).to_dict()
+
+        conflicts = payload["conflicts"]
+        assert isinstance(conflicts, dict)
+        assert conflicts["edit"]["detected"] == 1
+        assert conflicts["edit"]["silent_overwrite"] == 0
+        assert conflicts["write"]["detected"] == 0
+        assert conflicts["write"]["silent_overwrite"] == 1

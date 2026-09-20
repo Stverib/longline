@@ -695,6 +695,11 @@ class _FakeEngine:
 
     def __init__(self) -> None:
         self.scripted = False
+        # Counted, not just present: "the wrapper still calls the engine's own
+        # factory" is the claim, and a counter is how it can be checked when the
+        # factory returns a fresh closure every call (so identity comparison
+        # cannot be used).
+        self.factory_calls = 0
         self.make_call_model: Any = self._real_factory
         self.make_call_model_factory: Any = self._real_factory
 
@@ -702,6 +707,7 @@ class _FakeEngine:
         self, model: str | None = None, max_tokens: int = 16384
     ) -> Any:
         _ = model, max_tokens
+        self.factory_calls += 1
 
         async def call_model(**kwargs: Any) -> Any:
             _ = kwargs
@@ -739,17 +745,22 @@ class TestLivePathIsReachable:
         """The wrapper must WRAP, not replace.
 
         This is the whole difference from `_apply_scripted_model`: replacing
-        the engine's own factory is what made `model=` decorative. Asserting
-        the wrapped factory is the engine's original is what tells the two
-        implementations apart when both produce a `ModelCounter`.
+        the engine's own factory is what made `model=` decorative. Counting the
+        engine's own factory invocations is what tells the two implementations
+        apart when both produce a `ModelCounter` -- and it is a call counter
+        rather than an identity check because the factory returns a fresh
+        closure each time.
         """
         engine = _FakeEngine()
-        original = engine.make_call_model_factory
+        before = engine.factory_calls
 
         _apply_live_counting(engine, UsageLedger(), agent=LEADER)
+        engine.make_call_model_factory(model="claude-sonnet-5")
 
-        assert engine.make_call_model.factory is original
-        assert engine.make_call_model_factory.factory is original
+        assert engine.factory_calls > before, (
+            "the wrapper never reached the engine's own factory, so the request "
+            "would never have been made"
+        )
 
     def test_live_counting_binds_the_ledger_and_agent(self) -> None:
         engine = _FakeEngine()
@@ -772,6 +783,87 @@ class TestLivePathIsReachable:
         _apply_live_counting(engine, UsageLedger())
 
         assert engine.make_call_model.agent is None
+
+
+class _MethodShapedEngine:
+    """An engine whose factories are METHODS, the way `QueryEngine`'s are.
+
+    `_FakeEngine` assigns them as plain attributes, which is a shape no real
+    engine has -- and that difference is exactly what hid a live-path bug.
+    With a method, reading `engine.make_call_model_factory` yields a BOUND
+    METHOD rather than a factory, and wrapping that produces a wrapper that
+    raises `TypeError: got an unexpected keyword argument 'model'` the first
+    time a sub-agent creation site calls it. Every type assertion in this file
+    passed anyway, because a `ModelCounter` wrapping a bound method is still a
+    `ModelCounter`.
+
+    The shapes are copied from `QueryEngine` rather than made convenient:
+    `make_call_model_factory()` takes NO arguments and returns a factory, and
+    that factory is what accepts `model`. An earlier version of this fake took
+    `model` on the meta-factory too, which is a shape the real engine does not
+    have -- and it made the wrapper look broken when it was the fake that was
+    wrong. A fake that disagrees with the thing it stands in for is worse than
+    no fake, because it produces confident failures.
+
+    It records the models it was asked for, so a test can tell "the wrapper
+    forwarded the call" from "the wrapper returned something callable".
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[str | None] = []
+
+    def make_call_model(self, model: str | None = None, max_tokens: int = 16384) -> Any:
+        _ = max_tokens
+        self.asked.append(model)
+
+        async def call_model(**kwargs: Any) -> Any:
+            _ = kwargs
+            yield None
+
+        return call_model
+
+    def make_call_model_factory(self) -> Any:
+        engine = self
+
+        def factory(model: str | None = None, max_tokens: int = 16384) -> Any:
+            return engine.make_call_model(model=model, max_tokens=max_tokens)
+
+        return factory
+
+
+class TestLiveCountingSurvivesTheRealEngineShape:
+    """The wrapper has to be CALLABLE, not merely present and of the right type.
+
+    Found by the first live invocation this harness ever made: `--suite pair
+    --allow-paid` failed inside `_apply_live_counting`'s product with a
+    `TypeError`, before any request left the process. Every assertion the
+    previous class makes was already green.
+    """
+
+    def test_the_installed_factory_takes_the_arguments_a_spawn_passes(self) -> None:
+        """FAILS ON: `live = engine.make_call_model_factory` without the parens."""
+        engine = _MethodShapedEngine()
+
+        _apply_live_counting(engine, UsageLedger())
+
+        call_model = engine.make_call_model_factory(model="claude-sonnet-5")
+
+        assert callable(call_model)
+        assert engine.asked == ["claude-sonnet-5"], (
+            "the wrapper did not forward the model through to the engine's own "
+            "factory, so the request would never have been made with it"
+        )
+
+    def test_the_installed_call_model_takes_the_arguments_submit_passes(self) -> None:
+        engine = _MethodShapedEngine()
+
+        _apply_live_counting(engine, UsageLedger())
+
+        assert callable(engine.make_call_model(max_tokens=8192))
+        assert engine.asked == [None], (
+            "wrapping alone must not call the engine's factory: a wrapper that "
+            "built a model per wrap would build one per variant, not per turn"
+        )
 
 
 class TestSandboxChdir:

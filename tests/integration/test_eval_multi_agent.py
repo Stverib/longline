@@ -332,3 +332,67 @@ def test_the_loader_refuses_two_fixture_trees_that_differ(tmp_path: Path) -> Non
     (root / "b" / "f.txt").write_text("different\n", encoding="utf-8")
     with pytest.raises(CaseParseError, match="not the same tree"):
         assert_fixtures_identical(identical, root)
+
+
+@pytest.mark.asyncio
+async def test_a_run_carries_its_cases_category(tmp_path: Path) -> None:
+    """The report splits on this field, and a defaulted value looks plausible.
+
+    `MultiAgentRun.category` defaults to `parallel_analysis`, so a run that
+    never copied the case's category produces a report with ONE section
+    covering an 18-case three-category corpus -- a page that looks entirely
+    reasonable and is wrong in the way the split exists to prevent. Found
+    exactly that way: `--suite pair --offline` printed a single
+    `parallel_analysis` block with `n=18`.
+
+    Driven over a case whose category is NOT the default, so the assertion
+    cannot pass by coincidence.
+    """
+    from longline.eval.multi_agent import CATEGORY_ANALYSIS, CATEGORY_DEPENDENT
+
+    benefit = REPO / "evals" / "multi_agent_benefit.jsonl"
+    cases = load_multi_agent_cases(benefit)
+    case = next(c for c in cases if c.category == CATEGORY_DEPENDENT)
+    assert case.category != CATEGORY_ANALYSIS, "the fixture must not be the default"
+
+    run = await run_multi_agent_case(
+        case, api_key="offline", fixtures_dir=FIXTURES,
+        claude_dir=_claude_dir(tmp_path), usage=TURN_USAGE,
+    )
+
+    assert run.category == case.category
+    assert run.to_row()["category"] == case.category
+
+
+@pytest.mark.asyncio
+async def test_a_multi_category_aggregate_refuses_a_pooled_figure(
+    tmp_path: Path,
+) -> None:
+    """The gate has to fire on runs the runner actually produced.
+
+    A synthetic summary can carry `by_category` without anything having put it
+    there; this drives the corpus and checks the aggregate of REAL runs.
+    """
+    benefit = REPO / "evals" / "multi_agent_benefit.jsonl"
+    cases = load_multi_agent_cases(benefit)
+    # One case from each of the first two categories present, rather than a
+    # head slice: the corpus is ordered BY category, so `[:6]` is one category
+    # and the test would have asserted the opposite of what it means.
+    seen: set[str] = set()
+    picked = []
+    for case in cases:
+        if case.category not in seen:
+            seen.add(case.category)
+            picked.append(case)
+    assert len(picked) > 1, "the corpus is meant to span several categories"
+
+    runs = await run_multi_agent_suite(
+        picked, api_key="offline", fixtures_dir=FIXTURES,
+        claude_dir=_claude_dir(tmp_path), usage=TURN_USAGE,
+    )
+
+    summary = aggregate_multi_agent(runs)
+
+    assert len(summary.by_category) > 1
+    assert summary.is_pooled is True
+    assert summary.to_dict()["pooled"] is None

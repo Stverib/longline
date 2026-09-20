@@ -1451,3 +1451,217 @@ uv run --extra dev pytest tests/unit/eval -q
    > 本地循环时间），但它量的是**同一题的两个分支之间**的差，**不是**「每解决一题的成本」。
    > 这条局限**仍然成立**：跨套件的 cost-per-task 依然没有，因此本项目的效率结论只能
    > 限定在「恢复 vs 重启」这一个决策上。
+   > **2026-09-20 再补充**：§5.13 现在**定义了**「每解决一题的成本」
+   > （`SuccessPer1KTokens`，两条臂分别报，分母为 0 报 `not measured` 而不是 0.0）。
+   > 但**定义不等于有数**：`pair` 套件至今没有跑过真实 API，所以这一条从「没有这个指标」
+   > 变成「有这个指标、还没有它的数字」。在拿到真实数字之前，**不得**声称任何成本优势。
+
+### 5.13 配对收益：同一个任务两条路（2026-09-20）
+
+#### 这一格要回答的问题
+
+前几格量的是「运行时对不对」。这一格量的是**多 Agent 到底值不值它的成本**，而且要求两条路
+做**同一份工作**：同一条用例、同一份 prompt 文本、同一组预期产物、同一个 merge 步骤、判分
+用同一批评委。两侧的 fixture 是逐字节相同的兄弟目录（装载时校验 sha256），所以两条臂之间
+**唯一**的差别是工作怎么被执行。
+
+```bash
+# 只看链路（免费、确定性）：不产生通过率结论
+uv run --extra dev python -m longline.eval --suite pair --offline --run-id <id> --repeats 1
+# 真跑（花钱）：必须显式确认
+uv run --extra dev python -m longline.eval --suite pair --allow-paid --run-id <id> --repeats 3
+```
+
+`--suite pair` 不给 `--offline` 也不给 `--allow-paid` 时**直接拒绝启动**。理由是它失败的样子
+不是一条报错，是一张账单。
+
+#### 语料：18 条，三个 category，各 6 条
+
+| category | 任务形状 | `workers` |
+| --- | --- | --- |
+| `parallel_analysis` | 6 个彼此独立的模块，各写一份摘要 | 4 |
+| `parallel_modification` | 6 处彼此独立的修改，隐藏测试在判分时才落进沙箱 | 3 |
+| `dependent` | 6 条**依赖型串行链**，后一步读前一步的产物 | 1（契约固定） |
+
+#### 报告口径：按 category 分表，**不出总平均**
+
+三个 category 是三种不同的任务，一个跨三类的平均回答的是「这个 6/6/6 的配比跑得怎么样」——
+没人问过的问题，语料一重新配比它就变，而架构什么都没变。所以 `MultiAgentSummary` 在
+`is_pooled` 为真时把 `pooled` 置为 **`None`**：报告不打印组头条，`summary.json` 里也拿不到
+那个数。
+
+`Speedup` **同时**报 mean 与 P50，两个数**必须来自同一个比值列表**（`metrics.speedup_block`
+一个函数同时算）。mean 保留是为了能和 §5.6 冻结的离线报告对读；P50 是新增的，因为 per-case
+比值的均值会被碰巧最小的那条用例拽走。
+
+#### 指标
+
+```text
+Pass@1               判分通过的用例 / 用例数            (两条臂用同一批评委)
+Speedup              single_wall_time / multi_wall_time  (1.00x 是持平)
+TokenOverhead        (multi_tokens - single_tokens) / single_tokens
+ToolCalls            两条臂各自的工具调用数
+SuccessPer1KTokens   成功数 / (token / 1000)             (分母为 0 报 not measured)
+```
+
+#### 不能夸大的部分
+
+1. **`--offline` 只验链路，不验通过率。** 离线协议是真实 `QueryEngine`、真实工具、真实
+   `query_loop`、真实 `spawn_teammate`，只有模型是脚本化的。脚本模型按声明把文件写出来，
+   所以**文件级**的检查两侧都过——**那个通过率不是结论**，它只说明装置能跑完。要看通过率
+   必须真跑。
+
+   实测（`--suite pair --offline --repeats 1`，18 条）：
+
+   | category | single | multi | 失败在哪 |
+   | --- | --- | --- | --- |
+   | `parallel_analysis` | 6/6 | 6/6 | —— |
+   | `parallel_modification` | 0/6 | 0/6 | 两侧都只挂 `python_test` |
+   | `dependent` | 0/6 | 0/6 | 两侧都只挂 `python_test` |
+
+   **两个 category 的失败是两侧对称的**：文件级检查（`file_exists`）全过，挂的都只有隐藏
+   测试，因为脚本模型写的是 `# <subtask id>` 加一句指令的占位正文，满足不了检查真实内容与
+   依赖顺序的隐藏测试。对称是关键——它说明这个 0 不是某一条臂的缺陷，而是**装置的性质**。
+   也因此这张表**不能**读成「多 Agent 在修改型和依赖型任务上失败」。
+2. **离线测不出 `Speedup`。** 多 Agent 唯一的加速机制是**重叠模型延迟**，而脚本模型没有
+   延迟。离线的 `Speedup` 在数学上不可能 > 1，实测是 0.12–0.16x。§5.6 已经记过这一点。
+3. **live 路径 2026-09-20 才接上，此前从未执行过。** 在这之前 `_apply_scripted_model` 是
+   **无条件**调用的，`model=` 只影响 system prompt 文本，请求根本到不了 SDK。第一次真的调用
+   它是在 Task 18 的付费门禁自检里，当场暴露出 `_apply_live_counting` 会把 `QueryEngine` 的
+   **方法**当成工厂包起来（`TypeError`），以及更根本的一处：`QueryEngine` 的工厂闭包体就是
+   `engine.make_call_model(...)`，包工厂的**产物**会递归。**截至本节写下时，本套件还没有产出
+   任何一个真实 API 的数字。**
+4. **这一格还没有数字。** §5.6 那 24 条冻结用例是**同一条 `task` 字符串**重复 18 次，
+   它的 controlled 均值是关于一个模板的事实；本节的 18 条是另一种语料，两者不可互换。
+
+---
+
+### 5.14 协作可靠性：机器，不是 agent（2026-09-20）
+
+#### 这一格要回答的问题
+
+§5.13 问「扇出值不值」。这一格问**它底下的机器撑不撑得住**。不跑模型、不需要 key、
+不花钱，所以这里可以做到穷尽，而 §5.13 必须省着来。
+
+```bash
+uv run --extra dev python -m longline.eval --suite collab --run-id <id>
+```
+
+用例声明在 `longline/eval/collab_cases.py` 里而不是 JSONL——一个用例在这里是一个场景
+（发送者数、故障注入点、一对冲突的 writer、一棵 worktree），没有 `EvalCase` 的形状能承载。
+
+#### 六个指标，其中两个**预期就是坏的**
+
+| 指标 | 预期 | 说明 |
+| --- | --- | --- |
+| `MessageLossRate` | 0 | **阴性对照**，见下 |
+| `DuplicateMessageRate` | 0 | 同上 |
+| `InboxDurabilityLossRate` | **全丢** | 截断的文件按构造就读不出来；文件就是整个收件箱 |
+| `InboxDurabilityLossReported` | **True** | 丢了消息**并且说出来**才算有耐久上限 |
+| `OrphanTaskRate` | 实测 | 跑完了但结果没人取 |
+| `CrossWorktreeLeakRate` | **1.0** | `isolation="worktree"` 建了 worktree 却不告诉子 agent |
+| 冲突处理 | 四个独立计数 | injected / detected / silent overwrite / integrated |
+
+**「预期是坏的」这两条才是这一节的价值**：它们把一句架构声明（「Git worktree 隔离」）变成
+一条发现（「隔离没有生效」），而把预期**事先**写下来，是让结果事后无法被解释掉的办法。
+
+#### `MessageLossRate` 是阴性对照，不是抓到的 bug
+
+`TeammateMailbox` 的自述里警告并发写会丢消息。**那条警告在这个运行时里够不着**：
+`send()` 从 `_read_inbox` 到 `_write_inbox` 全程同步、中间没有 `await`，而 teammate 是同一个
+事件循环上的 `asyncio` task；单线程循环里同步函数体不可被抢占。所以读-改-写是**构造上原子**的。
+
+这条测试因此**确认一个设计假设**，不是猎 bug。把它当 bug 猎，会让人在找不到 bug 的时候去改
+实现。每个 sender 发完一条就 `await asyncio.sleep(0)` 让出一次，这不是装饰：`send` 自己从不
+`await`，不让出的话第一个协程会跑完才轮到第二个，「没丢消息」就成了一条关于「测试里从来没有
+两个写者」的陈述。`peak_concurrent_sends` 记录这个重叠真的发生过。
+
+**如果这条测试哪天开始丢消息**，说明「同进程单事件循环」这个前提被别的东西打破了——最可能是
+某个 teammate 被挪到了线程或进程上——**那才是要查的东西**。
+
+#### 收件箱耐久性：修复买到的是「报出来」，不是「不丢」
+
+| revision | truncate | delivered | survived | loss_rate | reported |
+| --- | --- | --- | --- | --- | --- |
+| 修复前 | 是 | 8 | 0 | 1.0 | **False** |
+| 修复后 | 是 | 8 | 0 | 1.0 | **True** |
+| 修复后（对照） | 否 | 8 | 8 | 0.0 | False |
+
+**损失量没有变，两次都是 8/8。** 修复买到的是一行「投递 8 条、一条都没读回来」，而不是
+「收件箱是空的」。后者**没有症状**：teammate 看到「没有消息」继续干完活并报成功，leader 收到
+一份没提丢失工作的回复——双方都报成功而消息没了。原子写（temp + `os.replace`）防的是**半份
+文件被生产出来**，由 `tests/unit/swarm/test_mailbox.py` 的性质测试锁住；两者都**不恢复字节**。
+
+`truncate=False` 那一行是对照：一条只会观测损坏情形的测试，分不出「reader 报出了损失」与
+「reader 永远报损失」。
+
+#### 孤儿任务率：写侧与读侧，缺一不可
+
+- **写侧**是 `TaskRegistry`：`spawn_teammate` 逐个注册，done-callback 把记录推到终态。
+  这是**运行时的**事实，由 spawn 路径产生。
+- **读侧**是 leader：那条回复有没有进它的收件箱，以及它有没有读过。
+
+一个 teammate 可以 COMPLETED 而结果没人取——**那个缺口才是这个指标**。只测一侧，得到的要么是
+「都跑完了」（写侧），要么是「我看见了我看见的」（读侧）。
+
+`OrphanTaskRate = (completed - consumed) / completed`，**分母是 COMPLETED 而不是 SPAWNED**：
+没跑完的 teammate 不可能有被孤立的回复，算进去会把崩溃记成孤儿。
+
+实测最值钱的一格：把 `TeammateMailbox.send` 改成抛错，三个 teammate **全部报 COMPLETED**、
+`errors` 为空、收件箱是空的——`OrphanTaskRate` 单独用分不出这一格和「leader 不读信」那一格
+（都是 1.0）。所以 `delivered` 必须单独报：`completed - delivered` 是运行时没投出去，
+`delivered - consumed` 是投出去了没人取。**两种故障，修法不同。**
+
+#### worktree 隔离：实测未生效，越界率 100%
+
+`longline/tools/agent/worktree.py` 的契约第 2 条写明「子 agent 在 worktree 目录中执行所有操作」。
+`agent_tool.py` 从未做到：`worktree_path` 全文只有**声明**、**创建**、**删除**三处，中间没有
+任何一处接到子 agent 上；`query_loop` 没有 `cwd` 参数；`child_registry` 注册的是父 agent 的
+工具实例，而工具按**进程 cwd** 解析相对路径。
+
+于是 `isolation="worktree"` 的实际语义是：**建一棵 worktree，子 agent 在父目录里干完活，
+把那棵空的 worktree 删掉。**
+
+实测 K=3：3 个 marker 全部落在父仓库，仓库 `git status --porcelain` 从空变成 3 个未跟踪文件，
+残留 worktree 0 棵。两个观测合起来才关得死——`leaked=3` 说文件落在父仓库，`残留=0` 说
+worktree 被拆掉时是空的（`cleanup_agent_worktree` 会**保留**任何有未提交改动的 worktree）。
+
+**这条测量不是自证的**：把 `create_agent_worktree` 改成建完就 chdir 进去（等价于真把 cwd 串
+下去），越界数从 3 变 0、落在 worktree 内从 0 变 3、残留从 0 变 3，三个量同向翻转。
+
+测试断言的是**实测行为**而不是意图，所以它会在有人真的把 cwd 串下去的那天**失败**——那个
+失败是改结论的信号，不是测试写错了。修复（per-tool cwd 重构：动 Read/Write/Edit/Glob/Grep/Bash
+六个工具与调用链）**明确出本轮范围**。
+
+#### 冲突处理：`Write` 与 `Edit` 往相反方向失败
+
+| 形状 | injected | detected | silent_overwrite | integration_ok |
+| --- | --- | --- | --- | --- |
+| `Edit`（有前置条件） | 2 | **1** | **0** | True |
+| `Write`（全量覆盖） | 2 | **0** | **1** | True |
+| `Write` 单 writer（对照） | 1 | 0 | 0 | True |
+
+`Edit` 带着 `old_string` 这个**前置条件**，所以第二个 writer 拿到 `old_string not found`——
+冲突被接住，代价是一个失败的任务。`Write` 是全量覆盖、**没有前置条件**，于是两个 call 都返回
+成功，最终文件只剩后写的那个，**没有任何一处报过冲突**。把 `Edit` 换成 `Write`，`detected`
+从 1 掉到 0、`silent_overwrite` 从 0 升到 1，而对上层而言两者都「成功」。
+
+`final_integration_success` 是**护栏不是结论**：两个形状都是 True，且是构造上必然 True
+（两个工具都走 `os.replace` 原子写，半份文件活不下来）。报它是因为「有人发现了冲突」与
+「工作区仍然自洽」是两句不同的话。
+
+#### 不得夸大的部分
+
+1. **这一节测的是机器，不是 agent 的注意力。** leader 是**脚本驱动**的，所以 `consumed`
+   反映的是运行时**投递链路**是否闭合，**不是**真模型会不会去读收件箱。`OrphanTaskRate=0`
+   只说明链路通，不说明模型从不漏掉子任务。
+2. **冲突不是竞态，是丢失更新。** 两个 writer 顺序执行而非交错——两个工具的 `execute` 在
+   「读文件」与「写文件」之间都没有 `await`，单事件循环里本来就交错不了（与 mailbox 同一条
+   理由）。测的是第二次写基于一个**已经过期的读**。并发不改变答案：`Edit` 的前置条件挂在
+   字节上，`Write` 根本没有前置条件。
+3. **`CrossWorktreeLeakRate=1.0` 是本项目当前的实际状态**，不是这套装置的问题，也不是一条
+   已经修好的历史记录。它要求在简历、README 和任何对外描述里**不能**写成「Git worktree 隔离」。
+4. **计数刻意很小**（4 个 sender、8 条消息、3 个 teammate）。丢一条消息是**结构性失败**，
+   不是需要大样本才能测出的比率。
+
+---

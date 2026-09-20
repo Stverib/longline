@@ -934,3 +934,69 @@ class TestAblationRunMetadata:
 
         assert "prompt_variant" not in block
         assert "tool_desc_variant" not in block
+
+
+class TestPairAndCollabSuites:
+    """`pair` is the three-category corpus; `collab` drives no model at all.
+
+    `pair` is separate from `multi_agent` rather than an extension of it
+    because the 24 frozen cases are 18 rows sharing ONE `task` string. Pooling
+    them into `parallel_analysis` would make that category's average a fact
+    about a single template -- the exact thing splitting by category exists to
+    prevent.
+    """
+
+    def test_pair_points_at_the_three_category_corpus(self) -> None:
+        ns = cli.parse_args(["--suite", "pair"])
+        cli._apply_suite(ns)
+
+        assert ns.type == "multi_agent"
+        assert Path(ns.case_file).name == "multi_agent_benefit.jsonl"
+
+    def test_collab_is_its_own_layer(self) -> None:
+        """Not `multi_agent`: it drives no model and reads no case file."""
+        ns = cli.parse_args(["--suite", "collab"])
+        cli._apply_suite(ns)
+
+        assert ns.type == "collab"
+
+    def test_collab_is_accepted_as_a_type_too(self) -> None:
+        assert "collab" in cli.TYPE_CHOICES
+
+    def test_the_existing_suites_are_untouched(self) -> None:
+        """Adding two entries must not have moved the ones already documented."""
+        assert cli.SUITES["multi_agent"] == ("multi_agent.jsonl", "multi_agent")
+        assert cli.SUITES["safety"] == ("safety.jsonl", "safety")
+        assert "safety" in cli.TYPE_CHOICES
+
+
+class TestUnpaidLiveRunIsRefused:
+    """The failure mode being prevented is a bill, not an error message.
+
+    Scoped to the suites whose DEFAULT is a live run. Broadening the guard to
+    every suite would break the documented invocations of suites nobody is at
+    risk of running by accident, and a guard that has to be worked around is a
+    guard that gets removed.
+    """
+
+    def test_pair_without_offline_refuses_to_start(self) -> None:
+        ns = cli.parse_args(["--suite", "pair"])
+
+        with pytest.raises(SystemExit, match="calls the real API"):
+            cli._refuse_unpaid_live_run(ns)
+
+    def test_offline_is_the_way_through(self) -> None:
+        ns = cli.parse_args(["--suite", "pair", "--offline"])
+
+        cli._refuse_unpaid_live_run(ns)  # must not raise
+
+    def test_an_explicit_acknowledgement_is_also_the_way_through(self) -> None:
+        ns = cli.parse_args(["--suite", "pair", "--allow-paid"])
+
+        cli._refuse_unpaid_live_run(ns)  # must not raise
+
+    def test_a_free_suite_is_never_blocked(self) -> None:
+        """`collab` spends nothing, so a guard on it would be noise."""
+        ns = cli.parse_args(["--suite", "collab"])
+
+        cli._refuse_unpaid_live_run(ns)  # must not raise

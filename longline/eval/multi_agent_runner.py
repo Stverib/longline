@@ -338,6 +338,7 @@ class MultiAgentRun:
         return {
             "case_id": self.case_id,
             "group": self.group,
+            "category": self.category,
             "workers": self.workers,
             "num_subtasks": self.num_subtasks,
             "expected_paths": self.expected_paths,
@@ -1321,13 +1322,11 @@ def _apply_live_counting(
 ) -> Any:
     """Wrap a real engine's own model transport with the usage counter, in place.
 
-    The live sibling of `_apply_scripted_model`, and it moves the same two
-    attributes for the same reason: `make_call_model` is what `submit()` calls
-    directly, and `make_call_model_factory` is what a sub-agent creation site
-    calls. The difference is what goes underneath -- here it is the engine's
-    OWN factory, so the request reaches the SDK and only the counting wrapper
-    is added. Replacing that factory (which the unconditional
-    `_apply_scripted_model` call did) is what made `model=` decorative.
+    The live sibling of `_apply_scripted_model`, and the difference is what goes
+    underneath: here it is the engine's OWN factory, so the request reaches the
+    SDK and only the counting wrapper is added. Replacing that factory (which
+    the unconditional `_apply_scripted_model` call did) is what made `model=`
+    decorative.
 
     `agent=None` leaves the owner of each turn to be resolved from the ambient
     scope at call time, which is what the multi variant needs: ONE wrapper on
@@ -1335,13 +1334,23 @@ def _apply_live_counting(
     worker's scope and each worker's arriving inside its own. Pinning an agent
     here would attribute every teammate's turns to the leader.
 
+    `make_call_model` is the ONE insertion point, and both attributes are set to
+    the same wrapper. `QueryEngine` routes everything through it: `submit()`
+    calls it directly, and `make_call_model_factory()` returns a closure whose
+    body is `engine.make_call_model(...)`. So wrapping the factory's PRODUCT
+    instead -- the obvious reading of "wrap the factory" -- recurses, because
+    the closure calls the attribute this function has just replaced, and the
+    wrapper calls the closure again. Measured: `RecursionError` from
+    `ModelCounter.__call__`. Capturing the bound method BEFORE the assignment is
+    what breaks that cycle, and it is the same object `submit` would have got.
+
     `_assert_live_counting` is the mirror of `assert_applied`. A refactor that
     renamed either attribute would leave the live path UNCOUNTED -- and an
     uncounted live run reports zero tokens while spending real money, which is
     the same "reads as a cheap fan-out" failure in the opposite direction.
     """
-    live = engine.make_call_model_factory
-    counted = count_usage(live, ledger, agent=agent)
+    original = engine.make_call_model
+    counted = count_usage(original, ledger, agent=agent)
     engine.make_call_model = counted
     engine.make_call_model_factory = counted
     _assert_live_counting(engine)
@@ -1414,6 +1423,7 @@ async def run_multi_agent_case(
     run = MultiAgentRun(
         case_id=case.id,
         group=case.group,
+        category=case.category,
         workers=(
             effective_workers(case, workers_override)
             if case.group == CONTROLLED
@@ -1509,6 +1519,7 @@ async def run_multi_agent_suite(
     model: str | None = None,
     claude_dir: Path | None = None,
     usage: Any = None,
+    workers_override: int | None = None,
 ) -> list[MultiAgentRun]:
     """Run every case serially.
 
@@ -1517,6 +1528,11 @@ async def run_multi_agent_suite(
     quantities -- running two cases at once would measure the contention
     instead. The fan-out *inside* one variant deliberately does run its workers
     concurrently; that is the thing being measured.
+
+    `workers_override` applies to every case in the run, which is what the
+    agent-count axis wants: two runs of the SAME case file at 2 and 4, compared
+    to each other. A `dependent` case refuses a value other than 1, so a corpus
+    containing both shapes cannot be swept blindly -- see `effective_workers`.
     """
     runs: list[MultiAgentRun] = []
     for case in cases:
@@ -1524,6 +1540,7 @@ async def run_multi_agent_suite(
             await run_multi_agent_case(
                 case, api_key=api_key, fixtures_dir=fixtures_dir, model=model,
                 claude_dir=claude_dir, usage=usage,
+                workers_override=workers_override,
             )
         )
     return runs

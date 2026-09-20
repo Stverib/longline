@@ -92,15 +92,34 @@ SUITES: dict[str, tuple[str, str]] = {
     "compression": ("compression.jsonl", "compression"),
     "latency": ("e2e.jsonl", "latency"),
     "multi_agent": ("multi_agent.jsonl", "multi_agent"),
+    # `pair` is the paired-benefit suite: the three-category corpus. Separate
+    # from `multi_agent` rather than an extension of it, because the 24 frozen
+    # cases are 18 rows sharing ONE `task` string -- pooling them into
+    # `parallel_analysis` would make that category's average a fact about a
+    # single template. `multi_agent` stays as the frozen regression set; `pair`
+    # carries the corpus the report splits by category.
+    "pair": ("multi_agent_benefit.jsonl", "multi_agent"),
+    # `collab` drives no model at all. It measures the collaboration
+    # INFRASTRUCTURE -- the mailbox, the worktree isolation, the task registry --
+    # so it needs neither a key nor a case file; the second element is a label
+    # for the run metadata, the same way `latency` labels a file it never opens.
+    "collab": ("multi_agent_benefit.jsonl", "collab"),
     "safety": ("safety.jsonl", "safety"),
     "all": ("tool_calls.jsonl", "all"),
 }
 
-# Layer names accepted by --type. `compression`, `latency`, `multi_agent` and
-# `safety` are separate from `e2e` for the reasons above.
+# Layer names accepted by --type. `compression`, `latency`, `multi_agent`,
+# `collab` and `safety` are separate from `e2e` for the reasons above.
 TYPE_CHOICES = [
-    "tool_call", "e2e", "compression", "latency", "multi_agent", "safety", "all",
+    "tool_call", "e2e", "compression", "latency", "multi_agent", "collab",
+    "safety", "all",
 ]
+
+# Suites whose cases are driven by a REAL model unless `--offline` says
+# otherwise. `pair` is the only one so far, and it is listed rather than
+# inferred: the guard below has to know which invocations can reach the API,
+# and a suite that became paid later should have to be added here deliberately.
+PAID_SUITES = frozenset({"pair"})
 
 # Case tags that partition the tool-selection suite. `--blind` / `--instruction`
 # are sugar over `--tag`, kept as flags because the two halves must never be
@@ -351,7 +370,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
              "real tools, the real query_loop and a real spawn_teammate fan-out, "
              "with the model transport scripted. Deterministic, free, and what "
              "the committed dataset describes; the run records which mode "
-             "produced it.",
+             "produced it. REQUIRED for --suite pair unless --allow-paid is "
+             "given: that suite is the one that reaches the real API.",
+    )
+    p.add_argument(
+        "--allow-paid", action="store_true",
+        help="Acknowledge that --suite pair without --offline will call the real "
+             "API and spend money. Without this flag such an invocation refuses "
+             "to start, because the failure mode of getting it wrong is a bill "
+             "rather than an error message.",
+    )
+    p.add_argument(
+        "--workers", type=int, default=None, metavar="N",
+        help="Multi-agent suites: run ONE case at a different concurrency, "
+             "without touching the case itself. This is the agent-count axis "
+             "(1/2/4): two runs of the same case at different values are the two "
+             "points of the curve. Refused for a `dependent` case, whose "
+             "concurrency is fixed at 1 by contract -- the serial scheduler "
+             "ignores the number, so accepting one would put a concurrency in "
+             "the report that the run never used.",
     )
     return p.parse_args(argv)
 
@@ -407,6 +444,31 @@ def _apply_suite(args: argparse.Namespace, argv: Sequence[str] | None = None) ->
         args.case_file = str(PROJECT_ROOT / "evals" / case_file)
     if not _explicit("type", argv):
         args.type = type_filter
+
+
+def _refuse_unpaid_live_run(args: argparse.Namespace) -> None:
+    """Stop a `pair` invocation that would reach the real API, unless it says so.
+
+    Every other suite is either offline by construction or was already reachable
+    before this flag existed, so the guard is scoped to the one suite whose
+    DEFAULT is a live run. Broadening it to all of them would break the
+    documented invocations of suites nobody is at risk of running by accident,
+    and a guard that has to be worked around is a guard that gets removed.
+
+    The failure mode being prevented is not an error -- it is a bill. So the
+    check is a refusal rather than a prompt: this harness is driven
+    non-interactively, and a confirmation nobody is present to answer would
+    either block forever or default to yes.
+    """
+    suite = args.suite or args.type
+    if suite not in PAID_SUITES or args.offline or args.allow_paid:
+        return
+    raise SystemExit(
+        f"--suite {suite} without --offline calls the real API and spends money. "
+        "Pass --offline for the scripted protocol, or --allow-paid to confirm the "
+        "paid run. (The offline protocol validates the wiring; it does not "
+        "measure a pass rate -- see evals/README.md §5.13.)"
+    )
 
 
 def split_cases(cases: list[EvalCase]) -> tuple[list[ToolCallCase], list[E2ECase]]:
@@ -922,6 +984,92 @@ async def _run_latency(
     return 0
 
 
+async def _run_collab(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    run_id: str | None,
+) -> int:
+    """The collaboration-reliability suite: the infrastructure, not the agent.
+
+    No model, no API key, nothing spent. The scenarios are declared in
+    `longline/eval/collab_cases.py` rather than in a JSONL file, because a
+    scenario here is a sender count, a failpoint or a pair of conflicting
+    writers -- shapes no `EvalCase` can carry, the same reason `latency` declares
+    its schedules in code.
+
+    The scratch tree is a temporary directory and is deleted before anything is
+    written. It holds a throwaway git repository and a set of inbox files, none
+    of which is an observation; the three artifacts below are the whole output,
+    and leaving the scratch behind would put a git repo inside `evals/results/`.
+
+    `case_file_sha256` is None in the metadata, on purpose. This suite reads no
+    case file, and pointing the field at an unrelated JSONL to make it look
+    populated would be a fabricated provenance record -- the one thing §3 says
+    a run directory must not contain.
+    """
+    import tempfile
+
+    from longline.eval.collab_cases import CollabSuite
+    from longline.eval.collab_runner import run_collab_suite
+    from longline.eval.report import render_collab_markdown
+
+    resolved = run_id or make_run_id(args.model, "collab")
+    with tempfile.TemporaryDirectory(prefix="longline-collab-") as scratch:
+        # In a worker THREAD, because the collab runners are synchronous entry
+        # points that call `asyncio.run` themselves, and this function is
+        # already inside the loop `main()` opened. `asyncio.run` cannot nest.
+        #
+        # The thread is safe here specifically because the one piece of global
+        # state these runners touch -- the process cwd, which
+        # `run_worktree_isolation` changes to make relative paths resolvable --
+        # is restored in a `finally` and nothing else is running concurrently
+        # while the loop awaits this call.
+        payload = await asyncio.to_thread(
+            lambda: run_collab_suite(CollabSuite(root=Path(scratch))).to_dict()
+        )
+
+    metadata = run_metadata(
+        run_id=resolved, suite="collab", variant=args.variant,
+        model="none (this suite drives no model)",
+        case_file=Path("(no case file: scenarios are declared in code)"),
+        repeat_index=0, repeats_completed=1,
+    )
+
+    run_dir = out_dir / resolved
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # One row, tagged, because the suite is one run rather than a list of cases.
+    # Splitting it into a row per metric would invent a per-row shape that the
+    # other suites' readers do not expect and that nothing recomputes from.
+    with (run_dir / RAW_NAME).open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(tagged({"suite": "collab", **payload}), ensure_ascii=False) + "\n")
+    (run_dir / SUMMARY_NAME).write_text(
+        json.dumps({"metadata": metadata, "collab": payload}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / REPORT_NAME).write_text(
+        render_collab_markdown(payload), encoding="utf-8",
+    )
+
+    print("[eval] collaboration reliability (no model, nothing spent)")
+    print(f"[eval]   MessageLossRate={payload['message_loss_rate']} "
+          f"DuplicateMessageRate={payload['duplicate_message_rate']} "
+          f"(expected 0/0)")
+    print(f"[eval]   InboxDurabilityLossRate={payload['inbox_durability_loss_rate']} "
+          f"reported={payload['inbox_durability_reported']} "
+          f"control={payload['inbox_durability_control_loss_rate']}")
+    print(f"[eval]   OrphanTaskRate={payload['orphan_task_rate']} "
+          f"completed={payload['orphan_completed']} "
+          f"delivered={payload['orphan_delivered']} consumed={payload['orphan_consumed']}")
+    print(f"[eval]   CrossWorktreeLeakRate={payload['cross_worktree_leak_rate']} "
+          f"(EXPECTED 1.0: isolation is not in effect)")
+    print(f"[eval]   conflicts={payload['conflicts']}")
+    print(f"[eval] raw      -> {run_dir / RAW_NAME}")
+    print(f"[eval] summary  -> {run_dir / SUMMARY_NAME}")
+    print(f"[eval] markdown -> {run_dir / REPORT_NAME}")
+    return 0
+
+
 async def _run_multi_agent(
     args: argparse.Namespace,
     *,
@@ -983,6 +1131,7 @@ async def _run_multi_agent(
         model=None if args.offline else args.model,
         claude_dir=None,
         usage=SCRIPTED_TURN_USAGE if args.offline else None,
+        workers_override=args.workers,
     )
     summaries = [
         aggregate_multi_agent(runs, group=group)
@@ -1208,14 +1357,25 @@ async def _run_safety(
 async def _run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args, argv)
+    _refuse_unpaid_live_run(args)
     _apply_base_url()  # adopt OpenCode gateway if configured (no native key)
     api_key = _load_api_key()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # The collaboration-reliability suite is dispatched FIRST, and before the
+    # case-file check, because it has no case file: its scenarios are declared
+    # in `longline/eval/collab_cases.py` and it drives no model at all. Making
+    # it satisfy a check that exists for the model-driven suites would mean
+    # shipping it a dummy file, and the next person would reasonably conclude
+    # the file mattered.
+    if args.type == "collab" or args.suite == "collab":
+        return await _run_collab(args, out_dir=out_dir, run_id=args.run_id)
+
     case_file = Path(args.case_file)
     if not case_file.is_file():
         raise SystemExit(f"case file not found: {case_file}")
     fixtures = Path(args.fixtures_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # The compression suite is dispatched before the generic path: its cases are
     # not `EvalCase`s (they carry a history and key facts), and it produces two
@@ -1236,8 +1396,10 @@ async def _run(argv: Sequence[str] | None = None) -> int:
 
     # The multi-agent suite, for the same reason: one case yields two CaseResults
     # plus a usage ledger, and its headline numbers are a ratio of durations and
-    # a ratio of token counts rather than a pass rate.
-    if args.type == "multi_agent" or args.suite == "multi_agent":
+    # a ratio of token counts rather than a pass rate. `pair` rides this path
+    # too -- it is the same runner over a different case file, and giving it a
+    # second body would let the two drift into computing Speedup twice.
+    if args.type == "multi_agent" or args.suite in ("multi_agent", "pair"):
         return await _run_multi_agent(
             args, case_file=case_file, fixtures=fixtures, out_dir=out_dir,
             api_key=api_key, run_id=args.run_id,

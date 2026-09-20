@@ -106,3 +106,59 @@ class ConflictCase:
     values: tuple[str, ...] = ("alpha", "beta")
     target: str = "shared.py"
     anchor: str = 'VALUE = "original"'
+
+
+@dataclass(frozen=True)
+class CollabSuite:
+    """The whole collaboration-reliability suite, against one scratch root.
+
+    Every scenario writes under `root`, which the caller owns and can delete.
+    Nothing here touches the repository, the user's `~/.longline`, or the
+    network: this suite exists to be runnable at any time, on any machine, for
+    free, which is what lets it be exhaustive where the benefit suite has to be
+    economical.
+
+    The counts are the declared ones rather than tuned values. Four senders
+    fanning into one inbox is enough to show whether loss CAN happen -- and a
+    lost message is a structural failure, not a rate that needs a large sample
+    to detect: one loss out of forty is already a broken invariant.
+    """
+
+    root: Path
+    senders: int = 4
+    messages_per_sender: int = 10
+    delivered: int = 8
+    agents: int = 3
+    teammates: int = 3
+
+    @property
+    def mailbox(self) -> CollabCase:
+        return CollabCase(
+            senders=self.senders,
+            messages_per_sender=self.messages_per_sender,
+            claude_dir=self.root / "mailbox",
+        )
+
+    @property
+    def durability(self) -> DurabilityCase:
+        return DurabilityCase(delivered=self.delivered, claude_dir=self.root / "durability")
+
+    @property
+    def durability_control(self) -> DurabilityCase:
+        return DurabilityCase(
+            delivered=self.delivered, claude_dir=self.root / "durability-ok",
+            truncate=False,
+        )
+
+    @property
+    def worktree(self) -> WorktreeCase:
+        return WorktreeCase(
+            repo=self.root / "worktree-repo", agents=self.agents, marker="marker.txt",
+        )
+
+    @property
+    def orphans(self) -> OrphanCase:
+        return OrphanCase(teammates=self.teammates, claude_dir=self.root / "orphans")
+
+    def conflicts(self, shape: str) -> ConflictCase:
+        return ConflictCase(workspace=self.root / f"conflict-{shape}", shape=shape)

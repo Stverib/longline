@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
     from longline.eval.collab_cases import (
         CollabCase,
+        CollabSuite,
         ConflictCase,
         DurabilityCase,
         OrphanCase,
@@ -800,4 +801,77 @@ def run_conflict(case: ConflictCase) -> ConflictResult:
         shape=case.shape,
         writers=writers,
         final_content=final_content,
+    )
+
+
+# --- the whole suite ---------------------------------------------------------
+
+
+@dataclass
+class CollabSuiteResult:
+    """Every collaboration-infrastructure measurement, taken together.
+
+    Each field is reported on its own. There is deliberately no single "health"
+    score: the numbers below include two that are EXPECTED to look bad, one that
+    is a negative control, and one whose dangerous outcome is invisible at the
+    layer that produces it. A composite would average those into a figure that
+    describes none of them.
+    """
+
+    mailbox: MailboxIntegrityResult
+    durability: DurabilityResult
+    durability_control: DurabilityResult
+    worktree: WorktreeIsolationResult
+    orphans: OrphanResult
+    conflicts: dict[str, ConflictResult] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "message_loss_rate": self.mailbox.message_loss_rate,
+            "duplicate_message_rate": self.mailbox.duplicate_message_rate,
+            "peak_concurrent_sends": self.mailbox.peak_concurrent_sends,
+            "mailbox_expected": self.mailbox.expected,
+            "mailbox_received": self.mailbox.received,
+            "inbox_durability_loss_rate": self.durability.loss_rate,
+            "inbox_durability_reported": self.durability.reported,
+            "inbox_durability_control_loss_rate": self.durability_control.loss_rate,
+            "orphan_task_rate": self.orphans.orphan_rate,
+            "orphan_completed": self.orphans.completed,
+            "orphan_delivered": self.orphans.delivered,
+            "orphan_consumed": self.orphans.consumed,
+            "cross_worktree_leak_rate": self.worktree.leak_rate,
+            "cross_worktree_writes": self.worktree.writes,
+            "cross_worktree_leftovers": len(self.worktree.leftover_worktrees),
+            "cross_worktree_main_dirty": self.worktree.main_dirty_after,
+            "conflicts": {
+                shape: {
+                    "injected": result.injected,
+                    "detected": result.detected,
+                    "silent_overwrite": result.silent_overwrite,
+                    "final_integration_success": result.final_integration_success,
+                }
+                for shape, result in sorted(self.conflicts.items())
+            },
+        }
+
+
+def run_collab_suite(suite: CollabSuite) -> CollabSuiteResult:
+    """Run every collaboration scenario against one scratch root.
+
+    No model, no API key, nothing spent. That is the point of the suite rather
+    than a side effect: the checks that matter here -- did a message survive,
+    did a write land where it claimed, did two writers notice each other -- are
+    facts about the machinery, and a model in the loop would only add a way for
+    the run to be flaky.
+    """
+    return CollabSuiteResult(
+        mailbox=run_mailbox_integrity(suite.mailbox),
+        durability=run_inbox_durability(suite.durability),
+        durability_control=run_inbox_durability(suite.durability_control),
+        worktree=run_worktree_isolation(suite.worktree),
+        orphans=run_orphan_task_rate(suite.orphans),
+        conflicts={
+            shape: run_conflict(suite.conflicts(shape))
+            for shape in ("edit", "write")
+        },
     )

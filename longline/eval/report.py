@@ -1020,6 +1020,105 @@ def _category_lines(summary: MultiAgentSummary) -> list[str]:
     return lines
 
 
+def render_collab_markdown(payload: dict[str, object]) -> str:
+    """The collaboration-reliability section, as a standalone report.
+
+    Standalone rather than folded into `render_markdown` because this suite has
+    no cases and no agent results: it produces one payload, and the generic
+    renderer's tables are all keyed on `CaseResult`s it does not have.
+
+    Every number is printed with its EXPECTATION next to it. Two of these are
+    supposed to look bad -- `CrossWorktreeLeakRate` is 1.0 because the isolation
+    is not wired up, and the durability loss is total because a half-written
+    file is unreadable by construction. A reader handed the bare numbers would
+    reasonably read them as bugs in the suite.
+    """
+    def _fmt(value: object) -> str:
+        if value is None:
+            return "not measured"
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return str(value)
+
+    conflicts = payload.get("conflicts") or {}
+    assert isinstance(conflicts, dict)
+
+    lines = [
+        "# Collaboration reliability (no model, nothing spent)",
+        "",
+        "> These measure the INFRASTRUCTURE the fan-out runs on -- the mailbox, "
+        "the worktree isolation, the task registry, the conflict behaviour of "
+        "the file tools. No model is involved, which is why every check can be "
+        "exhaustive where the paired-benefit suite has to be economical.",
+        "",
+        "| metric | value | what is expected |",
+        "|---|---|---|",
+        f"| MessageLossRate | {_fmt(payload.get('message_loss_rate'))} "
+        "| 0 -- a lost message is a structural failure, not a rate |",
+        f"| DuplicateMessageRate | {_fmt(payload.get('duplicate_message_rate'))} "
+        "| 0 |",
+        f"| InboxDurabilityLossRate | {_fmt(payload.get('inbox_durability_loss_rate'))} "
+        "| ALL -- a truncated file is unreadable; the file is the whole inbox |",
+        f"| InboxDurabilityLossReported | {_fmt(payload.get('inbox_durability_reported'))} "
+        "| **True** -- losing messages silently is the failure this suite exists for |",
+        f"| InboxDurabilityLossRate (intact control) | "
+        f"{_fmt(payload.get('inbox_durability_control_loss_rate'))} "
+        "| 0 -- without it, 'the reader reports loss' cannot be told from "
+        "'the reader always reports loss' |",
+        f"| OrphanTaskRate | {_fmt(payload.get('orphan_task_rate'))} "
+        "| measured; a teammate can finish and its result never be taken up |",
+        f"| CrossWorktreeLeakRate | {_fmt(payload.get('cross_worktree_leak_rate'))} "
+        "| **1.0 is the MEASURED result, not a regression**: `isolation=\"worktree\"` "
+        "creates a worktree and never tells the child about it |",
+        "",
+        "| orphan accounting | value |",
+        "|---|---|",
+        f"| completed (from TaskRegistry) | {_fmt(payload.get('orphan_completed'))} |",
+        f"| delivered (in the leader's inbox) | {_fmt(payload.get('orphan_delivered'))} |",
+        f"| consumed (leader read it) | {_fmt(payload.get('orphan_consumed'))} |",
+        "",
+        "`completed - delivered` is a reply the runtime never posted; "
+        "`delivered - consumed` is one nobody picked up. They are different "
+        "faults with different fixes, and `OrphanTaskRate` alone cannot tell "
+        "them apart -- both read as 1.0.",
+        "",
+        "| conflict shape | injected | detected | silent overwrite | integration ok |",
+        "|---|---|---|---|---|",
+    ]
+    for shape, block in sorted(conflicts.items()):
+        assert isinstance(block, dict)
+        lines.append(
+            f"| `{shape}` | {block.get('injected')} | {block.get('detected')} | "
+            f"{block.get('silent_overwrite')} | {block.get('final_integration_success')} |"
+        )
+    lines += [
+        "",
+        "`silent_overwrite` is the headline: a writer whose tool call returned "
+        "SUCCESS whose text is not in the final file. Neither shape reports it, "
+        "and the `Edit` shape fails the second writer loudly (its `old_string` "
+        "no longer matches) while the `Write` shape fails it in silence.",
+        "",
+        "| worktree evidence | value |",
+        "|---|---|",
+        f"| writes landed | {_fmt(payload.get('cross_worktree_writes'))} |",
+        f"| worktrees kept by cleanup | {_fmt(payload.get('cross_worktree_leftovers'))} |",
+        f"| main tree after | {payload.get('cross_worktree_main_dirty') or 'clean'} |",
+        "",
+        "`cleanup_agent_worktree` KEEPS any worktree with uncommitted changes, so "
+        "a leftover would mean the isolation worked at least once. Finding none, "
+        "together with the writes landing in the parent's tree, is what makes "
+        "the leak a measurement rather than a scan artifact.",
+        "",
+        "> **Limit, stated so it is not read past:** the leader here is "
+        "script-driven. `OrphanTaskRate` therefore reports whether the runtime's "
+        "delivery chain CLOSES, not whether a real model's attention would have "
+        "noticed the reply. `0.0` means the plumbing works; it does not mean a "
+        "model never drops a subtask.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
     """The Task 7 section: one block per group, never one pooled number.
 
