@@ -30,6 +30,7 @@ from longline.eval.collab_cases import CollabCase, DurabilityCase, WorktreeCase
 from longline.eval.collab_runner import (
     run_inbox_durability,
     run_mailbox_integrity,
+    run_worktree_isolation,
 )
 
 
@@ -148,3 +149,74 @@ class TestWorktreeCaseShape:
 
         assert case.agents == 3
         assert case.marker == "marker.txt"
+
+
+class TestWorktreeIsolation:
+    """Measured expectation: the writes land OUTSIDE the worktree.
+
+    `AgentTool.execute` creates a worktree and deletes it without ever handing
+    the path to the child: `query_loop` has no `cwd` parameter and
+    `child_registry` holds the PARENT's tool instances, which resolve relative
+    paths against the process cwd. So the child writes into the parent's tree
+    and the worktree is deleted empty.
+
+    This test asserts the MEASURED behaviour, not the intended one. It fails the
+    day someone threads a cwd through -- and that failure is the signal to flip
+    the assertion and rewrite the report line, not evidence the test was wrong.
+
+    Two independent observations carry the finding, and neither depends on
+    timing:
+
+    - `main_dirty_after` is the user-visible one: the repository the user owns
+      went from clean to holding the child's files.
+    - `leftover_worktrees` is the structural one. `cleanup_agent_worktree` KEEPS
+      any worktree with uncommitted changes, so a child that had really written
+      inside its worktree would have left that worktree behind. Nothing is left
+      behind, so the children wrote nothing there.
+    """
+
+    def test_a_child_with_worktree_isolation_writes_into_the_parents_tree(
+        self, tmp_path: Path
+    ) -> None:
+        result = run_worktree_isolation(
+            WorktreeCase(repo=tmp_path / "repo", agents=3, marker="marker.txt")
+        )
+
+        assert result.agents == 3
+        assert result.writes == 3, "every child's Write has to land SOMEWHERE"
+        assert result.leaked == 3, (
+            "expected every write to land outside its worktree; if this now "
+            "passes with leaked=0, AgentTool gained a real cwd and the report "
+            "line about worktree isolation must be rewritten"
+        )
+        assert result.in_worktree == 0
+        assert result.leftover_worktrees == [], (
+            "a worktree with uncommitted changes is kept by cleanup, so a "
+            "leftover would mean the isolation worked at least once"
+        )
+        assert result.main_dirty_before == []
+        assert result.main_dirty_after == [
+            f"?? marker-{index}.txt" for index in range(3)
+        ]
+
+    def test_the_spawn_path_did_not_error(self, tmp_path: Path) -> None:
+        """A failed `git worktree add` returns early, so a clean run proves one ran.
+
+        Without this the leak could be explained as "no worktree was ever
+        created", which is a different -- and much less interesting -- bug than
+        "a worktree was created and never entered".
+        """
+        result = run_worktree_isolation(
+            WorktreeCase(repo=tmp_path / "repo", agents=2, marker="marker.txt")
+        )
+
+        assert result.spawn_errors == []
+
+    def test_a_run_with_no_agents_has_no_rate(self, tmp_path: Path) -> None:
+        """A zero denominator must not read as a clean zero rate."""
+        result = run_worktree_isolation(
+            WorktreeCase(repo=tmp_path / "repo", agents=0, marker="marker.txt")
+        )
+
+        assert result.writes == 0
+        assert result.leak_rate is None
