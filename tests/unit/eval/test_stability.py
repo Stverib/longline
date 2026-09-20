@@ -27,12 +27,62 @@ from longline.eval.stability import (
 
 def _run(
     case_id: str, repeat: int, passed: bool, calls: list[str],
-    *, tags: list[str] | None = None,
+    *, tags: list[str] | None = None, variant: str | None = None,
 ) -> CaseResult:
     return CaseResult(
         case_id=case_id, case_type="e2e", passed=passed, repeat_index=repeat,
-        tags=tags or [], tool_calls=[(name, {}) for name in calls],
+        tags=tags or [], variant=variant,
+        tool_calls=[(name, {}) for name in calls],
     )
+
+
+class TestArmsAreNotRepeats:
+    """两个臂共用一个 case_id, 但它们不是同一个东西的两次重复.
+
+    配对套件把 single 与 multi 两臂放进**同一份** results 里 (这是它故意
+    的: 一张表要同时看到两侧), 而 `case_stability` 只按 `case_id` 分组.
+    于是一次运行里 "single 过, multi 挂" 被读成 `mixed(content_driven)` --
+    一条关于**稳定性**的结论, 而它实际上是一条关于**架构**的结论, 且样本
+    只有 1 次.
+
+    付费探路里 pa-001 正是这样被报成 mixed 的: 它只跑了一次, 两臂各一次.
+    `repeat_index` 是重复轴, `variant` 是另一条轴; 把 variant 当 repeat 统计,
+    任何多臂报告都会得到这个错数.
+    """
+
+    def test_one_run_of_two_arms_is_not_a_mixed_case(self) -> None:
+        got = case_stability([
+            _run("pa-001", 0, True, ["Read"], variant="single_agent"),
+            _run("pa-001", 0, False, ["Read"], variant="multi_agent"),
+        ])
+
+        assert len(got) == 2, "the two arms are two things, not one"
+        assert {s.kind for s in got} == {SINGLE}, (
+            "each arm ran once; one run is not evidence of stability"
+        )
+
+    def test_repeats_within_an_arm_still_classify(self) -> None:
+        """分组变细之后, 臂内那 3 次重复仍要正常判 stable."""
+        got = case_stability([
+            _run("pa-001", i, True, ["Read"], variant="single_agent")
+            for i in range(3)
+        ] + [
+            _run("pa-001", i, False, ["Read"], variant="multi_agent")
+            for i in range(3)
+        ])
+
+        kinds = {s.variant: s.kind for s in got}
+        assert kinds == {"single_agent": STABLE, "multi_agent": ALWAYS_FAIL}
+
+    def test_a_variantless_suite_is_unchanged(self) -> None:
+        """单臂套件不带 variant, 分组必须与从前完全一致."""
+        got = case_stability([
+            _run("c", 0, True, ["Read"]),
+            _run("c", 1, False, ["Read"]),
+        ])
+
+        assert len(got) == 1
+        assert got[0].kind == MIXED
 
 
 class TestMixedCause:

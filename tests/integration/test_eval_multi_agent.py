@@ -290,6 +290,32 @@ async def test_every_row_is_json_serialisable_and_carries_both_variants(
     )
 
 
+@pytest.mark.asyncio
+async def test_repeats_rerun_the_case_and_stamp_the_index(tmp_path: Path) -> None:
+    """驱真实 runner 的重复, 而不是只测聚合的函数签名.
+
+    `repeats` 一路从 CLI 走到 `run_multi_agent_suite`, 中间任何一段丢掉它,
+    症状都不是报错 -- 是一条跑了 1 次却报成 3 次的记录. 所以这里断言的是
+    **真的跑了 3 遍**: 三次运行各自的 `repeat_index` 依次为 0/1/2, 且聚合把
+    它们算作 1 个任务, 3 次运行.
+    """
+    cases = group_of(load_multi_agent_cases(DATASET), CONTROLLED)[:1]
+
+    runs = await run_multi_agent_suite(
+        cases, api_key="offline", fixtures_dir=FIXTURES,
+        claude_dir=_claude_dir(tmp_path), usage=TURN_USAGE, repeats=3,
+    )
+
+    assert len(runs) == 3, "three repeats of one case is three runs"
+    assert [r.repeat_index for r in runs] == [0, 1, 2]
+    assert {r.case_id for r in runs} == {cases[0].id}
+
+    summary = aggregate_multi_agent(runs, group=CONTROLLED)
+    assert summary.num_cases == 1
+    assert summary.num_runs == 3
+    assert summary.eligible_runs == 3
+
+
 def test_the_dataset_is_committed_and_well_formed() -> None:
     """A number whose dataset is missing is not a number (`evals/README.md` §3)."""
     assert DATASET.is_file()

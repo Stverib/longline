@@ -1116,6 +1116,11 @@ async def _run_multi_agent(
         cases = [c for c in cases if c.group == args.group]
     if args.tag is not None:
         cases = [c for c in cases if args.tag in c.tags]
+    # `--case-id` before `--max-cases`, so a named subset is never silently
+    # truncated by a cap meant for smoke runs.
+    if args.case_id is not None:
+        wanted = set(args.case_id)
+        cases = [c for c in cases if c.id in wanted]
     if args.max_cases is not None:
         cases = cases[: args.max_cases]
     if not cases:
@@ -1132,6 +1137,7 @@ async def _run_multi_agent(
         claude_dir=None,
         usage=SCRIPTED_TURN_USAGE if args.offline else None,
         workers_override=args.workers,
+        repeats=args.repeats,
     )
     summaries = [
         aggregate_multi_agent(runs, group=group)
@@ -1139,10 +1145,12 @@ async def _run_multi_agent(
         if any(r.group == group for r in runs)
     ]
 
-    print(f"[eval] {len(runs)} multi-agent cases across {len(summaries)} group(s)")
+    print(f"[eval] {len(runs)} multi-agent case-runs across {len(summaries)} group(s)")
     for summary in summaries:
-        print(f"[eval]   group={summary.group}: {summary.num_cases} cases, "
-              f"{summary.eligible_cases} eligible, {summary.excluded_cases} excluded")
+        print(f"[eval]   group={summary.group}: {summary.num_cases} tasks, "
+              f"{summary.num_runs} case-runs, "
+              f"{summary.eligible_runs} eligible, "
+              f"{summary.num_runs - summary.eligible_runs} excluded")
         print(f"[eval]     SuccessRate single={_fmt_ratio(summary.single_success_rate)} "
               f"multi={_fmt_ratio(summary.multi_success_rate)}")
         print(f"[eval]     WallClockTime single={_fmt_ms(summary.single_wall_time_ms)} "
@@ -1162,7 +1170,7 @@ async def _run_multi_agent(
 
     metadata = run_metadata(
         run_id=run_id, suite="multi_agent", variant=args.variant, model=args.model,
-        case_file=case_file, repeat_index=0, repeats_completed=1,
+        case_file=case_file, repeat_index=0, repeats_completed=args.repeats,
         served_models=served_models_in(runs),
     )
     metadata["multi_agent"] = {

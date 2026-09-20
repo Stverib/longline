@@ -461,6 +461,8 @@ def _multi_agent_summary(*, mean_speedup: float | None) -> Any:
         num_cases=1,
         eligible_cases=1,
         excluded_cases=0,
+        num_runs=1,
+        eligible_runs=1,
         single_success_rate=both,
         multi_success_rate=both,
         single_wall_time_ms=16.9,
@@ -708,8 +710,8 @@ class TestStabilitySection:
         md = render_markdown(rep)
 
         assert "## Run stability" in md
-        assert "| mixed case | cause | first divergence |" in md
-        assert "| mixed | content_driven | - |" in md
+        assert "| mixed case | variant | cause | first divergence |" in md
+        assert "| mixed | - | content_driven | - |" in md
 
     def test_markdown_reports_first_action_consistency(self) -> None:
         rep = aggregate([

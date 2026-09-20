@@ -85,6 +85,7 @@ from longline.eval.multi_agent_runner import (
     leader_prompt,
     merge_instruction,
     run_multi_agent_case,
+    run_multi_agent_suite,
     subtask_prompt,
 )
 from longline.models.messages import Usage
@@ -645,6 +646,7 @@ def _stub_run(
     multi_ms: float = 50.0,
     single_tokens: int = 100,
     multi_tokens: int = 200,
+    repeat_index: int = 0,
 ) -> Any:
     """A `MultiAgentRun` with hand-set numbers, for the aggregation tests.
 
@@ -677,6 +679,7 @@ def _stub_run(
         single=variant(SINGLE, single_ms, single_tokens),
         multi=variant(MULTI, multi_ms, multi_tokens),
         expected_paths=[],
+        repeat_index=repeat_index,
     )
 
 
@@ -1677,6 +1680,79 @@ class TestWorkersOverride:
         assert effective_workers(case, None) == DEPENDENT_WORKERS
         with pytest.raises(ValueError, match="serial by contract"):
             effective_workers(case, 4)
+
+
+class TestRepeats:
+    """`--repeats` was accepted by the CLI and dropped on the floor down here.
+
+    The documented 2b invocation is 6 tasks x 2 arms x **3 repeats**. No code
+    path carried a repeat count: `run_multi_agent_suite` ran each case exactly
+    once and `MultiAgentRun` had no repeat field, so `--repeats 3` would have
+    produced 12 arm-executions instead of 36 -- and the report would have been a
+    complete, plausible, correctly-formatted table saying nothing about the
+    shortfall. Silently running one third of a paid sweep is the failure mode
+    this class exists to prevent.
+
+    The count is also what makes `mean_speedup` mean anything: with repeats, the
+    per-case ratios a repeat produces are one sample each, and averaging them
+    without saying how many tasks they came from lets a 3-repeat run of 6 tasks
+    read as an 18-task result.
+    """
+
+    def test_repeats_do_not_inflate_the_task_count(self) -> None:
+        runs = [
+            _stub_run("c1", CONTROLLED, passed=True, repeat_index=i) for i in range(3)
+        ] + [
+            _stub_run("c2", CONTROLLED, passed=True, repeat_index=i) for i in range(3)
+        ]
+
+        summary = aggregate_multi_agent(runs, group=CONTROLLED)
+
+        assert summary.num_cases == 2, "three repeats of one task are not three tasks"
+        assert summary.num_runs == 6, "and six case-runs is not the same as six tasks"
+
+    def test_the_per_category_block_separates_them_too(self) -> None:
+        """The category table is what gets quoted, so `n` there must not lie."""
+        runs = [
+            _stub_run("c1", CONTROLLED, passed=True, repeat_index=i) for i in range(3)
+        ]
+
+        block = aggregate_multi_agent(runs, group=CONTROLLED).by_category[
+            CATEGORY_ANALYSIS
+        ]
+
+        assert block["num_cases"] == 1
+        assert block["num_runs"] == 3
+
+    def test_one_repeat_leaves_the_counts_equal(self) -> None:
+        """Every existing suite runs one repeat; their numbers must not move."""
+        summary = aggregate_multi_agent(
+            [_stub_run("c1", CONTROLLED, passed=True)], group=CONTROLLED,
+        )
+
+        assert (summary.num_cases, summary.num_runs) == (1, 1)
+
+    def test_a_repeat_index_is_recorded_on_the_row(self) -> None:
+        """Recomputable from `raw.jsonl` alone (contract §3)."""
+        row = _stub_run("c1", CONTROLLED, passed=True, repeat_index=2).to_row()
+
+        assert row["repeat_index"] == 2
+
+    def test_the_suite_refuses_a_repeat_count_below_one(self) -> None:
+        """Zero repeats is a run that spends nothing and reports nothing.
+
+        It would also divide by zero in every mean, so the refusal has to be
+        here rather than only in the CLI's `_positive_int`: the runner is
+        reachable from tests and notebooks, and a sweep that silently measured
+        nothing is worse than one that refused to start.
+        """
+        with pytest.raises(ValueError, match="repeats"):
+            asyncio.run(
+                run_multi_agent_suite(
+                    [make_case()], api_key="offline", fixtures_dir=Path("."),
+                    repeats=0,
+                )
+            )
 
 
 __all__: list[str] = []

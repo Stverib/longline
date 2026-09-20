@@ -311,6 +311,12 @@ class MultiAgentRun:
     # report splits on this one, because a mean over three different kinds of
     # task answers a question about the corpus mix rather than the architecture.
     category: str = CATEGORY_ANALYSIS
+    # Which repetition of this case it is, 0-based. The repeat axis is separate
+    # from `variant`: the two arms are two different executions of the SAME
+    # task, not two samples of one configuration, and anything that groups runs
+    # by case id alone (the report's stability section does) will otherwise read
+    # "the two arms disagreed" as "the case is flaky".
+    repeat_index: int = 0
 
     @property
     def speedup(self) -> float | None:
@@ -339,6 +345,7 @@ class MultiAgentRun:
             "case_id": self.case_id,
             "group": self.group,
             "category": self.category,
+            "repeat_index": self.repeat_index,
             "workers": self.workers,
             "num_subtasks": self.num_subtasks,
             "expected_paths": self.expected_paths,
@@ -363,6 +370,12 @@ class MultiAgentSummary:
     measured quantities, **not** proportions: `Speedup` and `TokenOverhead` are
     unitless and get no Wilson interval, because there is no binomial trial
     behind them. Only the two success rates are `Ratio`s.
+
+    `num_cases` counts distinct TASKS and `num_runs` counts case-runs, so a
+    6-task 3-repeat sweep reads as 6 tasks / 18 runs rather than 18 cases. The
+    two are equal whenever `repeats == 1`, which is every suite but this one, so
+    the pair costs nothing to carry and is what keeps a repeated sweep from
+    publishing a denominator it did not have.
     """
 
     group: str
@@ -379,6 +392,13 @@ class MultiAgentSummary:
     multi_tokens: dict[str, int]
     single_tool_calls: int
     multi_tool_calls: int
+    # How many case-runs the figures above were computed over. Equals
+    # `num_cases` when nothing was repeated; larger when it was. Mandatory, not
+    # defaulted: a default of 0 would let a caller that forgot it publish a
+    # count of zero next to a correct `num_cases`, which is the silent-wrong-
+    # number shape this suite keeps producing.
+    num_runs: int
+    eligible_runs: int
     agent_counts: list[int] = field(default_factory=list)
     per_case: list[dict[str, object]] = field(default_factory=list)
     # One self-contained block per CATEGORY present, each with its own success
@@ -412,6 +432,8 @@ class MultiAgentSummary:
             "num_cases": self.num_cases,
             "eligible_cases": self.eligible_cases,
             "excluded_cases": self.excluded_cases,
+            "num_runs": self.num_runs,
+            "eligible_runs": self.eligible_runs,
             "success_rate": {
                 "single_agent": self.single_success_rate.to_dict(),
                 "multi_agent": self.multi_success_rate.to_dict(),
@@ -1396,6 +1418,7 @@ async def run_multi_agent_case(
     claude_dir: Path | None = None,
     usage: Any = None,
     workers_override: int | None = None,
+    repeat_index: int = 0,
 ) -> MultiAgentRun:
     """Run one case's single and multi variants, each in its own sandbox.
 
@@ -1433,6 +1456,7 @@ async def run_multi_agent_case(
         single=single,
         multi=multi,
         expected_paths=case.expected_paths(),
+        repeat_index=repeat_index,
     )
     # Both arms are asked, in that order, and the first reason wins. A broken
     # BASELINE is reported ahead of a broken fan-out because the ratio is
@@ -1520,8 +1544,9 @@ async def run_multi_agent_suite(
     claude_dir: Path | None = None,
     usage: Any = None,
     workers_override: int | None = None,
+    repeats: int = 1,
 ) -> list[MultiAgentRun]:
-    """Run every case serially.
+    """Run every case serially, `repeats` times each.
 
     Serial by contract (§4.6): a parallel quality run would contend for the API
     and for the host's cores, and `WallClockTime` is one of the reported
@@ -1529,20 +1554,33 @@ async def run_multi_agent_suite(
     instead. The fan-out *inside* one variant deliberately does run its workers
     concurrently; that is the thing being measured.
 
+    The repeats of one case run back to back rather than the corpus being swept
+    once per repeat: `repeat_index` is what the report's stability section
+    groups on, and interleaving would make a case's samples differ by whatever
+    else happened on the host in between.
+
     `workers_override` applies to every case in the run, which is what the
     agent-count axis wants: two runs of the SAME case file at 2 and 4, compared
     to each other. A `dependent` case refuses a value other than 1, so a corpus
     containing both shapes cannot be swept blindly -- see `effective_workers`.
+
+    `repeats` is validated here and not only at the CLI: a repeat count of zero
+    is a sweep that spends nothing and reports nothing, and it divides by zero
+    in every mean. The runner is reachable from tests and notebooks too.
     """
+    if repeats < 1:
+        raise ValueError(f"repeats must be at least 1, got {repeats!r}")
     runs: list[MultiAgentRun] = []
     for case in cases:
-        runs.append(
-            await run_multi_agent_case(
-                case, api_key=api_key, fixtures_dir=fixtures_dir, model=model,
-                claude_dir=claude_dir, usage=usage,
-                workers_override=workers_override,
+        for repeat_index in range(repeats):
+            runs.append(
+                await run_multi_agent_case(
+                    case, api_key=api_key, fixtures_dir=fixtures_dir, model=model,
+                    claude_dir=claude_dir, usage=usage,
+                    workers_override=workers_override,
+                    repeat_index=repeat_index,
+                )
             )
-        )
     return runs
 
 
@@ -1583,7 +1621,8 @@ def _pair_block(eligible: Sequence[MultiAgentRun]) -> dict[str, object]:
         )
 
     return {
-        "num_cases": len(eligible),
+        "num_cases": len({r.case_id for r in eligible}),
+        "num_runs": len(eligible),
         "success_rate": {
             "single_agent": Ratio.fraction(r.single.passed for r in eligible).to_dict(),
             "multi_agent": Ratio.fraction(r.multi.passed for r in eligible).to_dict(),
@@ -1650,9 +1689,13 @@ def aggregate_multi_agent(
 
     return MultiAgentSummary(
         group=group or "all",
-        num_cases=len(selected),
-        eligible_cases=len(eligible),
-        excluded_cases=len(selected) - len(eligible),
+        num_cases=len({r.case_id for r in selected}),
+        eligible_cases=len({r.case_id for r in eligible}),
+        excluded_cases=(
+            len({r.case_id for r in selected}) - len({r.case_id for r in eligible})
+        ),
+        num_runs=len(selected),
+        eligible_runs=len(eligible),
         single_success_rate=Ratio.fraction(r.single.passed for r in eligible),
         multi_success_rate=Ratio.fraction(r.multi.passed for r in eligible),
         single_wall_time_ms=_mean([r.single.duration_ms for r in eligible]),

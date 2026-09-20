@@ -53,12 +53,15 @@ _WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "NotebookEdit"})
 
 @dataclass
 class CaseStability:
-    """How one case behaved across its repeats."""
+    """How one case behaved across its repeats, within ONE variant."""
 
     case_id: str
     runs: int
     passes: int
     kind: str
+    # None for a single-arm suite. Set when a paired suite put two arms in one
+    # result list, so the two rows this case now produces are tellable apart.
+    variant: str | None = None
     mixed_cause: str | None = None
     first_divergence: int | None = None
     sequences: list[list[str]] = field(default_factory=list)
@@ -66,6 +69,7 @@ class CaseStability:
     def to_dict(self) -> dict[str, object]:
         return {
             "case_id": self.case_id,
+            "variant": self.variant,
             "runs": self.runs,
             "passes": self.passes,
             "kind": self.kind,
@@ -111,14 +115,25 @@ def _classify_mixed(seqs: list[tuple[tuple[str, ...], bool]]) -> tuple[str, int 
 
 
 def case_stability(results: Sequence[CaseResult]) -> list[CaseStability]:
-    """One `CaseStability` per case id, sorted by id."""
-    grouped: dict[str, list[CaseResult]] = {}
+    """One `CaseStability` per (case id, variant), sorted by id then variant.
+
+    The variant is part of the key, not decoration. A paired suite deliberately
+    puts two arms of the SAME case id into one result list, and grouping by case
+    id alone reads their disagreement as instability: one run each of
+    "single passed, multi failed" becomes `mixed(content_driven)`, a claim about
+    run-to-run flakiness made from a single sample of each. `repeat_index` is
+    the repeat axis; `variant` is a different axis, and only the first is
+    evidence about stability.
+
+    Suites that run one variant leave it None, so their grouping is unchanged.
+    """
+    grouped: dict[tuple[str, str | None], list[CaseResult]] = {}
     for result in results:
-        grouped.setdefault(result.case_id, []).append(result)
+        grouped.setdefault((result.case_id, result.variant), []).append(result)
 
     out: list[CaseStability] = []
-    for case_id in sorted(grouped):
-        seqs = _outcomes(grouped[case_id])
+    for case_id, variant in sorted(grouped, key=lambda k: (k[0], k[1] or "")):
+        seqs = _outcomes(grouped[(case_id, variant)])
         passes = sum(1 for _, passed in seqs if passed)
         cause: str | None = None
         divergence: int | None = None
@@ -135,6 +150,7 @@ def case_stability(results: Sequence[CaseResult]) -> list[CaseStability]:
             cause, divergence = _classify_mixed(seqs)
         out.append(CaseStability(
             case_id=case_id,
+            variant=variant,
             runs=len(seqs),
             passes=passes,
             kind=kind,

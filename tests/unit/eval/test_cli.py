@@ -11,6 +11,8 @@ import pytest
 from longline.eval import cli
 from longline.eval.types import ToolCallCase
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 def test_parse_known_args_defaults(tmp_path: Path) -> None:
     ns = cli.parse_args(["--case-file", str(tmp_path / "c.jsonl")])
@@ -968,6 +970,98 @@ class TestPairAndCollabSuites:
         assert cli.SUITES["multi_agent"] == ("multi_agent.jsonl", "multi_agent")
         assert cli.SUITES["safety"] == ("safety.jsonl", "safety")
         assert "safety" in cli.TYPE_CHOICES
+
+
+class TestPairSuiteHonoursItsFlags:
+    """`--repeats` 与 `--case-id` 在这条路径上都曾经不生效.
+
+    2b 的既定调用是 6 任务 x 2 臂 x **3 次**. `_run_multi_agent` 既不把
+    `--repeats` 传下去 (`run_multi_agent_suite` 当时根本没有这个参数), 也不
+    应用 `--case-id` (只认 `--group` / `--tag` / `--max-cases`). 于是那条
+    命令会跑 12 次臂执行而不是 36 次, 并且出一张格式完整, 看起来毫无问题的
+    表 -- 一次静默跑掉三分之二的付费扫描, 而 `--repeats` 在 `--help` 里
+    写得清清楚楚.
+
+    选 6 条**跨三分类**的用例这件事也必须走 `--case-id`: 语料是按 category
+    排序的, `--max-cases 6` 取到的是同一类的前 6 条, 而按 category 分表正是
+    这套装置存在的理由.
+    """
+
+    @staticmethod
+    def _namespaces(tmp_path: Path, *extra: str) -> Any:
+        return cli.parse_args([
+            "--suite", "pair", "--offline", "--run-id", "t",
+            "--case-file", str(PROJECT_ROOT / "evals" / "multi_agent_benefit.jsonl"),
+            "--fixtures-dir", str(PROJECT_ROOT / "evals" / "fixtures"),
+            "--out-dir", str(tmp_path),
+            *extra,
+        ])
+
+    @pytest.mark.asyncio
+    async def test_repeats_and_case_ids_reach_the_suite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from longline.eval import multi_agent_runner as runner_mod
+
+        seen: dict[str, Any] = {}
+
+        async def fake_suite(cases: Any, **kwargs: Any) -> list[Any]:
+            seen["ids"] = [c.id for c in cases]
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(runner_mod, "run_multi_agent_suite", fake_suite)
+
+        ns = self._namespaces(
+            tmp_path,
+            "--case-id", "pa-001", "--case-id", "pm-003", "--case-id", "pd-006",
+            "--repeats", "3",
+        )
+        await cli._run_multi_agent(
+            ns, case_file=Path(ns.case_file), fixtures=Path(ns.fixtures_dir),
+            out_dir=tmp_path, api_key="offline", run_id="t",
+        )
+
+        assert seen["ids"] == ["pa-001", "pm-003", "pd-006"], (
+            "the named subset, in corpus order -- not the first N of one category"
+        )
+        assert seen["repeats"] == 3
+
+    @pytest.mark.asyncio
+    async def test_the_repeat_count_is_not_the_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """一次跑不传 `--repeats` 时仍是 1 次, 别把默认值也一起改掉."""
+        from longline.eval import multi_agent_runner as runner_mod
+
+        seen: dict[str, Any] = {}
+
+        async def fake_suite(cases: Any, **kwargs: Any) -> list[Any]:
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(runner_mod, "run_multi_agent_suite", fake_suite)
+
+        ns = self._namespaces(tmp_path, "--case-id", "pa-001")
+        await cli._run_multi_agent(
+            ns, case_file=Path(ns.case_file), fixtures=Path(ns.fixtures_dir),
+            out_dir=tmp_path, api_key="offline", run_id="t",
+        )
+
+        assert seen["repeats"] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_case_id_selects_nothing_and_says_so(
+        self, tmp_path: Path,
+    ) -> None:
+        """选空必须是错误, 不是一次空跑 (`--case-id` 的 help 就是这么写的)."""
+        ns = self._namespaces(tmp_path, "--case-id", "no-such-case")
+
+        with pytest.raises(SystemExit, match=r"no .*cases selected"):
+            await cli._run_multi_agent(
+                ns, case_file=Path(ns.case_file), fixtures=Path(ns.fixtures_dir),
+                out_dir=tmp_path, api_key="offline", run_id="t",
+            )
 
 
 class TestMultiAgentRowsCarryTheirTurnCount:

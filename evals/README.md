@@ -1475,6 +1475,24 @@ uv run --extra dev python -m longline.eval --suite pair --allow-paid --run-id <i
 `--suite pair` 不给 `--offline` 也不给 `--allow-paid` 时**直接拒绝启动**。理由是它失败的样子
 不是一条报错，是一张账单。
 
+`--repeats N` 让每条用例跑 N 次，每次带自己的 `repeat_index`。**这一条曾经是坏的**：`--repeats`
+被 `argparse` 收下，然后在这条路径上被丢掉（`run_multi_agent_suite` 当时根本没有这个参数，
+`_run_multi_agent` 也没传），所以 `--repeats 3` 会跑 1 次并出一张格式完整、看不出短少的表。
+现在重复真的有用了，而且**任务数与运行数分开报**：
+
+```text
+Tasks: 6 (18 case-runs), 18 eligible, 0 excluded
+```
+
+`n` 那一列是**任务数**；旁边的比值是在**运行数**上求的。两者只在重复时不等，而重复会被写出来
+（`6 (18 runs)`）而不是悄悄折进去 —— 一个叫 `n` 的列如果静默地数运行数，一次 6 任务的 3 遍
+扫描就会读成 18 条任务的结果。
+
+重复也是让「运行稳定性」那一节有意义的前提：`case_stability` 的**分组键是 (case_id, variant)**。
+配对套件故意把两条臂放进同一份 results 里，只按 `case_id` 分组会把「single 过、multi 挂」读成
+`mixed(content_driven)` —— 一条关于**稳定性**的结论，用两次各 1 个样本，而它其实是一条关于
+**架构**的结论。`repeat_index` 是重复轴，`variant` 是另一条轴。
+
 #### 语料：18 条，三个 category，各 6 条
 
 | category | 任务形状 | `workers` |

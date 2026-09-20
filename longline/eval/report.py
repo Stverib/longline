@@ -721,10 +721,10 @@ def render_markdown(
         if mixed:
             lines += [
                 "",
-                "| mixed case | cause | first divergence |",
-                "|---|---|---|",
+                "| mixed case | variant | cause | first divergence |",
+                "|---|---|---|---|",
                 *(
-                    f"| {s.case_id} | {s.mixed_cause} | "
+                    f"| {s.case_id} | {s.variant or '-'} | {s.mixed_cause} | "
                     f"{'-' if s.first_divergence is None else s.first_divergence} |"
                     for s in mixed
                 ),
@@ -1007,8 +1007,19 @@ def _category_lines(summary: MultiAgentSummary) -> list[str]:
         speedup = block["speedup"]
         per_1k = block["success_per_1k_tokens"]
         assert isinstance(rate, dict) and isinstance(speedup, dict) and isinstance(per_1k, dict)
+        # `n` is TASKS; the ratios beside it are over case-runs. They differ
+        # only when a case was repeated, and the repeats are shown rather than
+        # folded in -- a column labelled `n` that silently counted runs would
+        # let a 3-repeat sweep of 6 tasks read as an 18-task result.
+        num_cases = block["num_cases"]
+        num_runs = block.get("num_runs")
+        n_cell = (
+            f"{num_cases}"
+            if num_runs in (None, num_cases)
+            else f"{num_cases} ({num_runs} runs)"
+        )
         lines.append(
-            f"| `{category}` | {block['num_cases']} | "
+            f"| `{category}` | {n_cell} | "
             f"{_fmt_pct_dict(rate['single_agent'])} | "
             f"{_fmt_pct_dict(rate['multi_agent'])} | "
             f"{_fmt_speedup(_as_float(speedup['speedup_mean']))} | "
@@ -1166,9 +1177,10 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
                 "reported on its own and never merged with the controlled number."
             ),
             "",
-            f"- **Cases:** {summary.num_cases} total, {summary.eligible_cases} eligible, "
-            f"{summary.excluded_cases} excluded (a variant did not complete or its "
-            "token accounting did not reconcile)",
+            f"- **Tasks:** {summary.num_cases} ({summary.num_runs} case-runs), "
+            f"{summary.eligible_runs} eligible, "
+            f"{summary.num_runs - summary.eligible_runs} excluded (a variant did not "
+            "complete or its token accounting did not reconcile)",
             f"- **Agent counts (multi arm):** {summary.agent_counts or 'n/a'}",
         ]
 
@@ -1198,11 +1210,11 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
             (
                 f"| Speedup | {_fmt_speedup(summary.mean_speedup)} "
                 f"| n/a | mean over "
-                f"{summary.eligible_cases} per-case `single / multi` ratios |"
+                f"{summary.eligible_runs} per-case-run `single / multi` ratios |"
             ),
             (
                 f"| TokenOverhead | {_fmt_pct_ratio(summary.mean_token_overhead)} "
-                f"(ratio) | n/a | mean over {summary.eligible_cases} per-case "
+                f"(ratio) | n/a | mean over {summary.eligible_runs} per-case-run "
                 "`(multi - single) / single` ratios |"
             ),
             "",
