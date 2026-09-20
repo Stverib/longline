@@ -56,6 +56,7 @@ from longline.eval.child_usage import (
 from longline.eval.multi_agent import (
     CATEGORIES,
     CATEGORY_ANALYSIS,
+    CATEGORY_DEPENDENT,
     CATEGORY_MODIFICATION,
     CONTROLLED,
     EXPLORATORY,
@@ -64,6 +65,7 @@ from longline.eval.multi_agent import (
     CaseParseError,
     MultiAgentCase,
     Subtask,
+    chain_order,
 )
 from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
@@ -862,17 +864,196 @@ class TestCategoryAxis:
     def test_every_category_is_loadable(self) -> None:
         """A constant in `CATEGORIES` that the loader rejects is a dead branch."""
         for category in CATEGORIES:
-            case = MultiAgentCase.from_dict(_case_dict(category=category))
+            case = MultiAgentCase.from_dict(
+                _case_dict(category=category, subtasks=_subtasks_for(category))
+            )
             assert case.category == category
 
     def test_group_and_category_are_independent(self) -> None:
-        """Four combinations, all valid -- the axes do not constrain each other."""
+        """Four combinations, all valid -- the axes do not constrain each other.
+
+        Note what this test does NOT claim: that one subtask list is legal in
+        every category. `dependent` requires a total order and the others
+        require the absence of one, so the list has to move with the category.
+        That mutual exclusion is the loader's actual shape, and hiding it here
+        would make this test assert something false.
+        """
         for group in (CONTROLLED, EXPLORATORY):
             for category in CATEGORIES:
-                case = MultiAgentCase.from_dict(
-                    _case_dict(group=group, category=category)
-                )
+                case = MultiAgentCase.from_dict(_case_dict(
+                    group=group, category=category,
+                    subtasks=_subtasks_for(category),
+                ))
                 assert (case.group, case.category) == (group, category)
+
+
+def _chain(*specs: tuple[str, str]) -> list[dict[str, Any]]:
+    """`(id, writes)` pairs into the declared-subtask shape, each on the last.
+
+    Every step but the first declares the step before it as its predecessor, so
+    the result is a total order by construction. Tests that want a BROKEN chain
+    take this and edit one entry, which keeps the breakage the only difference
+    from a case the loader accepts.
+    """
+    out: list[dict[str, Any]] = []
+    for index, (sid, writes) in enumerate(specs):
+        entry: dict[str, Any] = {
+            "id": sid, "instruction": f"step {sid}", "writes": writes,
+        }
+        if index:
+            entry["depends_on"] = [specs[index - 1][0]]
+        out.append(entry)
+    return out
+
+
+class TestDependentChainValidation:
+    """A `dependent` case's subtasks form a total order, or the case is rejected.
+
+    The non-overlap rule that `_parse_subtasks` enforces everywhere else is
+    about CONCURRENCY: a fan-out that writes one path twice loses one of the two
+    writes. A declared chain has no concurrency -- step N+1 gets a fresh
+    teammate only after step N's has finished -- so overlapping writes are the
+    point of the category rather than a hazard, and a different check replaces
+    it.
+    """
+
+    def test_legal_chain_loads(self) -> None:
+        case = MultiAgentCase.from_dict(_case_dict(
+            category=CATEGORY_DEPENDENT,
+            subtasks=_chain(("s1", "src/a.py"), ("s2", "src/a.py"), ("s3", "src/a.py")),
+        ))
+
+        assert [s.id for s in case.subtasks] == ["s1", "s2", "s3"]
+        assert case.subtasks[0].depends_on == ()
+        assert case.subtasks[2].depends_on == ("s2",)
+
+    def test_chain_order_is_the_declared_order(self) -> None:
+        case = MultiAgentCase.from_dict(_case_dict(
+            category=CATEGORY_DEPENDENT,
+            subtasks=_chain(("s1", "a.py"), ("s2", "a.py"), ("s3", "a.py")),
+        ))
+
+        assert [s.id for s in chain_order(case.subtasks)] == ["s1", "s2", "s3"]
+
+    def test_overlapping_writes_raise_without_the_dependent_category(self) -> None:
+        """The two loaders must disagree, and this is the half that rejects.
+
+        Asserted separately from the accepting case because the whole point of
+        the new path is that the SAME declarations are legal in one category and
+        illegal in another. A test that only checked the accepting side would
+        pass just as well if the rule had been deleted outright.
+
+        The subtasks here carry no `depends_on`: under a non-chain category a
+        declared predecessor is rejected first, so a case that declared one
+        would test that rule instead of this one.
+        """
+        with pytest.raises(CaseParseError, match="race"):
+            MultiAgentCase.from_dict(_case_dict(
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "src/a.py"},
+                    {"id": "s2", "instruction": "b", "writes": "src/a.py"},
+                ],
+            ))
+
+    def test_declared_predecessors_are_rejected_outside_a_chain(self) -> None:
+        """A chain filed under the wrong category would be run CONCURRENTLY.
+
+        Both variants of a non-chain case are free to run the subtasks in any
+        order, so a case that declares `depends_on` and is not `dependent` is
+        not merely mislabelled -- it will be executed in a way its declarations
+        say is wrong, and if its steps share a path, silently lose a write.
+        """
+        with pytest.raises(CaseParseError, match="depends_on"):
+            MultiAgentCase.from_dict(_case_dict(
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "a.py"},
+                    {"id": "s2", "instruction": "b", "writes": "b.py",
+                     "depends_on": ["s1"]},
+                ],
+            ))
+
+    def test_cycle_is_rejected(self) -> None:
+        subtasks = _chain(("s1", "a.py"), ("s2", "a.py"), ("s3", "a.py"))
+        subtasks[0]["depends_on"] = ["s3"]          # s1 <- s3 <- s2 <- s1
+        with pytest.raises(CaseParseError, match=r"total order|cycle|unreachable"):
+            MultiAgentCase.from_dict(
+                _case_dict(category=CATEGORY_DEPENDENT, subtasks=subtasks)
+            )
+
+    def test_fork_is_rejected(self) -> None:
+        """Two steps depending on one predecessor can run in either order."""
+        with pytest.raises(CaseParseError, match=r"total order|fork|successor"):
+            MultiAgentCase.from_dict(_case_dict(
+                category=CATEGORY_DEPENDENT,
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "a.py"},
+                    {"id": "s2", "instruction": "b", "writes": "a.py",
+                     "depends_on": ["s1"]},
+                    {"id": "s3", "instruction": "c", "writes": "a.py",
+                     "depends_on": ["s1"]},
+                ],
+            ))
+
+    def test_two_roots_are_rejected(self) -> None:
+        """Two first steps means two chains, and which runs first is undefined."""
+        with pytest.raises(CaseParseError, match=r"total order|first step"):
+            MultiAgentCase.from_dict(_case_dict(
+                category=CATEGORY_DEPENDENT,
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "a.py"},
+                    {"id": "s2", "instruction": "b", "writes": "b.py"},
+                ],
+            ))
+
+    def test_missing_predecessor_is_rejected(self) -> None:
+        subtasks = _chain(("s1", "a.py"), ("s2", "a.py"))
+        subtasks[1]["depends_on"] = ["s9"]
+        with pytest.raises(CaseParseError, match=r"unknown predecessor|s9"):
+            MultiAgentCase.from_dict(
+                _case_dict(category=CATEGORY_DEPENDENT, subtasks=subtasks)
+            )
+
+    def test_self_dependency_is_rejected(self) -> None:
+        with pytest.raises(CaseParseError, match=r"itself|cycle"):
+            MultiAgentCase.from_dict(_case_dict(
+                category=CATEGORY_DEPENDENT,
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "a.py",
+                     "depends_on": ["s1"]},
+                    {"id": "s2", "instruction": "b", "writes": "a.py",
+                     "depends_on": ["s1"]},
+                ],
+            ))
+
+    def test_two_predecessors_are_rejected(self) -> None:
+        """A step with two predecessors is a join, not a link in a chain."""
+        with pytest.raises(CaseParseError, match=r"predecessor|total order"):
+            MultiAgentCase.from_dict(_case_dict(
+                category=CATEGORY_DEPENDENT,
+                subtasks=[
+                    {"id": "s1", "instruction": "a", "writes": "a.py"},
+                    {"id": "s2", "instruction": "b", "writes": "a.py"},
+                    {"id": "s3", "instruction": "c", "writes": "a.py",
+                     "depends_on": ["s1", "s2"]},
+                ],
+            ))
+
+
+def _subtasks_for(category: str) -> list[dict[str, Any]]:
+    """A subtask list the loader accepts for this category.
+
+    The two shapes are mutually exclusive rather than merely different:
+    `dependent` needs a declared total order and must overlap its writes, while
+    every other category rejects `depends_on` outright and rejects two steps
+    sharing a path. So a test that varies the category has to vary the
+    subtasks with it -- there is no one list that satisfies all three.
+    """
+    if category == CATEGORY_DEPENDENT:
+        return _chain(("s1", "a.py"), ("s2", "a.py"))
+    return [
+        {"id": "s1", "instruction": "a", "writes": "a.py"},
+        {"id": "s2", "instruction": "b", "writes": "b.py"},
+    ]
 
 
 def _case_dict(**overrides: Any) -> dict[str, Any]:

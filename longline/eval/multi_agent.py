@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from longline.eval.types import CaseParseError, E2ECase
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from pathlib import Path
 
 # The two variants, matching the contract's `single_agent` / `multi_agent`
@@ -132,6 +132,11 @@ class Subtask:
     id: str
     instruction: str
     writes: str
+    # Declared predecessors, empty for every subtask of a non-chain case. Only
+    # `dependent` cases populate it, and only there is it load-bearing: the
+    # order the runner drives the steps in is derived from this, not from the
+    # order they happen to appear in the case file.
+    depends_on: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], *, case_id: str) -> Subtask:
@@ -153,7 +158,18 @@ class Subtask:
                 f"{case_id}/{sid}: 'writes' must be a relative path inside the "
                 f"sandbox, got {writes!r}"
             )
-        return cls(id=sid, instruction=instruction, writes=writes)
+        raw_deps = d.get("depends_on", [])
+        if not isinstance(raw_deps, list) or not all(
+            isinstance(dep, str) and dep for dep in raw_deps
+        ):
+            raise CaseParseError(
+                f"{case_id}/{sid}: 'depends_on' must be a list of non-empty "
+                f"subtask ids, got {raw_deps!r}"
+            )
+        return cls(
+            id=sid, instruction=instruction, writes=writes,
+            depends_on=tuple(raw_deps),
+        )
 
 
 @dataclass
@@ -235,7 +251,9 @@ class MultiAgentCase(E2ECase):
                 f"{cid}: 'category' must be one of {list(CATEGORIES)}, got {category!r}"
             )
 
-        subtasks = cls._parse_subtasks(d.get("subtasks"), case_id=cid)
+        subtasks = cls._parse_subtasks(
+            d.get("subtasks"), case_id=cid, category=category,
+        )
         workers = d.get("workers", MIN_WORKERS)
         if isinstance(workers, bool) or not isinstance(workers, int):
             raise CaseParseError(f"{cid}: 'workers' must be an int, got {workers!r}")
@@ -289,7 +307,9 @@ class MultiAgentCase(E2ECase):
         )
 
     @staticmethod
-    def _parse_subtasks(raw: object, *, case_id: str) -> list[Subtask]:
+    def _parse_subtasks(
+        raw: object, *, case_id: str, category: str = CATEGORY_ANALYSIS
+    ) -> list[Subtask]:
         if raw is None:
             return []
         if not isinstance(raw, list):
@@ -298,6 +318,22 @@ class MultiAgentCase(E2ECase):
         ids = [s.id for s in subtasks]
         if len(set(ids)) != len(ids):
             raise CaseParseError(f"{case_id}: duplicate subtask ids {ids}")
+
+        if category == CATEGORY_DEPENDENT:
+            # A chain is serial by construction, so two steps writing one path
+            # is the category's whole shape rather than a race. What replaces
+            # the overlap rule is the total-order check: without it a case
+            # could declare a fan-out, call it a chain, and be run serially --
+            # measuring the handoff tax while actually doing parallel work.
+            _validate_dependency_chain(subtasks, case_id=case_id)
+            return subtasks
+
+        if any(subtask.depends_on for subtask in subtasks):
+            raise CaseParseError(
+                f"{case_id}: 'depends_on' is only meaningful for a "
+                f"{CATEGORY_DEPENDENT!r} case; this one is {category!r}, where "
+                "both variants are free to run the subtasks in any order"
+            )
 
         # Non-overlapping writes (contract §8.3). Compared on the normalised
         # relative path so `a/b.py` and `a\b.py` -- the same file on Windows --
@@ -313,6 +349,103 @@ class MultiAgentCase(E2ECase):
                 )
             seen[key] = subtask.id
         return subtasks
+
+
+def chain_order(
+    subtasks: Sequence[Subtask], *, case_id: str = "<unknown>"
+) -> list[Subtask]:
+    """The steps of a `dependent` case in the order they must run.
+
+    THE one definition of "chain order": the loader calls it to reject a case
+    that is not a total order, and the runner calls it to decide what to drive
+    next. Two copies of this walk would eventually disagree about a case that
+    both accept, and the disagreement would land as steps running in an order
+    the case never declared.
+
+    Every structural violation gets its own message because each one means
+    something different to whoever wrote the case:
+
+    - an unknown predecessor is a typo;
+    - a step with two predecessors is a join, and a join means the two inputs
+      could be produced in either order -- the case is not a chain;
+    - a step with two successors is a fork, same objection;
+    - a self-dependency is the degenerate fork;
+    - two roots means two chains, and which runs first is undefined;
+    - a back edge is a cycle, so no step is first.
+
+    The walk is iterative and bounded by the number of steps, so a cycle
+    terminates here rather than spinning.
+    """
+    ids = [s.id for s in subtasks]
+    known = set(ids)
+    if len(known) != len(ids):
+        raise CaseParseError(f"{case_id}: duplicate subtask ids in a dependent chain")
+
+    successors: dict[str, list[str]] = {sid: [] for sid in ids}
+    by_id = {s.id: s for s in subtasks}
+    for subtask in subtasks:
+        if len(subtask.depends_on) > 1:
+            raise CaseParseError(
+                f"{case_id}: subtask {subtask.id!r} declares "
+                f"{len(subtask.depends_on)} predecessors; a chain is a total "
+                "order, so every step has exactly one (or, for the first, none)"
+            )
+        for pred in subtask.depends_on:
+            if pred == subtask.id:
+                raise CaseParseError(
+                    f"{case_id}: subtask {subtask.id!r} depends on itself"
+                )
+            if pred not in known:
+                raise CaseParseError(
+                    f"{case_id}: subtask {subtask.id!r} declares unknown "
+                    f"predecessor {pred!r}"
+                )
+            successors[pred].append(subtask.id)
+
+    forked = sorted(sid for sid, succ in successors.items() if len(succ) > 1)
+    if forked:
+        raise CaseParseError(
+            f"{case_id}: {forked!r} have more than one successor; a fork is not "
+            "a total order and cannot be driven serially"
+        )
+
+    roots = [s.id for s in subtasks if not s.depends_on]
+    if len(roots) != 1:
+        raise CaseParseError(
+            f"{case_id}: a dependent chain needs exactly one first step, found "
+            f"{len(roots)} ({roots!r}); without exactly one it is not a total order"
+        )
+
+    order: list[Subtask] = []
+    seen: set[str] = set()
+    cursor: str | None = roots[0]
+    while cursor is not None:
+        if cursor in seen:
+            raise CaseParseError(f"{case_id}: dependency cycle through {cursor!r}")
+        seen.add(cursor)
+        order.append(by_id[cursor])
+        nxt = successors[cursor]
+        cursor = nxt[0] if nxt else None
+
+    if len(seen) != len(ids):
+        unreachable = sorted(known - seen)
+        raise CaseParseError(
+            f"{case_id}: subtasks {unreachable!r} are unreachable from the first "
+            "step, so the case is not a total order"
+        )
+    return order
+
+
+def _validate_dependency_chain(subtasks: Sequence[Subtask], *, case_id: str) -> None:
+    """Reject a `dependent` case whose steps are not a total order.
+
+    A thin wrapper over `chain_order` so the loader and the runner share one
+    walk. Written as a separate name because the two callers want different
+    things from the same computation -- the loader wants a verdict, the runner
+    wants the order -- and inlining the call at the loader would make it look
+    like the check and the drive were independent rules.
+    """
+    chain_order(subtasks, case_id=case_id)
 
 
 def fixture_fingerprint(root: Path) -> dict[str, str]:
