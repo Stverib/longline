@@ -972,6 +972,75 @@ class TestPairAndCollabSuites:
         assert "safety" in cli.TYPE_CHOICES
 
 
+class TestTheConsoleDoesNotLeakThePooledFigure:
+    """报告扣下了组级头条, 控制台却照印 -- 而控制台是跑的时候唯一看得见的东西.
+
+    第一次付费跑 2b 时, `report.md` 正确地扣下了跨三类的合并数, 终端却印着
+    `SuccessRate single=94.4% multi=100.0%` 与 `Speedup=0.46x`. 那正是
+    「三类任务永不合并成总平均」要挡的那个数: 它描述的是这份 6/6/6 语料的
+    配比, 不是架构, 语料一重新配比它就变.
+
+    两个输出通道只守一个等于没守, 而且漏的那个是操作员真正在读的那个 --
+    报告要等跑完才存在.
+    """
+
+    @staticmethod
+    def _summary(*, categories: int, is_pooled: bool) -> Any:
+        from longline.eval.metrics import Ratio, speedup_block
+        from longline.eval.multi_agent_runner import MultiAgentSummary
+
+        block = {
+            "num_cases": 2,
+            "num_runs": 6,
+            "success_rate": {
+                "single_agent": Ratio(numerator=6, denominator=6).to_dict(),
+                "multi_agent": Ratio(numerator=5, denominator=6).to_dict(),
+            },
+            "speedup": speedup_block([0.4, 0.5, 0.6]),
+            "token_overhead": 2.0,
+            "tokens": {},
+            "tool_calls": {},
+            "success_per_1k_tokens": {},
+        }
+        both = Ratio(numerator=1, denominator=1)
+        summary = MultiAgentSummary(
+            group="controlled", num_cases=4, eligible_cases=4, excluded_cases=0,
+            num_runs=12, eligible_runs=12,
+            single_success_rate=both, multi_success_rate=both,
+            single_wall_time_ms=1.0, multi_wall_time_ms=2.0,
+            mean_speedup=0.46, mean_token_overhead=2.14,
+            single_tokens={"total_tokens": 1, "child_tokens": 0},
+            multi_tokens={"total_tokens": 2, "child_tokens": 1},
+            single_tool_calls=1, multi_tool_calls=2,
+            by_category={f"cat{i}": block for i in range(categories)},
+        )
+        assert summary.is_pooled is is_pooled
+        return summary
+
+    def test_a_pooled_group_prints_no_group_level_metric(self) -> None:
+        lines = cli.multi_agent_console_lines(self._summary(categories=3, is_pooled=True))
+        text = "\n".join(lines)
+
+        assert "withheld" in text
+        assert "SuccessRate single=" not in text, (
+            "a cross-category success rate reached the console"
+        )
+        assert "TokenOverhead=+214.0%" not in text, (
+            "the group-level overhead reached the console"
+        )
+        # The per-category rows replace it, one per category.
+        for category in ("cat0", "cat1", "cat2"):
+            assert f"{category}: n=2 (6 runs)" in text
+
+    def test_the_guard_does_not_over_fire_on_one_category(self) -> None:
+        """单类语料的组级数就是该类自己的数, 扣下它反而丢了信息."""
+        lines = cli.multi_agent_console_lines(self._summary(categories=1, is_pooled=False))
+        text = "\n".join(lines)
+
+        assert "SuccessRate single=" in text
+        assert "withheld" not in text
+
+
 class TestPairSuiteHonoursItsFlags:
     """`--repeats` 与 `--case-id` 在这条路径上都曾经不生效.
 

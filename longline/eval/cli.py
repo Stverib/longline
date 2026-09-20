@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from longline.eval.multi_agent import GROUPS, MAX_WORKERS, MIN_WORKERS, load_multi_agent_cases
-from longline.eval.multi_agent_runner import MULTI_AGENT_TAG
+from longline.eval.multi_agent_runner import MULTI_AGENT_TAG, MultiAgentSummary
 from longline.eval.report import (
     _fmt_speedup,  # canonical: a duration ratio has parity at 1.00x, not 0
     aggregate,
@@ -1147,22 +1147,8 @@ async def _run_multi_agent(
 
     print(f"[eval] {len(runs)} multi-agent case-runs across {len(summaries)} group(s)")
     for summary in summaries:
-        print(f"[eval]   group={summary.group}: {summary.num_cases} tasks, "
-              f"{summary.num_runs} case-runs, "
-              f"{summary.eligible_runs} eligible, "
-              f"{summary.num_runs - summary.eligible_runs} excluded")
-        print(f"[eval]     SuccessRate single={_fmt_ratio(summary.single_success_rate)} "
-              f"multi={_fmt_ratio(summary.multi_success_rate)}")
-        print(f"[eval]     WallClockTime single={_fmt_ms(summary.single_wall_time_ms)} "
-              f"multi={_fmt_ms(summary.multi_wall_time_ms)}")
-        print(f"[eval]     Speedup={_fmt_speedup(summary.mean_speedup)} "
-              f"(single_wall / multi_wall; 1.00x is parity)")
-        print(f"[eval]     TokenOverhead={_fmt_ratio_value(summary.mean_token_overhead)} "
-              f"single_total={summary.single_tokens['total_tokens']} "
-              f"multi_total={summary.multi_tokens['total_tokens']} "
-              f"multi_child={summary.multi_tokens['child_tokens']}")
-        print(f"[eval]     ToolCalls single={summary.single_tool_calls} "
-              f"multi={summary.multi_tool_calls} | agent_counts={summary.agent_counts}")
+        for line in multi_agent_console_lines(summary):
+            print(line)
 
     results: list[CaseResult] = []
     for run in runs:
@@ -1257,6 +1243,68 @@ def _multi_agent_results(run: object) -> list[CaseResult]:
         }
         out.append(result)
     return out
+
+
+def _fmt_frac(ratio: dict[str, object]) -> str:
+    """`numerator/denominator` for a `Ratio.to_dict()`, for the console."""
+    return f"{ratio['numerator']}/{ratio['denominator']}"
+
+
+def multi_agent_console_lines(summary: MultiAgentSummary) -> list[str]:
+    """The console block for one group's `MultiAgentSummary`.
+
+    Returns lines instead of printing them so the withheld-headline rule is
+    testable without capturing stdout.
+
+    The pooled guard is the SAME one the report applies, and it is here for the
+    same reason: three categories of task are not one population, so a mean over
+    them describes the corpus mix rather than the architecture. `--suite pair`
+    spans three categories, and on the first paid sweep of it the report
+    correctly withheld the headline while the console printed
+    `SuccessRate single=94.4% multi=100.0%` and `Speedup=0.46x` anyway -- and the
+    console is what the operator reads while the run is still going, before any
+    report exists. A guard only one of two output channels honours is not a
+    guard.
+    """
+    lines = [
+        f"[eval]   group={summary.group}: {summary.num_cases} tasks, "
+        f"{summary.num_runs} case-runs, {summary.eligible_runs} eligible, "
+        f"{summary.num_runs - summary.eligible_runs} excluded"
+    ]
+    if summary.is_pooled:
+        lines.append(
+            f"[eval]     pooled headline withheld: this group spans "
+            f"{len(summary.by_category)} categories, and a mean over them "
+            "describes the corpus mix rather than the architecture"
+        )
+        for category, block in sorted(summary.by_category.items()):
+            rate = block["success_rate"]
+            speedup = block["speedup"]
+            assert isinstance(rate, dict) and isinstance(speedup, dict)
+            lines.append(
+                f"[eval]       {category}: n={block['num_cases']} "
+                f"({block['num_runs']} runs) "
+                f"succ single={_fmt_frac(rate['single_agent'])} "
+                f"multi={_fmt_frac(rate['multi_agent'])} "
+                f"Speedup={_fmt_speedup(speedup['speedup_mean'])} "
+                f"TokenOverhead={_fmt_ratio_value(block['token_overhead'])}"
+            )
+        return lines
+    lines += [
+        f"[eval]     SuccessRate single={_fmt_ratio(summary.single_success_rate)} "
+        f"multi={_fmt_ratio(summary.multi_success_rate)}",
+        f"[eval]     WallClockTime single={_fmt_ms(summary.single_wall_time_ms)} "
+        f"multi={_fmt_ms(summary.multi_wall_time_ms)}",
+        f"[eval]     Speedup={_fmt_speedup(summary.mean_speedup)} "
+        f"(single_wall / multi_wall; 1.00x is parity)",
+        f"[eval]     TokenOverhead={_fmt_ratio_value(summary.mean_token_overhead)} "
+        f"single_total={summary.single_tokens['total_tokens']} "
+        f"multi_total={summary.multi_tokens['total_tokens']} "
+        f"multi_child={summary.multi_tokens['child_tokens']}",
+        f"[eval]     ToolCalls single={summary.single_tool_calls} "
+        f"multi={summary.multi_tool_calls} | agent_counts={summary.agent_counts}",
+    ]
+    return lines
 
 
 def _fmt_latency(value: float | None) -> str:
