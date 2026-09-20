@@ -67,8 +67,10 @@ which one produced it, and neither is trusted more than the other.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -96,7 +98,7 @@ from longline.eval.multi_agent import (
 from longline.eval.runner import _prepare_sandbox
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Sequence
 
 # Wall-clock ceiling for one variant. A fan-out that hangs is a failed case with
 # a reason, not a suite that never finishes.
@@ -534,6 +536,44 @@ def _message_text(message: Any) -> str:
 # --- the two variants --------------------------------------------------------
 
 
+@contextmanager
+def _in_sandbox(sandbox: str) -> Iterator[None]:
+    """Run a variant with the process cwd set to its sandbox.
+
+    The production tools resolve relative paths against the process cwd
+    (`FileWriteTool` does `Path(file_path)`; `Tool._declare` resolves the same
+    way), and `build_engine` tells the model in its system prompt that its
+    working directory IS the sandbox. Without this the two disagree: the model
+    writes what it was asked for, relative to the repository root, and the
+    judge then reads an empty sandbox. The offline protocol never showed the
+    disagreement because `scripted_factory` builds absolute paths.
+
+    `os.chdir` is process-global, so **cases must run serially**. That is
+    already true of this suite, and it is what makes the shared-sandbox design
+    coherent: the teammates of one variant are *supposed* to share a working
+    tree, so one cwd per variant is the right granularity rather than a
+    limitation. A future parallel runner would have to pass a cwd down to the
+    tools instead -- see the spec's option B.
+
+    The entry assertion exists because a nested chdir is indistinguishable
+    from a correct one at the point of failure: the next case would resolve its
+    paths one level deeper and report a missing artifact rather than a leaked
+    cwd.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    here = Path.cwd().resolve()
+    if here != repo_root:
+        raise RuntimeError(
+            f"_in_sandbox entered from {here}, expected the repository root "
+            f"{repo_root}; a previous variant did not restore the cwd"
+        )
+    os.chdir(sandbox)
+    try:
+        yield
+    finally:
+        os.chdir(here)
+
+
 async def _drive(
     engine: Any,
     prompt: str,
@@ -617,9 +657,12 @@ async def run_single_variant(
             # process, so a "live" run cost nothing and reported zero turns.
             _apply_live_counting(engine, ledger, agent=LEADER)
 
-        started = time.perf_counter()
-        _events, errors = await _drive(engine, leader_prompt(case), max_turns=case.max_turns)
-        duration_ms = (time.perf_counter() - started) * 1000.0
+        with _in_sandbox(sandbox):
+            started = time.perf_counter()
+            _events, errors = await _drive(
+                engine, leader_prompt(case), max_turns=case.max_turns,
+            )
+            duration_ms = (time.perf_counter() - started) * 1000.0
     finally:
         current_ledger.reset(token)
 
@@ -719,19 +762,24 @@ async def run_multi_variant(
             _apply_live_counting(engine, ledger)
             counted = engine.make_call_model
 
-        spawned_ids.append(LEADER)
-        await _spawn_workers(
-            case, counted=counted, ledger=ledger, registry=registry,
-            claude_dir=claude_dir, spawned_ids=spawned_ids, sandbox=Path(sandbox),
-            failures=worker_outcomes,
-        )
-        for agent_name, exc in sorted(worker_outcomes.items()):
-            errors.append(f"{agent_name}: {type(exc).__name__}: {exc}")
+        # Every teammate's file I/O happens inside this block. They are
+        # `asyncio` tasks sharing one process cwd, so the chdir has to outlive
+        # all of them -- and it is fine that they share it, because the
+        # teammates of one variant are supposed to work in one tree.
+        with _in_sandbox(sandbox):
+            spawned_ids.append(LEADER)
+            await _spawn_workers(
+                case, counted=counted, ledger=ledger, registry=registry,
+                claude_dir=claude_dir, spawned_ids=spawned_ids, sandbox=Path(sandbox),
+                failures=worker_outcomes,
+            )
+            for agent_name, exc in sorted(worker_outcomes.items()):
+                errors.append(f"{agent_name}: {type(exc).__name__}: {exc}")
 
-        _events, leader_errors = await _drive(
-            engine, merge_instruction(case), max_turns=case.max_turns,
-        )
-        errors.extend(leader_errors)
+            _events, leader_errors = await _drive(
+                engine, merge_instruction(case), max_turns=case.max_turns,
+            )
+            errors.extend(leader_errors)
     finally:
         current_ledger.reset(token)
 

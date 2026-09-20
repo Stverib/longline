@@ -64,6 +64,7 @@ from longline.eval.multi_agent import (
 from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
     _apply_live_counting,
+    _in_sandbox,
     aggregate_multi_agent,
     leader_prompt,
     merge_instruction,
@@ -754,6 +755,75 @@ class TestLivePathIsReachable:
         _apply_live_counting(engine, UsageLedger())
 
         assert engine.make_call_model.agent is None
+
+
+class TestSandboxChdir:
+    """Both variants must run with the process cwd inside the sandbox.
+
+    The production tools resolve relative paths against the process cwd
+    (`FileWriteTool` does `Path(file_path)`; `Tool._declare` resolves the same
+    way), while `build_engine` tells the model in its system prompt that its
+    working directory IS the sandbox. Without this the two disagree: the model
+    writes what it was asked for, relative to the repository root, and the
+    judge then reads an empty sandbox.
+
+    The offline protocol hides the disagreement, because `scripted_factory`
+    builds absolute paths and never resolves a relative one.
+    """
+
+    def test_chdir_context_moves_into_the_sandbox(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+
+        with _in_sandbox(str(sandbox)):
+            assert Path.cwd().resolve() == sandbox.resolve()
+
+    def test_chdir_context_restores_cwd(self, tmp_path: Path) -> None:
+        before = Path.cwd().resolve()
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+
+        with _in_sandbox(str(sandbox)):
+            pass
+
+        assert Path.cwd().resolve() == before
+
+    def test_chdir_context_restores_cwd_on_exception(self, tmp_path: Path) -> None:
+        """A variant that raises must not leave the process in its sandbox.
+
+        `_drive` catches a crashed variant and records it rather than
+        propagating, but a `_judge` or a `_spawn_workers` raise is not caught
+        there. Without the `finally`, one such case would relocate every later
+        case in the run -- and the symptom would be "the model wrote the wrong
+        file", not "the harness leaked the cwd".
+        """
+        before = Path.cwd().resolve()
+        sandbox = tmp_path / "sbx-on-error"
+        sandbox.mkdir()
+
+        with pytest.raises(RuntimeError, match="boom"), _in_sandbox(str(sandbox)):
+            raise RuntimeError("boom")
+
+        assert Path.cwd().resolve() == before
+
+    def test_chdir_refuses_a_non_root_starting_point(self, tmp_path: Path) -> None:
+        """A nested chdir is a bug: it means a previous case did not restore.
+
+        Left unchecked the second chdir silently nests, every later case
+        resolves its paths one level deeper, and the failure surfaces as a
+        missing artifact rather than a leaked cwd -- which is the kind of
+        symptom that gets attributed to the model.
+        """
+        sandbox = tmp_path / "sbx-nested"
+        sandbox.mkdir()
+
+        with _in_sandbox(str(sandbox)), pytest.raises(RuntimeError, match="chdir"):
+            # Entered directly rather than as a nested `with`: ruff's SIM117
+            # wants the two contexts combined, and the inner one has to raise
+            # on ENTRY, which a combined `with` cannot express as a body.
+            _in_sandbox(str(tmp_path / "other")).__enter__()
+
+        assert Path.cwd().resolve() != sandbox.resolve()
 
 
 __all__: list[str] = []
