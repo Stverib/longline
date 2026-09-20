@@ -311,6 +311,186 @@ ANALYSIS_SPECS: tuple[AnalysisSpec, ...] = (
 )
 
 
+# --- the six modification cases ----------------------------------------------
+
+MODIFICATION_MODULE_TEMPLATE = '''"""The {name} module.
+
+Policy: {policy}
+"""
+
+
+def {name}_summary() -> str:
+    """Return the fact this module is responsible for."""
+    return {summary!r}
+'''
+
+HIDDEN_TEST_TEMPLATE = '''"""Hidden judge: every listed module gains a distinct describe().
+
+Generated, and generated per case, so the module list cannot drift from the
+case that names it. It lives outside the fixture trees because those trees are
+copied into the agent's sandbox: a test inside one is readable, and a case whose
+answer is readable measures reading.
+"""
+
+import importlib
+
+MODULES = {modules!r}
+
+
+def test_each_module_exposes_a_non_empty_describe():
+    for name in MODULES:
+        module = importlib.import_module(f"modules.{{name}}")
+        assert hasattr(module, "describe"), f"modules/{{name}}.py has no describe()"
+        described = module.describe()
+        assert isinstance(described, str), f"{{name}}.describe() is not a string"
+        assert described.strip(), f"{{name}}.describe() returned nothing"
+
+
+def test_describe_is_module_specific():
+    """A constant passes the test above while doing none of the work.
+
+    Without this second assertion the cheapest passing solution is to paste one
+    string into all three modules, and the case would report a success that no
+    reader of the diff would call one.
+    """
+    texts = {{
+        importlib.import_module(f"modules.{{name}}").describe()
+        for name in MODULES
+    }}
+    assert len(texts) == len(MODULES), "describe() must differ per module"
+'''
+
+
+@dataclass(frozen=True)
+class ModificationSpec:
+    """One `parallel_modification` case: N independent modules, one hidden judge."""
+
+    case_id: str
+    repo_name: str
+    modules: tuple[ModuleSpec, ...]
+
+    @property
+    def task(self) -> str:
+        names = ", ".join(m.name for m in self.modules)
+        return (
+            f"Add a describe() function to each of the {self.repo_name} modules "
+            f"({names}). Each module's describe() must return a non-empty string "
+            "that is specific to that module. The modules are independent: no "
+            "change in one affects another."
+        )
+
+    @property
+    def hidden_test_path(self) -> str:
+        return f"{PAIR_SUBDIR}/{self.case_id}_hidden/test_hidden.py"
+
+
+def build_modification_fixture(root: Path, spec: ModificationSpec) -> None:
+    """Write one modification fixture tree.
+
+    Shares no code with `build_fixture` beyond the shape: these modules must NOT
+    already export `describe()`, and reusing the analysis template would make
+    every hidden test pass on the untouched tree.
+    """
+    modules_dir = root / "modules"
+    notes_dir = root / "notes"
+    modules_dir.mkdir(parents=True, exist_ok=True)
+    notes_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = "\n".join(
+        f"| `{m.name}` | `modules/{m.name}.py` |" for m in spec.modules
+    )
+    (root / "README.md").write_text(
+        README_TEMPLATE.format(
+            repo=spec.repo_name, count=len(spec.modules), rows=rows,
+        ),
+        encoding="utf-8",
+    )
+    (notes_dir / "rollout.md").write_text(ROLLOUT_TEMPLATE, encoding="utf-8")
+    for module in spec.modules:
+        (modules_dir / f"{module.name}.py").write_text(
+            MODIFICATION_MODULE_TEMPLATE.format(
+                name=module.name, policy=module.policy, summary=module.summary,
+            ),
+            encoding="utf-8",
+        )
+
+
+MODIFICATION_SPECS: tuple[ModificationSpec, ...] = (
+    ModificationSpec(
+        case_id="pm-001",
+        repo_name="ledger-core",
+        modules=(
+            ModuleSpec("cache", "Cached entries are keyed by request id.",
+                       "The cache is write-through, never write-back."),
+            ModuleSpec("retry", "Retries stop after the third attempt.",
+                       "A retry reuses the original deadline."),
+            ModuleSpec("routing", "Routes are matched longest-prefix first.",
+                       "An unmatched route is an error, not a default."),
+        ),
+    ),
+    ModificationSpec(
+        case_id="pm-002",
+        repo_name="ingest",
+        modules=(
+            ModuleSpec("parser", "Records are parsed one line at a time.",
+                       "A malformed line is skipped and counted."),
+            ModuleSpec("schema", "Fields are validated against a declared type.",
+                       "An unknown field is rejected, never coerced."),
+            ModuleSpec("validate", "Validation runs before any write.",
+                       "Validation is all-or-nothing per record."),
+        ),
+    ),
+    ModificationSpec(
+        case_id="pm-003",
+        repo_name="transport",
+        modules=(
+            ModuleSpec("socket", "Connections are pooled and reused.",
+                       "A pool entry is dropped after one failure."),
+            ModuleSpec("framing", "Frames carry a length prefix.",
+                       "A frame longer than the cap is refused."),
+            ModuleSpec("backoff", "Backoff doubles up to thirty seconds.",
+                       "Jitter is applied after the doubling."),
+        ),
+    ),
+    ModificationSpec(
+        case_id="pm-004",
+        repo_name="storage",
+        modules=(
+            ModuleSpec("index", "The index maps keys to segment offsets.",
+                       "An index entry is written after its segment."),
+            ModuleSpec("segment", "Segments are immutable once sealed.",
+                       "A segment is sealed at one megabyte."),
+            ModuleSpec("compact", "Compaction merges adjacent segments.",
+                       "Compaction never runs while a read is open."),
+        ),
+    ),
+    ModificationSpec(
+        case_id="pm-005",
+        repo_name="access",
+        modules=(
+            ModuleSpec("token", "Tokens expire after one hour.",
+                       "An expired token is rejected, not refreshed in place."),
+            ModuleSpec("scope", "Scopes are checked innermost first.",
+                       "A missing scope denies rather than defers."),
+            ModuleSpec("audit", "Audit rows are appended, never updated.",
+                       "An audit row records the decision, not the request."),
+        ),
+    ),
+    ModificationSpec(
+        case_id="pm-006",
+        repo_name="scheduler",
+        modules=(
+            ModuleSpec("queue", "The queue is ordered by deadline.",
+                       "A job is dequeued once, under a lock."),
+            ModuleSpec("worker", "Workers claim one job at a time.",
+                       "A claim expires if it is not renewed."),
+            ModuleSpec("clock", "The clock is monotonic and injectable.",
+                       "Wall-clock time is never used for ordering."),
+        ),
+    ),
+)
+
+
 # --- case emission -----------------------------------------------------------
 
 
@@ -368,9 +548,60 @@ def _analysis_case(spec: AnalysisSpec) -> dict[str, Any]:
     }
 
 
+def _modification_case(spec: ModificationSpec) -> dict[str, Any]:
+    """One modification case in the loader's on-disk shape.
+
+    The judge is the hidden test, and it is the ONLY judge. An
+    `unexpected_paths` check would be tempting -- it is what the analysis cases
+    use to catch a stray write -- but here it would fail on `__pycache__`, which
+    `python_test` itself creates the moment it imports the modules. Listing the
+    checks in the right order would paper over that, and an order-dependent
+    judge list is a trap for whoever edits the case next.
+    """
+    module_paths = [f"modules/{m.name}.py" for m in spec.modules]
+    return {
+        "type": "multi_agent",
+        "id": spec.case_id,
+        "task": spec.task,
+        "group": "controlled",
+        "category": "parallel_modification",
+        "workers": len(spec.modules),
+        "subtasks": [
+            {
+                "id": f"s{index}",
+                "instruction": (
+                    f"Add a describe() function to modules/{module.name}.py that "
+                    f"returns a non-empty string specific to the {module.name} module"
+                ),
+                "writes": f"modules/{module.name}.py",
+            }
+            for index, module in enumerate(spec.modules, start=1)
+        ],
+        "merge": "write_required",
+        "merge_file": "out/manifest.txt",
+        "hidden_test": spec.hidden_test_path,
+        "fixture_single": f"pair/{spec.case_id}_single",
+        "fixture_multi": f"pair/{spec.case_id}_multi",
+        "max_turns": 12,
+        "tags": ["pair", "parallel_modification", "code-edit"],
+        "checks": [
+            *[{"fn": "file_exists", "args": {"path": p}} for p in module_paths],
+            {"fn": "python_test", "args": {
+                "command": ["python", "-m", "pytest", "test_hidden.py", "-q"],
+                "allowed_commands": ["python"],
+                "interpreter": "python",
+                "timeout_s": 120,
+            }},
+        ],
+    }
+
+
 def _cases() -> list[dict[str, Any]]:
     """Every case in the corpus, in a fixed order."""
-    return [_analysis_case(spec) for spec in ANALYSIS_SPECS]
+    return [
+        *[_analysis_case(spec) for spec in ANALYSIS_SPECS],
+        *[_modification_case(spec) for spec in MODIFICATION_SPECS],
+    ]
 
 
 def generate(out_root: Path = DEFAULT_OUT) -> GeneratedCorpus:
@@ -388,6 +619,19 @@ def generate(out_root: Path = DEFAULT_OUT) -> GeneratedCorpus:
             build_fixture(
                 fixtures / PAIR_SUBDIR / f"{spec.case_id}_{side}", spec,
             )
+    for mod_spec in MODIFICATION_SPECS:
+        for side in ("single", "multi"):
+            build_modification_fixture(
+                fixtures / PAIR_SUBDIR / f"{mod_spec.case_id}_{side}", mod_spec,
+            )
+        hidden_dir = fixtures / PAIR_SUBDIR / f"{mod_spec.case_id}_hidden"
+        hidden_dir.mkdir(parents=True, exist_ok=True)
+        (hidden_dir / "test_hidden.py").write_text(
+            HIDDEN_TEST_TEMPLATE.format(
+                modules=[m.name for m in mod_spec.modules],
+            ),
+            encoding="utf-8",
+        )
 
     cases_file = out_root / CASES_NAME
     lines = [json.dumps(case, ensure_ascii=False) for case in _cases()]

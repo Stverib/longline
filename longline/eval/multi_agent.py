@@ -205,6 +205,12 @@ class MultiAgentCase(E2ECase):
     merge_file: str = ""
     fixture_single: str = ""
     fixture_multi: str = ""
+    # Path to this case's hidden judge, relative to the fixtures root, or "".
+    # Kept OUT of the fixture trees on purpose: those trees are copied into the
+    # agent's sandbox, so a test living in one is readable by the model and the
+    # case would measure reading rather than doing. The runner copies this file
+    # into the sandbox at judge time.
+    hidden_test: str = ""
 
     # --- contract fields derived from the declarations ---------------------
 
@@ -272,6 +278,21 @@ class MultiAgentCase(E2ECase):
         if not isinstance(merge_file, str):
             raise CaseParseError(f"{cid}: 'merge_file' must be a str, got {merge_file!r}")
 
+        hidden_test = d.get("hidden_test", "")
+        if not isinstance(hidden_test, str):
+            raise CaseParseError(f"{cid}: 'hidden_test' must be a str, got {hidden_test!r}")
+        # A path that escapes the fixtures root would put the judge somewhere
+        # the runner will not look, and the case would fail every run as if the
+        # model had not done the work.
+        if hidden_test and (
+            hidden_test.startswith(("/", "\\"))
+            or ".." in hidden_test.replace("\\", "/").split("/")
+        ):
+            raise CaseParseError(
+                f"{cid}: 'hidden_test' must be a relative path inside the "
+                f"fixtures root, got {hidden_test!r}"
+            )
+
         fixture_single = d.get("fixture_single", "")
         fixture_multi = d.get("fixture_multi", "")
         for label, value in (("fixture_single", fixture_single), ("fixture_multi", fixture_multi)):
@@ -304,6 +325,7 @@ class MultiAgentCase(E2ECase):
             merge_file=merge_file,
             fixture_single=fixture_single,
             fixture_multi=fixture_multi,
+            hidden_test=hidden_test,
         )
 
     @staticmethod

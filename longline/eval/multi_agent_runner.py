@@ -597,7 +597,38 @@ async def _drive(
     return events, errors
 
 
-def _judge(case: MultiAgentCase, sandbox: Path) -> tuple[bool, list[dict[str, Any]], dict[str, bool]]:
+def _install_hidden_test(
+    case: MultiAgentCase, sandbox: Path, fixtures_dir: Path
+) -> None:
+    """Copy a case's hidden judge into the sandbox, immediately before grading.
+
+    Never earlier. The sandbox IS the agent's working tree for the whole run, so
+    a judge sitting in it from the start is a judge the model can read, and a
+    case whose answer is readable measures reading rather than doing.
+
+    Both variants receive the SAME file from the SAME source. Grading the two
+    arms with different tests would make the comparison a comparison of tests,
+    which is the one confound this suite exists to remove.
+
+    A missing source is a hard error rather than a skipped step: grading without
+    the judge would make every run of the case fail as though the model had not
+    done the work, and the case would look hard rather than broken.
+    """
+    src = fixtures_dir / case.hidden_test
+    if not src.is_file():
+        raise FileNotFoundError(
+            f"{case.id}: hidden test declared at {case.hidden_test!r} is not "
+            f"under {fixtures_dir}"
+        )
+    shutil.copy2(src, sandbox / Path(case.hidden_test).name)
+
+
+def _judge(
+    case: MultiAgentCase,
+    sandbox: Path,
+    *,
+    fixtures_dir: Path | None = None,
+) -> tuple[bool, list[dict[str, Any]], dict[str, bool]]:
     """Grade both variants' artifacts against the case's own judges.
 
     The subtask verdicts are derived from the SAME `file_exists` question the
@@ -605,7 +636,19 @@ def _judge(case: MultiAgentCase, sandbox: Path) -> tuple[bool, list[dict[str, An
     went missing instead of reporting a single opaque boolean. They never
     decide pass/fail -- `case_passed` does that, over the case's declared
     checks, exactly as in every other suite.
+
+    A case that declares a `hidden_test` has it installed here, which is the
+    only place that sequencing is written down. Splitting "install the judge"
+    from "run the judge" across two call sites is how they eventually drift.
     """
+    if case.hidden_test:
+        if fixtures_dir is None:
+            raise ValueError(
+                f"{case.id}: declares a hidden_test but no fixtures_dir was "
+                "given, so the judge cannot be located"
+            )
+        _install_hidden_test(case, sandbox, fixtures_dir)
+
     passed, detail = case_passed(_shared_checks(case), sandbox, mode=case.checks_mode)
     verdicts = {
         subtask.id: (sandbox / subtask.writes).is_file() for subtask in case.subtasks
@@ -621,6 +664,7 @@ async def run_single_variant(
     api_key: str,
     offline: bool,
     usage: Any,
+    fixtures_dir: Path | None = None,
 ) -> VariantRun:
     """One agent, one query loop, every subtask's instruction in its prompt.
 
@@ -668,7 +712,7 @@ async def run_single_variant(
     finally:
         current_ledger.reset(token)
 
-    passed, detail, verdicts = _judge(case, Path(sandbox))
+    passed, detail, verdicts = _judge(case, Path(sandbox), fixtures_dir=fixtures_dir)
     # Both variants reconcile through the same gate. A single-agent run has no
     # second witness, so `witness_agents` stays None -- the check is weaker
     # here, and that is stated rather than papered over by skipping it.
@@ -697,6 +741,7 @@ async def run_multi_variant(
     offline: bool,
     usage: Any,
     claude_dir: Path | None = None,
+    fixtures_dir: Path | None = None,
 ) -> VariantRun:
     """`workers` teammates in parallel, then the leader's declared merge step.
 
@@ -800,7 +845,7 @@ async def run_multi_variant(
     accounts = reconcile(ledger, witness_agents=witness_agents, witness_turns=witness_turns)
     accounting_error = _accounting_error(accounts, case_id=case.id, variant=MULTI)
 
-    passed, detail, verdicts = _judge(case, Path(sandbox))
+    passed, detail, verdicts = _judge(case, Path(sandbox), fixtures_dir=fixtures_dir)
     return VariantRun(
         variant=MULTI,
         passed=passed,
@@ -1236,11 +1281,12 @@ async def _run_variant_in_sandbox(
         if variant == SINGLE:
             return await run_single_variant(
                 case, sandbox=sandbox, model=model, api_key=api_key,
-                offline=offline, usage=usage,
+                offline=offline, usage=usage, fixtures_dir=fixtures_dir,
             )
         return await run_multi_variant(
             case, sandbox=sandbox, model=model, api_key=api_key,
             offline=offline, usage=usage, claude_dir=claude_dir,
+            fixtures_dir=fixtures_dir,
         )
     except Exception as exc:  # a crashed variant is recorded, never propagated
         return VariantRun(

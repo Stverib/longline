@@ -71,6 +71,7 @@ from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
     _apply_live_counting,
     _in_sandbox,
+    _judge,
     _spawn_workers_serial,
     aggregate_multi_agent,
     leader_prompt,
@@ -1285,6 +1286,83 @@ def _case_dict(**overrides: Any) -> dict[str, Any]:
     }
     d.update(overrides)
     return d
+
+
+class TestHiddenTestInstallation:
+    """The judge must be present at grading time, and must not be before it.
+
+    The sandbox IS the agent's working tree for the whole run, so a hidden test
+    installed at the start is a test the model can read -- and a case whose
+    answer is readable measures reading. `_judge` installs it, which is the one
+    place that sequencing is written down; splitting "install" from "run" across
+    two call sites is how they eventually drift.
+    """
+
+    def _case_with_hidden(self, hidden: str) -> MultiAgentCase:
+        case = make_case(case_id="ma-hid")
+        case.hidden_test = hidden
+        # Only the hidden test grades this case, so an empty sandbox passing
+        # means "the judge ran and liked it", not "nothing was checked".
+        case.checks = [{
+            "fn": "python_test",
+            "args": {
+                "command": ["python", "-m", "pytest", "test_hidden.py", "-q"],
+                "allowed_commands": ["python"],
+                "timeout_s": 60,
+            },
+        }]
+        return case
+
+    def test_judge_copies_the_hidden_test_in_before_grading(self, tmp_path: Path) -> None:
+        fixtures = tmp_path / "fixtures"
+        hidden = fixtures / "pair" / "ma-hid_hidden" / "test_hidden.py"
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        case = self._case_with_hidden("pair/ma-hid_hidden/test_hidden.py")
+
+        passed, detail, _verdicts = _judge(case, sandbox, fixtures_dir=fixtures)
+
+        assert (sandbox / "test_hidden.py").is_file()
+        assert passed is True, detail
+        assert [c["fn"] for c in detail] == ["python_test"]
+
+    def test_no_case_gets_a_hidden_test_installed_unasked(self, tmp_path: Path) -> None:
+        """A case without one must not pick up a stray file from a previous run."""
+        fixtures = tmp_path / "fixtures"
+        hidden = fixtures / "pair" / "ma-hid_hidden" / "test_hidden.py"
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        case = make_case(case_id="ma-nohid")
+        case.checks = [{"fn": "file_exists", "args": {"path": "out/ma-nohid/m1.md"}}]
+
+        _judge(case, sandbox, fixtures_dir=fixtures)
+
+        assert not (sandbox / "test_hidden.py").exists()
+
+    def test_judge_refuses_a_hidden_test_it_cannot_locate(self, tmp_path: Path) -> None:
+        """A missing judge is an error, not a skipped step.
+
+        Skipping would make every run of the case fail as though the model had
+        not done the work -- the case would look hard instead of looking broken.
+        """
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        case = self._case_with_hidden("pair/nope_hidden/test_hidden.py")
+
+        with pytest.raises(FileNotFoundError, match="hidden test"):
+            _judge(case, sandbox, fixtures_dir=tmp_path / "fixtures")
+
+    def test_judge_refuses_a_hidden_test_with_no_fixtures_root(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        case = self._case_with_hidden("pair/x_hidden/test_hidden.py")
+
+        with pytest.raises(ValueError, match="fixtures_dir"):
+            _judge(case, sandbox)
 
 
 __all__: list[str] = []
