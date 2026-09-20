@@ -600,16 +600,22 @@ async def run_single_variant(
             sandbox=sandbox, model=model or "offline-multi-agent", api_key=api_key,
             tool_profile="core",
         )
-        scripted = scripted_factory(
-            subtasks=case.subtasks, merge_file=case.merge_file, sandbox=Path(sandbox),
-            usage=usage,
-        )
-        # Pinned to LEADER rather than resolved from the ambient scope: the
-        # single variant IS the leader, and reading `current_agent()` here
-        # would let a leaked scope from a previous case relabel its cost.
-        _apply_scripted_model(engine, count_usage(scripted, ledger, agent=LEADER))
         if offline:
+            scripted = scripted_factory(
+                subtasks=case.subtasks, merge_file=case.merge_file, sandbox=Path(sandbox),
+                usage=usage,
+            )
+            # Pinned to LEADER rather than resolved from the ambient scope: the
+            # single variant IS the leader, and reading `current_agent()` here
+            # would let a leaked scope from a previous case relabel its cost.
+            _apply_scripted_model(engine, count_usage(scripted, ledger, agent=LEADER))
             engine = _OfflineEngine(engine)
+        else:
+            # Live: count the engine's OWN transport. Replacing it here -- which
+            # is what the unconditional `_apply_scripted_model` call used to do
+            # -- is what made `model=` decorative: the request never left the
+            # process, so a "live" run cost nothing and reported zero turns.
+            _apply_live_counting(engine, ledger, agent=LEADER)
 
         started = time.perf_counter()
         _events, errors = await _drive(engine, leader_prompt(case), max_turns=case.max_turns)
@@ -672,18 +678,6 @@ async def run_multi_variant(
     token = current_ledger.set(ledger)
     registry = TaskRegistry()
 
-    scripted = scripted_factory(
-        subtasks=case.subtasks, merge_file=case.merge_file, sandbox=Path(sandbox),
-        usage=usage,
-    )
-    # ONE counter, shared by the leader and every worker. `count_usage` with no
-    # pinned agent resolves each turn's owner from the ambient scope at call
-    # time, which is exactly what a shared factory needs: the leader's turns
-    # arrive outside any worker's scope and land on LEADER, and each worker's
-    # arrive inside its own scope and land on that worker. Wrapping this in a
-    # second counter would record every turn twice.
-    counted = count_usage(scripted, ledger)
-
     started = time.perf_counter()
     errors: list[str] = []
     spawned_ids: list[str] = []
@@ -695,10 +689,35 @@ async def run_multi_variant(
             sandbox=sandbox, model=model or "offline-multi-agent", api_key=api_key,
             tool_profile="core",
         )
-        # The leader's own model calls go through the SAME counter, so the
-        # merge turn's tokens land in the ledger too. Without this the leader's
-        # cost would be missing and every fan-out would look cheaper than it is.
-        _apply_scripted_model(engine, count_usage(scripted, ledger, agent=LEADER))
+        if offline:
+            scripted = scripted_factory(
+                subtasks=case.subtasks, merge_file=case.merge_file, sandbox=Path(sandbox),
+                usage=usage,
+            )
+            # ONE counter, shared by the leader and every worker. `count_usage`
+            # with no pinned agent resolves each turn's owner from the ambient
+            # scope at call time, which is exactly what a shared factory needs:
+            # the leader's turns arrive outside any worker's scope and land on
+            # LEADER, and each worker's arrive inside its own scope and land on
+            # that worker. Wrapping this in a second counter would record every
+            # turn twice.
+            counted = count_usage(scripted, ledger)
+            # The leader's own model calls go through the SAME counter, so the
+            # merge turn's tokens land in the ledger too. Without this the
+            # leader's cost would be missing and every fan-out would look
+            # cheaper than it is.
+            _apply_scripted_model(engine, count_usage(scripted, ledger, agent=LEADER))
+            engine = _OfflineEngine(engine)
+        else:
+            # Live: ONE unpinned counter over the engine's OWN transport. The
+            # workers' factory IS the engine's here -- unlike the offline path,
+            # where they get the scripted factory while the leader's engine
+            # gets a LEADER-pinned copy of it. Sharing one wrapper is safe
+            # because the owner of each turn is resolved from the ambient scope
+            # at call time, and a turn cannot pass through two wrappers, so
+            # nothing is counted twice.
+            _apply_live_counting(engine, ledger)
+            counted = engine.make_call_model
 
         spawned_ids.append(LEADER)
         await _spawn_workers(
@@ -709,8 +728,6 @@ async def run_multi_variant(
         for agent_name, exc in sorted(worker_outcomes.items()):
             errors.append(f"{agent_name}: {type(exc).__name__}: {exc}")
 
-        if offline:
-            engine = _OfflineEngine(engine)
         _events, leader_errors = await _drive(
             engine, merge_instruction(case), max_turns=case.max_turns,
         )
@@ -952,6 +969,65 @@ def _apply_scripted_model(engine: Any, factory: Callable[..., Any]) -> Any:
     engine = transport.apply(engine)
     transport.assert_applied(engine)
     return engine
+
+
+def _apply_live_counting(
+    engine: Any, ledger: UsageLedger, *, agent: str | None = None
+) -> Any:
+    """Wrap a real engine's own model transport with the usage counter, in place.
+
+    The live sibling of `_apply_scripted_model`, and it moves the same two
+    attributes for the same reason: `make_call_model` is what `submit()` calls
+    directly, and `make_call_model_factory` is what a sub-agent creation site
+    calls. The difference is what goes underneath -- here it is the engine's
+    OWN factory, so the request reaches the SDK and only the counting wrapper
+    is added. Replacing that factory (which the unconditional
+    `_apply_scripted_model` call did) is what made `model=` decorative.
+
+    `agent=None` leaves the owner of each turn to be resolved from the ambient
+    scope at call time, which is what the multi variant needs: ONE wrapper on
+    the leader's engine, with the leader's own turns arriving outside any
+    worker's scope and each worker's arriving inside its own. Pinning an agent
+    here would attribute every teammate's turns to the leader.
+
+    `_assert_live_counting` is the mirror of `assert_applied`. A refactor that
+    renamed either attribute would leave the live path UNCOUNTED -- and an
+    uncounted live run reports zero tokens while spending real money, which is
+    the same "reads as a cheap fan-out" failure in the opposite direction.
+    """
+    live = engine.make_call_model_factory
+    counted = count_usage(live, ledger, agent=agent)
+    engine.make_call_model = counted
+    engine.make_call_model_factory = counted
+    _assert_live_counting(engine)
+    return engine
+
+
+def _assert_live_counting(engine: Any) -> None:
+    """Fail loudly if a live engine's transport is not the counting wrapper.
+
+    Behavioural rather than by convention, for the same reason
+    `_ScriptedTransport.assert_applied` is: a future rename of either attribute
+    would otherwise silently restore an uncounted live run, and the only
+    symptom would be a suspiciously cheap number.
+    """
+    from longline.eval.child_usage import ModelCounter
+
+    if not isinstance(engine.make_call_model, ModelCounter):
+        raise AccountingError(
+            "the live usage counter was not installed: "
+            f"engine.make_call_model is {type(engine.make_call_model).__name__}, "
+            "expected ModelCounter. A live run without it records no tokens, "
+            "which reads as a free fan-out."
+        )
+    if not isinstance(engine.make_call_model_factory, ModelCounter):
+        raise AccountingError(
+            "the live usage counter was not installed on the sub-agent "
+            f"creation path: engine.make_call_model_factory is "
+            f"{type(engine.make_call_model_factory).__name__}, expected "
+            "ModelCounter. Teammates spawned through it would spend tokens the "
+            "ledger never sees."
+        )
 
 
 # --- entry points ------------------------------------------------------------

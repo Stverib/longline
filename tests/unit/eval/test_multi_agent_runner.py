@@ -43,6 +43,7 @@ from longline.eval.child_usage import (
     LEADER,
     AccountingError,
     AgentUsage,
+    ModelCounter,
     TurnUsage,
     UsageLedger,
     agent_scope,
@@ -62,6 +63,7 @@ from longline.eval.multi_agent import (
 )
 from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
+    _apply_live_counting,
     aggregate_multi_agent,
     leader_prompt,
     merge_instruction,
@@ -658,6 +660,100 @@ def _stub_run(
         multi=variant(MULTI, multi_ms, multi_tokens),
         expected_paths=[],
     )
+
+
+class _FakeEngine:
+    """A stand-in exposing exactly the two attributes the transport swap touches.
+
+    `_ScriptedTransport` and `_apply_live_counting` both move `make_call_model`
+    and `make_call_model_factory`, and nothing else about a `QueryEngine`
+    matters to them. A fake that carried a whole engine would make this test a
+    test of `build_engine`.
+
+    `scripted` flips when a scripted factory is installed, so a test can tell
+    "the live engine was left alone" from "the live engine was replaced" --
+    which is the entire difference between the two paths.
+    """
+
+    def __init__(self) -> None:
+        self.scripted = False
+        self.make_call_model: Any = self._real_factory
+        self.make_call_model_factory: Any = self._real_factory
+
+    def _real_factory(
+        self, model: str | None = None, max_tokens: int = 16384
+    ) -> Any:
+        _ = model, max_tokens
+
+        async def call_model(**kwargs: Any) -> Any:
+            _ = kwargs
+            yield None
+
+        return call_model
+
+    async def submit(self, prompt: str, *, max_turns: int) -> Any:
+        _ = prompt, max_turns
+        yield None
+
+
+class TestLivePathIsReachable:
+    """`offline=False` must NOT install the scripted transport.
+
+    The regression this guards: `_apply_scripted_model` was called
+    unconditionally in both variants, so a "live" run silently used the
+    scripted model. `model=` reached `build_engine` and the system prompt and
+    nothing else -- the request never left the process, every run cost nothing,
+    and the module docstring's "A real model id runs the same case against the
+    live API" was simply not what the code did.
+    """
+
+    def test_live_counting_wraps_the_engines_own_transport(self) -> None:
+        engine = _FakeEngine()
+        ledger = UsageLedger()
+
+        _apply_live_counting(engine, ledger, agent=LEADER)
+
+        assert isinstance(engine.make_call_model, ModelCounter)
+        assert isinstance(engine.make_call_model_factory, ModelCounter)
+        assert engine.scripted is False, "the live path must not install a scripted model"
+
+    def test_live_counting_keeps_the_original_factory_underneath(self) -> None:
+        """The wrapper must WRAP, not replace.
+
+        This is the whole difference from `_apply_scripted_model`: replacing
+        the engine's own factory is what made `model=` decorative. Asserting
+        the wrapped factory is the engine's original is what tells the two
+        implementations apart when both produce a `ModelCounter`.
+        """
+        engine = _FakeEngine()
+        original = engine.make_call_model_factory
+
+        _apply_live_counting(engine, UsageLedger(), agent=LEADER)
+
+        assert engine.make_call_model.factory is original
+        assert engine.make_call_model_factory.factory is original
+
+    def test_live_counting_binds_the_ledger_and_agent(self) -> None:
+        engine = _FakeEngine()
+        ledger = UsageLedger()
+
+        _apply_live_counting(engine, ledger, agent=LEADER)
+
+        assert engine.make_call_model.ledger is ledger
+        assert engine.make_call_model.agent == LEADER
+
+    def test_unpinned_live_counting_resolves_the_agent_per_turn(self) -> None:
+        """The multi variant needs one shared counter, not a pinned one.
+
+        With `agent=None` the owner of each turn is read from the ambient scope
+        at call time, which is what lets the leader's turns and every worker's
+        turns flow through a single wrapper without double-counting either.
+        """
+        engine = _FakeEngine()
+
+        _apply_live_counting(engine, UsageLedger())
+
+        assert engine.make_call_model.agent is None
 
 
 __all__: list[str] = []
