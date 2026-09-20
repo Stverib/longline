@@ -447,6 +447,61 @@ class TestJudgeMutations:
         ) is True
         assert judge_case("command_ok", root, _command_ok_broken_command()) is False
 
+    def test_a_failed_check_names_the_stray_it_found(self, tmp_path: Path) -> None:
+        """`unexpected_paths` 的失败必须说出是哪个文件,不能只回一个 False.
+
+        这条是实测逼出来的:付费探针里 multi 那一臂 `unexpected_paths` 失败而
+        其余六项全过 —— 四个产物都在、manifest 逐行相等、directory_snapshot
+        也过。也就是说扇出把要求的活全干完了,只是多留了东西。但 `judge_detail`
+        里 `passed=False, error=None`,多留的是模型写的草稿文件还是 `Write` 原子
+        写入 `mkstemp(dir=path.parent)` 留下的 `.tmp`,从记录里读不出来 —— 前者
+        是关于协作的结论,后者是装置的 bug,两者的下一步完全不同。
+
+        所以判分器要么给理由,要么这条记录写不下去。
+        """
+        args, correct, _ = MUTATIONS["unexpected_paths"]
+        root = tmp_path / "strays"
+        root.mkdir()
+        correct(root)
+        (root / "out" / "scratch.tmp").write_text("leftover\n", encoding="utf-8")
+        (root / "out" / "notes.md").write_text("# notes\n", encoding="utf-8")
+
+        passed, detail = case_passed([{"fn": "unexpected_paths", "args": args}], root)
+        assert passed is False
+        reason = detail[0].get("reason")
+        assert reason, "a failed check carried no reason"
+        # BOTH strays, not just whichever `rglob` happened to yield first.
+        assert "out/scratch.tmp" in reason
+        assert "out/notes.md" in reason
+        assert "out/a.md" not in reason, "a declared artifact was reported as a stray"
+        # The reason is for a FAILED check; a passing one must not invent one.
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        correct(clean)
+        ok, clean_detail = case_passed(
+            [{"fn": "unexpected_paths", "args": args}], clean
+        )
+        assert ok is True
+        assert clean_detail[0].get("reason") is None
+
+    def test_a_reason_never_leaks_into_the_boolean(self, tmp_path: Path) -> None:
+        """`judge_case` 的返回契约仍是真布尔,理由走另一条路.
+
+        上面那张表用的是 `is True` / `is False` 严格同一性;一旦判分器改成回
+        元组而不在这里归一,`judge_case` 就会返回 `(False, "...")`,而元组在
+        布尔语境里恒为真 —— 每一个坏产物都会判成通过,而且是静默的。
+        """
+        args, correct, _ = MUTATIONS["unexpected_paths"]
+        root = tmp_path / "strays"
+        root.mkdir()
+        correct(root)
+        (root / "out" / "scratch.tmp").write_text("leftover\n", encoding="utf-8")
+        assert judge_case("unexpected_paths", root, args) is False
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        correct(clean)
+        assert judge_case("unexpected_paths", clean, args) is True
+
     def test_every_registered_judge_has_a_mutation(self) -> None:
         """新的 judge 必须同时补上 mutation,否则「能失败」没有被证明过."""
         from longline.eval.judges import _JUDGES

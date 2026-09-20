@@ -970,6 +970,60 @@ class TestPairAndCollabSuites:
         assert "safety" in cli.TYPE_CHOICES
 
 
+class TestMultiAgentRowsCarryTheirTurnCount:
+    """`turns` is the field that says whether the live path ran at all.
+
+    `_ScriptedTransport` is the offline protocol, and a scripted run reports zero
+    turns -- that is its documented self-exposure signal, and the plan's first
+    acceptance gate keys on it. `_multi_agent_results` never set the field, so
+    the generic report header printed `turns=0.00` for BOTH arms of a paid live
+    run whose raw rows carried 8 and 42 real turns. A reader auditing that report
+    would have concluded the live path never ran -- the reading the gate exists
+    to make, inverted.
+
+    The generic block is not this suite's real output (that is the paired table
+    below it), which is why a wrong number here survived: it is the block nobody
+    reads until they are checking exactly this.
+    """
+
+    @staticmethod
+    def _run(single_turns: int, multi_turns: int) -> Any:
+        from types import SimpleNamespace
+
+        def variant(name: str, turns: int) -> Any:
+            ledger = SimpleNamespace(turns_count=turns, child_tokens=lambda: 7)
+            return SimpleNamespace(
+                variant=name, passed=True, duration_ms=1.0,
+                input_tokens=10, output_tokens=2, errors=[],
+                accounting_error="", subtask_verdicts={}, agent_count=1,
+                ledger=ledger, accounts={}, offline=False,
+            )
+
+        return SimpleNamespace(
+            case_id="pa-001", single=variant("single_agent", single_turns),
+            multi=variant("multi_agent", multi_turns),
+        )
+
+    def test_each_arm_reports_its_own_turn_count(self) -> None:
+        results = cli._multi_agent_results(self._run(single_turns=8, multi_turns=42))
+
+        assert [r.turns for r in results] == [8, 42]
+
+    def test_a_scripted_run_is_still_distinguishable_by_zero(self) -> None:
+        """The signal is only useful if a genuinely turn-less run still reads 0."""
+        results = cli._multi_agent_results(self._run(single_turns=0, multi_turns=0))
+
+        assert [r.turns for r in results] == [0, 0]
+
+    def test_the_generic_header_average_is_no_longer_pinned_to_zero(self) -> None:
+        """`avg_turns` is read straight off these rows, so it has to move."""
+        from longline.eval.report import aggregate
+
+        results = cli._multi_agent_results(self._run(single_turns=8, multi_turns=42))
+
+        assert aggregate(results).avg_turns == 25.0
+
+
 class TestUnpaidLiveRunIsRefused:
     """The failure mode being prevented is a bill, not an error message.
 

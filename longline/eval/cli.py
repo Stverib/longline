@@ -1218,6 +1218,13 @@ def _multi_agent_results(run: object) -> list[CaseResult]:
     per-case tables and the latency percentiles), while the suite's OWN metrics
     come from the summary objects. The variant label is what keeps the two arms
     from being pooled into one row there.
+
+    `turns` is the ledger's turn count across EVERY agent, not just the leader.
+    It is also the field that says whether the live path ran at all: the offline
+    protocol is scripted and reports zero, so `turns=0.00` in the report header
+    is the self-exposure signal an auditor reads. Leaving it unset made a paid
+    live run print `turns=0.00` for both arms, i.e. it announced that the thing
+    it had just done had not happened.
     """
     out: list[CaseResult] = []
     for variant in (run.single, run.multi):  # type: ignore[attr-defined]
@@ -1225,6 +1232,7 @@ def _multi_agent_results(run: object) -> list[CaseResult]:
             case_id=run.case_id,  # type: ignore[attr-defined]
             case_type="multi_agent",
             passed=variant.passed,
+            turns=variant.ledger.turns_count,
             duration_ms=variant.duration_ms,
             input_tokens=variant.input_tokens,
             output_tokens=variant.output_tokens,

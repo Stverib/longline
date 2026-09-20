@@ -701,7 +701,9 @@ def judge_directory_snapshot(sandbox: Path, args: dict[str, Any]) -> bool:
     return True
 
 
-def judge_unexpected_paths(sandbox: Path, args: dict[str, Any]) -> bool:
+def judge_unexpected_paths(
+    sandbox: Path, args: dict[str, Any]
+) -> tuple[bool, str | None]:
     """Pass when nothing was written BEYOND the declared artifact set.
 
     The complement of `directory_snapshot`'s exact mode, for the one suite that
@@ -721,9 +723,21 @@ def judge_unexpected_paths(sandbox: Path, args: dict[str, Any]) -> bool:
     Deliberately one-directional: it never asserts a declared path EXISTS. That
     is `file_exists`'s job, and fusing the two would make a single check that
     cannot say which of the two things went wrong.
+
+    Returns `(passed, reason)`: the reason names the stray paths. This judge is
+    the one that needed it first. A live probe had the multi arm fail here while
+    the other six checks passed -- every declared artifact present, the manifest
+    line-for-line equal, `directory_snapshot` satisfied -- so the fan-out had
+    done all the work and merely left something behind. Whether that something
+    was a model's scratch file or a `.tmp` from `Write`'s
+    `mkstemp(dir=path.parent)` is the whole question (one is a finding about
+    coordination, the other is a defect in this apparatus), and a bare `False`
+    cannot tell them apart. Collecting every stray rather than returning on the
+    first makes one run's record enough to answer it.
     """
     allowed = {str(p).replace("\\", "/") for p in args.get("equals", [])}
     roots = [str(r) for r in args.get("roots", ["."])]
+    strays: list[str] = []
     for rel_root in roots:
         root = sandbox / rel_root
         if not root.is_dir():
@@ -733,8 +747,10 @@ def judge_unexpected_paths(sandbox: Path, args: dict[str, Any]) -> bool:
                 continue
             rel = path.relative_to(sandbox).as_posix()
             if rel not in allowed:
-                return False
-    return True
+                strays.append(rel)
+    if strays:
+        return False, "unexpected path(s): " + ", ".join(sorted(strays))
+    return True, None
 
 
 _JUDGES: dict[str, Any] = {
@@ -751,12 +767,36 @@ _JUDGES: dict[str, Any] = {
 }
 
 
+def _outcome(fn_name: str, sandbox: Path, args: dict[str, Any]) -> tuple[bool, str | None]:
+    """Run one judge and normalise its answer to `(passed, reason)`.
+
+    Most judges return a bare bool and have no reason to give. A judge that
+    returns `(bool, str)` opts into explaining itself. Normalising HERE rather
+    than at each call site is what keeps the two contracts from leaking into
+    each other: `judge_case` hands callers a real bool either way, and a tuple
+    would be truthy, so a missed normalisation would turn every failed check
+    into a silent pass.
+    """
+    result = _JUDGES.get(fn_name)
+    if result is None:
+        raise ValueError(
+            f"unknown judge fn: {fn_name!r} (known: {sorted(_JUDGES)})"
+        )
+    outcome = result(sandbox, args)
+    if isinstance(outcome, tuple):
+        passed, reason = outcome
+        return bool(passed), reason
+    return bool(outcome), None
+
+
 def judge_case(fn_name: str, sandbox: Path, args: dict[str, Any]) -> bool:
-    """Dispatch a named judge against a sandbox directory."""
-    fn = _JUDGES.get(fn_name)
-    if fn is None:
-        raise ValueError(f"unknown judge fn: {fn_name!r} (known: {sorted(_JUDGES)})")
-    return bool(fn(sandbox, args))
+    """Dispatch a named judge against a sandbox directory.
+
+    Returns a real bool even when the judge opted into the reason channel: a
+    `(False, "...")` tuple is truthy, so returning it unnormalised would report
+    every failed check as a pass.
+    """
+    return _outcome(fn_name, sandbox, args)[0]
 
 
 def case_passed(
@@ -777,6 +817,13 @@ def case_passed(
     not abort a 40-case run whose other 39 cases are still measurable; the
     per-check detail is what makes the breakage diagnosable afterwards.
 
+    `error` and `reason` are the two halves of that diagnosis and they mean
+    different things. `error` is the apparatus failing -- the check could not be
+    evaluated. `reason` is the apparatus working and the artifact being wrong,
+    as told by the judge itself. A run whose failures are all `reason` has a
+    result; a run whose failures are all `error` has a broken benchmark. Keeping
+    them in one field would make the second read as the first.
+
     Returns the per-check list in case order so a failure report can point at
     the exact assertion that broke rather than a single opaque boolean.
     """
@@ -795,12 +842,15 @@ def case_passed(
         fn_name = str(check.get("fn"))
         args = check.get("args") or {}
         try:
-            ok = judge_case(fn_name, sandbox, args)
+            ok, reason = _outcome(fn_name, sandbox, args)
             error = None
         except Exception as exc:  # a broken check is a failed check, not a crash
             ok = False
+            reason = None
             error = f"{type(exc).__name__}: {exc}"
-        results.append({"fn": fn_name, "args": args, "passed": ok, "error": error})
+        results.append(
+            {"fn": fn_name, "args": args, "passed": ok, "error": error, "reason": reason}
+        )
 
     outcomes = [bool(r["passed"]) for r in results]
     passed = any(outcomes) if mode == "any" else all(outcomes)
