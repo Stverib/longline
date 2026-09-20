@@ -54,10 +54,14 @@ from longline.eval.child_usage import (
     teammate_ids_in,
 )
 from longline.eval.multi_agent import (
+    CATEGORIES,
+    CATEGORY_ANALYSIS,
+    CATEGORY_MODIFICATION,
     CONTROLLED,
     EXPLORATORY,
     MULTI,
     SINGLE,
+    CaseParseError,
     MultiAgentCase,
     Subtask,
 )
@@ -824,6 +828,80 @@ class TestSandboxChdir:
             _in_sandbox(str(tmp_path / "other")).__enter__()
 
         assert Path.cwd().resolve() != sandbox.resolve()
+
+
+class TestCategoryAxis:
+    """`category` is orthogonal to `group`, and never replaces it.
+
+    `group` answers "did both arms do the same work" (`controlled` vs
+    `exploratory`); `category` answers "what shape was that work". A case has
+    both, and the report partitions on both.
+    """
+
+    def test_category_defaults_to_analysis_for_legacy_rows(self) -> None:
+        """The frozen 24 must keep loading: an absent `category` cannot raise.
+
+        They predate the field and cannot be edited (spec hard constraint 6),
+        so this default is what keeps `formal_multi_agent_offline` reproducible.
+        """
+        case = MultiAgentCase.from_dict(_case_dict())
+
+        assert case.category == CATEGORY_ANALYSIS
+
+    def test_category_is_read_when_present(self) -> None:
+        case = MultiAgentCase.from_dict(
+            _case_dict(category=CATEGORY_MODIFICATION)
+        )
+
+        assert case.category == CATEGORY_MODIFICATION
+
+    def test_unknown_category_is_rejected(self) -> None:
+        with pytest.raises(CaseParseError, match="category"):
+            MultiAgentCase.from_dict(_case_dict(category="vibes"))
+
+    def test_every_category_is_loadable(self) -> None:
+        """A constant in `CATEGORIES` that the loader rejects is a dead branch."""
+        for category in CATEGORIES:
+            case = MultiAgentCase.from_dict(_case_dict(category=category))
+            assert case.category == category
+
+    def test_group_and_category_are_independent(self) -> None:
+        """Four combinations, all valid -- the axes do not constrain each other."""
+        for group in (CONTROLLED, EXPLORATORY):
+            for category in CATEGORIES:
+                case = MultiAgentCase.from_dict(
+                    _case_dict(group=group, category=category)
+                )
+                assert (case.group, case.category) == (group, category)
+
+
+def _case_dict(**overrides: Any) -> dict[str, Any]:
+    """A loader-shaped dict for a minimal valid case.
+
+    Round-tripped from the known-good `make_case()` rather than hand-written:
+    a hand-written dict drifts from the schema the moment a required field is
+    added, and the symptom would be a `CaseParseError` in an unrelated test.
+    """
+    case = make_case()
+    d: dict[str, Any] = {
+        "id": case.id,
+        "task": case.task,
+        "group": case.group,
+        "subtasks": [
+            {"id": s.id, "instruction": s.instruction, "writes": s.writes}
+            for s in case.subtasks
+        ],
+        "workers": case.workers,
+        "merge": case.merge,
+        "merge_file": case.merge_file,
+        "fixture_single": case.fixture_single,
+        "fixture_multi": case.fixture_multi,
+        "max_turns": case.max_turns,
+        "tags": list(case.tags),
+        "checks": [dict(c) for c in case.checks],
+    }
+    d.update(overrides)
+    return d
 
 
 __all__: list[str] = []

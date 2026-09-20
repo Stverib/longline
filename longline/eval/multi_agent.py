@@ -74,6 +74,24 @@ CONTROLLED = "controlled"
 EXPLORATORY = "exploratory"
 GROUPS: tuple[str, ...] = (CONTROLLED, EXPLORATORY)
 
+# The task-shape axis, orthogonal to `group`. `group` answers "did both arms do
+# the same work"; `category` answers "what shape was that work". They are
+# independent: a `controlled` case can be any of the three, and the two axes
+# constrain each other in no direction.
+#
+# The categories are never pooled into one average. Such an average would be a
+# fact about the mix of shapes in the corpus rather than about the
+# architecture -- rebalance the corpus and the number moves without anything
+# about the runtime having changed.
+CATEGORY_ANALYSIS = "parallel_analysis"
+CATEGORY_MODIFICATION = "parallel_modification"
+CATEGORY_DEPENDENT = "dependent"
+CATEGORIES: tuple[str, ...] = (
+    CATEGORY_ANALYSIS,
+    CATEGORY_MODIFICATION,
+    CATEGORY_DEPENDENT,
+)
+
 # Contract §5.6: "2~4 个子 Agent 并行执行". A controlled case must declare at
 # least two subtasks (below that there is nothing to fan out) and at most four
 # workers run concurrently. The upper bound is a contract number, not a
@@ -91,6 +109,7 @@ MERGE_WRITE = "write_required"
 MERGE_MODES: tuple[str, ...] = (MERGE_WRITE,)
 
 Group = Literal["controlled", "exploratory"]
+Category = Literal["parallel_analysis", "parallel_modification", "dependent"]
 
 
 @dataclass
@@ -163,6 +182,7 @@ class MultiAgentCase(E2ECase):
     """
 
     group: Group = "controlled"
+    category: Category = "parallel_analysis"
     subtasks: list[Subtask] = field(default_factory=list)
     workers: int = MIN_WORKERS
     merge: str = MERGE_WRITE
@@ -204,6 +224,15 @@ class MultiAgentCase(E2ECase):
         if group not in GROUPS:
             raise CaseParseError(
                 f"{cid}: 'group' must be one of {list(GROUPS)}, got {group!r}"
+            )
+
+        # Parsed before the subtasks because `_parse_subtasks` behaves
+        # differently for a declared chain: the non-overlap rule it enforces is
+        # about concurrent fan-out, and a chain has no concurrency.
+        category = d.get("category", CATEGORY_ANALYSIS)
+        if category not in CATEGORIES:
+            raise CaseParseError(
+                f"{cid}: 'category' must be one of {list(CATEGORIES)}, got {category!r}"
             )
 
         subtasks = cls._parse_subtasks(d.get("subtasks"), case_id=cid)
@@ -250,6 +279,7 @@ class MultiAgentCase(E2ECase):
             checks_mode=base.checks_mode,
             judge=base.judge,
             group=group,
+            category=category,
             subtasks=subtasks,
             workers=workers,
             merge=merge,
