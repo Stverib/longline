@@ -181,6 +181,47 @@ def mean(values: Sequence[float]) -> float | None:
     return sum(values) / len(values)
 
 
+def speedup_block(ratios: Sequence[float]) -> dict[str, object]:
+    """Mean AND P50 of a list of per-case ratios, from ONE sample.
+
+    Both figures come from the list handed in, and that is the whole reason this
+    is a function rather than two call sites. A mean and a median computed over
+    two different samples -- one filtered, one not -- look perfectly fine in a
+    report and are not comparable to each other, which is the only thing the
+    pair is for.
+
+    The mean is not the more important of the two and is kept only for
+    comparability: the frozen offline report at
+    `evals/results/formal_multi_agent_offline/` publishes `mean over per-case
+    ratios`, so a P50-only report could not be read against it. P50 is the one
+    that answers "what does a typical case do", because a mean of per-case
+    ratios is dragged by whichever case happened to be small.
+
+    An empty sample yields None for both, never 0.0. This module's rule: a zero
+    denominator means not measured.
+    """
+    ordered = [float(v) for v in ratios]
+    return {
+        "speedup_mean": mean(ordered),
+        "speedup_p50": percentile(ordered, 50.0),
+        "n": len(ordered),
+    }
+
+
+def success_per_1k_tokens(*, successes: int, total_tokens: int) -> float | None:
+    """Successes per 1000 tokens, or None when there is nothing to divide by.
+
+    None rather than 0.0: no tokens means no rate was measured, while 0.0 claims
+    a rate that was measured and came out at zero. The report prints the two
+    differently, and only one of them is a fact about the agent. A case that
+    made no model calls -- and there are such cases, an offline arm that never
+    reaches the transport among them -- would read as "succeeded never".
+    """
+    if total_tokens <= 0:
+        return None
+    return successes / (total_tokens / 1000.0)
+
+
 @dataclass(frozen=True)
 class PairedDelta:
     """Per-case deltas between two aligned runs, plus their mean.

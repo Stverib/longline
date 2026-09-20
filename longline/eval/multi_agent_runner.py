@@ -87,8 +87,9 @@ from longline.eval.child_usage import (
     reconcile,
 )
 from longline.eval.judges import case_passed
-from longline.eval.metrics import Ratio
+from longline.eval.metrics import Ratio, mean, speedup_block, success_per_1k_tokens
 from longline.eval.multi_agent import (
+    CATEGORY_ANALYSIS,
     CATEGORY_DEPENDENT,
     CONTROLLED,
     DEPENDENT_WORKERS,
@@ -304,6 +305,12 @@ class MultiAgentRun:
     excluded_from_denominator: bool = False
     exclusion_reason: str | None = None
     note: str = ""
+    # The task SHAPE, orthogonal to `group`. `group` says whether the case was
+    # controlled or exploratory (a property of how the case was authored);
+    # `category` says what kind of work it is (a property of the task). The
+    # report splits on this one, because a mean over three different kinds of
+    # task answers a question about the corpus mix rather than the architecture.
+    category: str = CATEGORY_ANALYSIS
 
     @property
     def speedup(self) -> float | None:
@@ -373,8 +380,30 @@ class MultiAgentSummary:
     multi_tool_calls: int
     agent_counts: list[int] = field(default_factory=list)
     per_case: list[dict[str, object]] = field(default_factory=list)
+    # One self-contained block per CATEGORY present, each with its own success
+    # rates, speedup pair, token overhead and cost-per-success. This is what the
+    # report renders; the scalars above are the group's own figures and stay for
+    # the single-category suites (the frozen `multi_agent` corpus is one shape).
+    by_category: dict[str, dict[str, object]] = field(default_factory=dict)
+    # The cross-category figures, or None when `is_pooled`. Present as a FIELD
+    # rather than recomputed in `to_dict` because recomputing it from the rows
+    # would be a second implementation of every metric, and the rows do not
+    # carry `speedup` at all -- the sum would silently come out empty.
+    pooled: dict[str, object] | None = None
     speedup_units: str = "ratio_of_durations"
     overhead_units: str = "ratio"
+
+    @property
+    def is_pooled(self) -> bool:
+        """True when this summary covers more than one CATEGORY of task.
+
+        The report withholds the headline when this is true. A mean over
+        `parallel_analysis` and `strongly_dependent` cases together is not a
+        weaker version of either -- it is a statement about the corpus mix, and
+        it moves the moment the 6/6/6 split is rebalanced, with nothing about
+        the architecture having changed.
+        """
+        return len(self.by_category) > 1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -404,6 +433,11 @@ class MultiAgentSummary:
             },
             "agent_counts": self.agent_counts,
             "per_case": self.per_case,
+            "by_category": self.by_category,
+            # `None` when pooled, and that is a statement rather than a gap: a
+            # consumer reading the raw artifact must not be able to pick up a
+            # cross-category number the report deliberately refused to print.
+            "pooled": self.pooled,
         }
 
 
@@ -1508,6 +1542,53 @@ def _sum_tokens(runs: Sequence[VariantRun]) -> dict[str, int]:
     }
 
 
+def _pair_block(eligible: Sequence[MultiAgentRun]) -> dict[str, object]:
+    """Every reportable figure for one set of eligible runs.
+
+    One implementation, used for the group-level block AND for each category's.
+    A second copy for the per-category tables would be free to drift, and the
+    drift would show up as two headings in the same report computing `Speedup`
+    two different ways -- which a reader has no way to notice.
+
+    `success_per_1k_tokens` is per ARM, and both are reported. The corpus-level
+    question the user's spec asks is "how much does a success cost", and a
+    fan-out that wins on wall clock while costing 3.3x the tokens has a worse
+    cost per success -- which is the whole finding, stated as one number.
+    """
+    speedups = [v for v in (r.speedup for r in eligible) if v is not None]
+    overheads = [v for v in (r.token_overhead for r in eligible) if v is not None]
+    single_tokens = _sum_tokens([r.single for r in eligible])
+    multi_tokens = _sum_tokens([r.multi for r in eligible])
+
+    def _rate(*, passed: Sequence[bool], tokens: dict[str, int]) -> float | None:
+        return success_per_1k_tokens(
+            successes=sum(1 for ok in passed if ok), total_tokens=tokens["total_tokens"],
+        )
+
+    return {
+        "num_cases": len(eligible),
+        "success_rate": {
+            "single_agent": Ratio.fraction(r.single.passed for r in eligible).to_dict(),
+            "multi_agent": Ratio.fraction(r.multi.passed for r in eligible).to_dict(),
+        },
+        "speedup": speedup_block(speedups),
+        "token_overhead": mean(overheads),
+        "tokens": {"single_agent": single_tokens, "multi_agent": multi_tokens},
+        "tool_calls": {
+            "single_agent": single_tokens["tool_calls"],
+            "multi_agent": multi_tokens["tool_calls"],
+        },
+        "success_per_1k_tokens": {
+            "single_agent": _rate(
+                passed=[r.single.passed for r in eligible], tokens=single_tokens,
+            ),
+            "multi_agent": _rate(
+                passed=[r.multi.passed for r in eligible], tokens=multi_tokens,
+            ),
+        },
+    }
+
+
 def aggregate_multi_agent(
     runs: Sequence[MultiAgentRun],
     *,
@@ -1544,6 +1625,12 @@ def aggregate_multi_agent(
     single_tokens = _sum_tokens([r.single for r in eligible])
     multi_tokens = _sum_tokens([r.multi for r in eligible])
 
+    categories = sorted({r.category for r in eligible})
+    by_category = {
+        category: _pair_block([r for r in eligible if r.category == category])
+        for category in categories
+    }
+
     return MultiAgentSummary(
         group=group or "all",
         num_cases=len(selected),
@@ -1561,6 +1648,8 @@ def aggregate_multi_agent(
         multi_tool_calls=multi_tokens["tool_calls"],
         agent_counts=sorted({r.multi.agent_count for r in eligible}),
         per_case=[r.to_row() for r in selected],
+        by_category=by_category,
+        pooled=_pair_block(eligible) if len(categories) <= 1 else None,
     )
 
 

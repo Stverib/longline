@@ -949,6 +949,77 @@ def _fmt_speedup(value: float | None) -> str:
     return "1.00x (parity)"
 
 
+def _fmt_pct_dict(block: object) -> str:
+    """`_fmt_pct`, for the dict form `Ratio.to_dict()` produces.
+
+    The per-category blocks carry serialised ratios rather than `Ratio`
+    instances, because they are built for `raw.jsonl` first and read by the
+    report second. Formatting the dict keeps one rendering rule for both.
+    """
+    if not isinstance(block, dict) or block.get("value") is None:
+        return "not measured (0/0)"
+    return (
+        f"{float(block['value']) * 100:.1f}% "
+        f"({block['numerator']}/{block['denominator']})"
+    )
+
+
+def _fmt_rate(value: object) -> str:
+    """Successes per 1000 tokens, or `not measured`.
+
+    Never `0.0`. A zero denominator means the rate was not measured, and
+    printing `0.000` there reads as "this arm never succeeded" -- a much worse
+    claim than the one the data supports.
+    """
+    if value is None:
+        return "not measured"
+    return f"{float(value):.3f}"
+
+
+def _category_lines(summary: MultiAgentSummary) -> list[str]:
+    """Per-category tables, and NO all-categories row.
+
+    The refusal is the point. The three categories are different kinds of work,
+    so a mean over them describes this corpus's split rather than the
+    architecture: rebalance the corpus from 6/6/6 and the pooled number moves
+    while nothing about the agent has changed. A reader who wants a headline can
+    pick the category whose task shape they actually care about.
+
+    `Speedup` is shown as both mean and P50. The mean is kept because the frozen
+    offline report publishes a mean and the new numbers have to be readable
+    against it; the P50 is there because a mean of per-case ratios is dragged by
+    whichever case happened to be cheapest.
+    """
+    lines = [
+        "",
+        "> **The pooled figure is withheld.** These cases span more than one "
+        "CATEGORY of task, and a single mean over them would describe the "
+        "corpus mix rather than the architecture -- it would move if the mix "
+        "were rebalanced, with nothing about the agent having changed. Read the "
+        "per-category rows below; there is deliberately no all-categories row.",
+        "",
+        "| category | n | Success single | Success multi | Speedup mean | "
+        "Speedup P50 | TokenOverhead | succ/1k tok single | succ/1k tok multi |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for category, block in sorted(summary.by_category.items()):
+        rate = block["success_rate"]
+        speedup = block["speedup"]
+        per_1k = block["success_per_1k_tokens"]
+        assert isinstance(rate, dict) and isinstance(speedup, dict) and isinstance(per_1k, dict)
+        lines.append(
+            f"| `{category}` | {block['num_cases']} | "
+            f"{_fmt_pct_dict(rate['single_agent'])} | "
+            f"{_fmt_pct_dict(rate['multi_agent'])} | "
+            f"{_fmt_speedup(_as_float(speedup['speedup_mean']))} | "
+            f"{_fmt_speedup(_as_float(speedup['speedup_p50']))} | "
+            f"{_fmt_pct_ratio(_as_float(block['token_overhead']))} | "
+            f"{_fmt_rate(per_1k['single_agent'])} | "
+            f"{_fmt_rate(per_1k['multi_agent'])} |"
+        )
+    return lines
+
+
 def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
     """The Task 7 section: one block per group, never one pooled number.
 
@@ -1000,6 +1071,18 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
             f"{summary.excluded_cases} excluded (a variant did not complete or its "
             "token accounting did not reconcile)",
             f"- **Agent counts (multi arm):** {summary.agent_counts or 'n/a'}",
+        ]
+
+        if summary.is_pooled:
+            # The group headline is withheld. Everything below it -- the
+            # per-case table, the exclusions -- still applies and is printed, so
+            # a reader loses the summary line and nothing else.
+            lines += _category_lines(summary)
+            lines += ["", "### Per-case (this group)", ""]
+            lines += _per_case_table(summary)
+            continue
+
+        lines += [
             "",
             "| metric | value | 95% Wilson CI | numerator / denominator |",
             "|---|---|---|---|",
@@ -1039,30 +1122,43 @@ def _multi_agent_lines(summaries: dict[str, MultiAgentSummary]) -> list[str]:
             "",
             "### Per-case (this group)",
             "",
-            "| case | workers | single pass | multi pass | single ms | multi ms | "
-            "speedup | single tok | multi tok | multi child tok | excluded |",
-            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
-        for row in summary.per_case:
-            single = row["single"]
-            multi = row["multi"]
-            assert isinstance(single, dict) and isinstance(multi, dict)
-            single_ms = _as_float(single["duration_ms"])
-            multi_ms = _as_float(multi["duration_ms"])
-            speedup = (
-                None
-                if not single_ms or not multi_ms
-                else single_ms / multi_ms
-            )
-            excluded = "yes" if row["excluded_from_denominator"] else "-"
-            if row["exclusion_reason"]:
-                excluded = f"yes ({row['exclusion_reason']})"
-            lines.append(
-                f"| {row['case_id']} | {row['workers']} | {single['passed']} | "
-                f"{multi['passed']} | {_fmt_ms(single_ms)} | {_fmt_ms(multi_ms)} | "
-                f"{_fmt_speedup(speedup)} | {single['total_tokens']} | "
-                f"{multi['total_tokens']} | {multi['child_tokens']} | {excluded} |"
-            )
+        lines += _per_case_table(summary)
+    return lines
+
+
+def _per_case_table(summary: MultiAgentSummary) -> list[str]:
+    """The per-case header plus one row per case, excluded ones labelled.
+
+    One definition, used by the pooled layout and the per-category one. Two
+    copies would be free to drift, and the drift would land as two sections of
+    one report disagreeing about a case's speedup.
+    """
+    lines = [
+        "| case | workers | single pass | multi pass | single ms | multi ms | "
+        "speedup | single tok | multi tok | multi child tok | excluded |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in summary.per_case:
+        single = row["single"]
+        multi = row["multi"]
+        assert isinstance(single, dict) and isinstance(multi, dict)
+        single_ms = _as_float(single["duration_ms"])
+        multi_ms = _as_float(multi["duration_ms"])
+        speedup = (
+            None
+            if not single_ms or not multi_ms
+            else single_ms / multi_ms
+        )
+        excluded = "yes" if row["excluded_from_denominator"] else "-"
+        if row["exclusion_reason"]:
+            excluded = f"yes ({row['exclusion_reason']})"
+        lines.append(
+            f"| {row['case_id']} | {row['workers']} | {single['passed']} | "
+            f"{multi['passed']} | {_fmt_ms(single_ms)} | {_fmt_ms(multi_ms)} | "
+            f"{_fmt_speedup(speedup)} | {single['total_tokens']} | "
+            f"{multi['total_tokens']} | {multi['child_tokens']} | {excluded} |"
+        )
     return lines
 
 

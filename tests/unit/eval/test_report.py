@@ -803,3 +803,211 @@ class TestCacheAwareTokenEfficiency:
         md = render_markdown(rep)
 
         assert "cached" in md
+
+
+def _pair_arm(name: str, *, passed: bool, ms: float, tokens: int) -> Any:
+    """One `VariantRun` with a real ledger carrying `tokens`."""
+    from longline.eval.child_usage import LEADER, TurnUsage, UsageLedger
+    from longline.eval.multi_agent_runner import VariantRun
+
+    ledger = UsageLedger(spawned=[LEADER])
+    ledger.record(TurnUsage(agent=LEADER, input_tokens=tokens, output_tokens=0, tool_calls=1))
+    return VariantRun(
+        variant=name, passed=passed, duration_ms=ms, ledger=ledger,
+        accounts={}, subtask_verdicts={},
+    )
+
+
+def _runs_by_category(outcomes: dict[str, list[bool]]) -> list[Any]:
+    """One `MultiAgentRun` per verdict, tagged with its category.
+
+    The speedup of run N is `N`, which is arbitrary but distinct: per-case
+    ratios that repeated themselves would make a mean and a P50 agree by
+    accident, and the block would then pass whether or not it computed two
+    different things.
+    """
+    from longline.eval.multi_agent_runner import MultiAgentRun
+
+    runs = []
+    index = 0
+    for category, verdicts in outcomes.items():
+        for verdict in verdicts:
+            index += 1
+            runs.append(
+                MultiAgentRun(
+                    case_id=f"{category}-{index}",
+                    group="controlled",
+                    workers=2,
+                    num_subtasks=2,
+                    single=_pair_arm("single", passed=verdict, ms=1000.0, tokens=100),
+                    multi=_pair_arm("multi", passed=verdict, ms=1000.0 / index, tokens=300),
+                    expected_paths=[],
+                    category=category,
+                )
+            )
+    return runs
+
+
+def _summary_over(runs: list[Any]) -> Any:
+    from longline.eval.multi_agent_runner import aggregate_multi_agent
+
+    return aggregate_multi_agent(runs)
+
+
+class TestSpeedupBlock:
+    """Mean AND P50, from ONE list of ratios.
+
+    The mean is kept for comparability with the frozen offline report, which
+    publishes `mean over per-case ratios`; switching the only figure to P50
+    would make the two runs unreadable against each other. P50 is added because
+    a mean of per-case ratios is dragged by whichever case happened to be small.
+    """
+
+    def test_both_figures_come_from_the_same_sample(self) -> None:
+        """FAILS ON: computing P50 over a different (e.g. filtered) list.
+
+        A mean and a median over two different samples look fine in a report and
+        are not comparable to each other, which is the only thing the pair is
+        for. The outlier is here to pull them apart so the test can tell.
+        """
+        from longline.eval.metrics import speedup_block
+
+        block = speedup_block([1.0, 2.0, 3.0, 100.0])
+
+        assert block["speedup_mean"] == pytest.approx(26.5)
+        assert block["speedup_p50"] == pytest.approx(2.5)
+        assert block["n"] == 4
+
+    def test_no_samples_is_not_a_zero_speedup(self) -> None:
+        from longline.eval.metrics import speedup_block
+
+        block = speedup_block([])
+
+        assert block["speedup_mean"] is None
+        assert block["speedup_p50"] is None
+        assert block["n"] == 0
+
+
+class TestSuccessPer1KTokens:
+    def test_a_zero_denominator_is_none_not_zero(self) -> None:
+        """FAILS ON: returning 0.0, which reads as "succeeded never".
+
+        That is a different and much worse claim than "there was nothing to
+        divide by" -- a case that made no model calls has no rate at all.
+        """
+        from longline.eval.metrics import success_per_1k_tokens
+
+        assert success_per_1k_tokens(successes=0, total_tokens=0) is None
+        assert success_per_1k_tokens(successes=3, total_tokens=0) is None
+
+    def test_the_rate_is_per_thousand(self) -> None:
+        from longline.eval.metrics import success_per_1k_tokens
+
+        assert success_per_1k_tokens(successes=3, total_tokens=1500) == pytest.approx(2.0)
+
+
+class TestPairReport:
+    def test_categories_are_reported_separately(self) -> None:
+        """A pooled average is a fact about the corpus mix, not the architecture.
+
+        The three categories are different tasks, so one mean over all 18
+        answers "how did this particular 6/6/6 split do" -- a question nobody
+        asked, whose answer changes the moment the corpus is rebalanced.
+        """
+        from longline.eval.multi_agent import (
+            CATEGORY_ANALYSIS,
+            CATEGORY_DEPENDENT,
+            CATEGORY_MODIFICATION,
+        )
+
+        summary = _summary_over(_runs_by_category({
+            CATEGORY_ANALYSIS: [True, True, False],
+            CATEGORY_MODIFICATION: [True, False, False],
+            CATEGORY_DEPENDENT: [True, True, True],
+        }))
+
+        def rate(category: str) -> float:
+            block = summary.by_category[category]["success_rate"]["multi_agent"]
+            return float(block["value"])
+
+        assert rate(CATEGORY_ANALYSIS) == pytest.approx(2 / 3)
+        assert rate(CATEGORY_MODIFICATION) == pytest.approx(1 / 3)
+        assert rate(CATEGORY_DEPENDENT) == pytest.approx(1.0)
+
+    def test_a_multi_category_summary_refuses_to_publish_a_pooled_figure(self) -> None:
+        """FAILS ON: a summary that emits a cross-category number anyway.
+
+        `is_pooled` is what the report renders on: when it is True the headline
+        row is withheld and only the per-category tables appear. The JSON keeps
+        `pooled: None` as the machine-readable statement of the same refusal, so
+        a consumer cannot read a pooled value out of the raw artifact either.
+        """
+        from longline.eval.multi_agent import CATEGORY_ANALYSIS, CATEGORY_MODIFICATION
+
+        summary = _summary_over(_runs_by_category({
+            CATEGORY_ANALYSIS: [True, False],
+            CATEGORY_MODIFICATION: [True],
+        }))
+
+        assert summary.is_pooled is True
+        assert summary.to_dict()["pooled"] is None, (
+            "no pooled multi-category figure may be emitted at all"
+        )
+
+    def test_a_single_category_summary_still_publishes_its_figures(self) -> None:
+        """The frozen `multi_agent` suite is one category, and must not regress.
+
+        Refusing EVERY pooled figure would take the frozen baseline's headline
+        away with it, and that report is the thing the new numbers are read
+        against.
+        """
+        from longline.eval.multi_agent import CATEGORY_ANALYSIS
+
+        summary = _summary_over(_runs_by_category({CATEGORY_ANALYSIS: [True, False]}))
+
+        assert summary.is_pooled is False
+        pooled = summary.to_dict()["pooled"]
+        assert pooled is not None
+        assert pooled["speedup"]["speedup_p50"] is not None
+
+    def test_each_category_block_carries_its_own_speedup_pair(self) -> None:
+        """Per-category, not the group's figures repeated under three headings."""
+        from longline.eval.multi_agent import CATEGORY_ANALYSIS, CATEGORY_MODIFICATION
+
+        summary = _summary_over(_runs_by_category({
+            CATEGORY_ANALYSIS: [True, False],
+            CATEGORY_MODIFICATION: [True, False, False],
+        }))
+
+        analysis = summary.by_category[CATEGORY_ANALYSIS]["speedup"]
+        modification = summary.by_category[CATEGORY_MODIFICATION]["speedup"]
+
+        assert analysis["n"] == 2
+        assert modification["n"] == 3
+        assert analysis["speedup_mean"] != modification["speedup_mean"]
+
+    def test_every_block_reports_success_per_1k_tokens(self) -> None:
+        """The corpus-level question is "how much does a success cost"."""
+        from longline.eval.multi_agent import CATEGORY_ANALYSIS
+
+        summary = _summary_over(_runs_by_category({CATEGORY_ANALYSIS: [True, False]}))
+
+        block = summary.by_category[CATEGORY_ANALYSIS]
+
+        assert block["success_per_1k_tokens"]["multi_agent"] is not None
+        assert block["success_per_1k_tokens"]["single_agent"] is not None
+
+    def test_the_report_withholds_the_headline_when_categories_are_pooled(self) -> None:
+        """The refusal has to reach the Markdown, not only the dataclass."""
+        from longline.eval.multi_agent import CATEGORY_ANALYSIS, CATEGORY_MODIFICATION
+
+        summary = _summary_over(_runs_by_category({
+            CATEGORY_ANALYSIS: [True],
+            CATEGORY_MODIFICATION: [True],
+        }))
+
+        md = render_markdown(aggregate([]), multi_agent={"pair": summary})
+
+        assert "withheld" in md
+        assert CATEGORY_ANALYSIS in md
+        assert CATEGORY_MODIFICATION in md
