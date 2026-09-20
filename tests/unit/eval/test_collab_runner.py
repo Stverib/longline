@@ -28,11 +28,13 @@ from pathlib import Path
 
 from longline.eval.collab_cases import (
     CollabCase,
+    ConflictCase,
     DurabilityCase,
     OrphanCase,
     WorktreeCase,
 )
 from longline.eval.collab_runner import (
+    run_conflict,
     run_inbox_durability,
     run_mailbox_integrity,
     run_orphan_task_rate,
@@ -295,3 +297,95 @@ class TestOrphanTaskRate:
             "the denominator is COMPLETED, not SPAWNED: the failed teammate "
             "never produced a reply to orphan"
         )
+
+
+class TestConflictHandling:
+    """Four independent numbers, deliberately not one boolean.
+
+    "A conflict happened" and "a conflict was handled" are different facts, and
+    the dangerous outcome is neither: it is two writers both reporting success
+    while one of the two edits is simply gone. A single pass/fail collapses all
+    three into one bit and loses exactly the distinction the suite exists to
+    draw.
+
+    `silent_overwrite` is the headline: the final file holds one writer's text,
+    the other writer's tool call returned success, and nothing anywhere reported
+    a conflict.
+
+    The two shapes are not two ways of doing the same thing:
+
+    - `Edit` carries a precondition (`old_string`), so the second writer to run
+      finds the text already changed and FAILS. The conflict is detected, at the
+      cost of a failed task.
+    - `Write` is a whole-file overwrite with no precondition, so BOTH succeed
+      and the first writer's edit is gone. Nothing errors anywhere. This is the
+      shape the case exists for.
+
+    The writers run one after the other rather than interleaving, and that is
+    not a simplification: neither tool awaits between reading the file and
+    writing it, so on one event loop they could not interleave even if started
+    together. What is measured is a LOST UPDATE from a stale read, not a data
+    race -- and a data race is unreachable here for the same reason the mailbox
+    one is.
+    """
+
+    def test_edit_detects_the_conflict(self, tmp_path: Path) -> None:
+        result = run_conflict(ConflictCase(workspace=tmp_path, shape="edit"))
+
+        assert result.injected == 2
+        assert result.detected == 1
+        assert result.silent_overwrite == 0, (
+            "the second Edit's old_string no longer matches, so it errors "
+            "instead of quietly winning"
+        )
+        assert result.final_integration_success is True
+
+    def test_write_silently_overwrites(self, tmp_path: Path) -> None:
+        result = run_conflict(ConflictCase(workspace=tmp_path, shape="write"))
+
+        assert result.injected == 2
+        assert result.detected == 0, "Write has no precondition, so nothing can fail"
+        assert result.silent_overwrite == 1
+        assert result.final_integration_success is True
+
+    def test_every_writer_records_what_it_believed(self, tmp_path: Path) -> None:
+        """The belief and the outcome are recorded separately, per writer.
+
+        `silent_overwrite` is the gap between the two columns: a writer whose
+        call returned success whose text is not in the file. Collapsing them
+        into one field would make the metric uncomputable from the result.
+        """
+        result = run_conflict(ConflictCase(workspace=tmp_path, shape="write"))
+
+        assert len(result.writers) == 2
+        assert [writer.reported_success for writer in result.writers] == [True, True]
+        assert sum(1 for writer in result.writers if writer.survived) == 1
+
+    def test_a_lone_writer_cannot_conflict_with_anyone(self, tmp_path: Path) -> None:
+        """The control: the same machinery, no second writer.
+
+        Without it, a `silent_overwrite` of 1 could be a property of the tool
+        rather than of the collision.
+        """
+        result = run_conflict(
+            ConflictCase(workspace=tmp_path, shape="write", values=("alpha",))
+        )
+
+        assert result.injected == 1
+        assert result.detected == 0
+        assert result.silent_overwrite == 0
+        assert result.writers[0].survived is True
+
+    def test_the_edit_shape_names_which_writer_lost(self, tmp_path: Path) -> None:
+        """`error` has to carry the tool's own words, not just a boolean.
+
+        "One writer failed" is not actionable; "old_string not found" says the
+        precondition is what caught it, which is the difference between the two
+        shapes and the reason `Edit` is the safe one.
+        """
+        result = run_conflict(ConflictCase(workspace=tmp_path, shape="edit"))
+
+        failed = [writer for writer in result.writers if not writer.reported_success]
+        assert len(failed) == 1
+        assert "old_string not found" in failed[0].error
+        assert failed[0].survived is False

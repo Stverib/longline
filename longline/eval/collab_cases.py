@@ -80,3 +80,29 @@ class OrphanCase:
     drain: bool = True
     failing: tuple[str, ...] = ()
     team_name: str = "collab-orphan"
+
+
+@dataclass(frozen=True)
+class ConflictCase:
+    """Two writers aimed at the same line of the same file.
+
+    `shape` picks the tool, and the two shapes fail in opposite directions, so
+    neither one alone is a result about "conflicts":
+
+    - `"edit"` sends `Edit`, which carries `old_string` as a precondition. The
+      second writer finds the text already changed and errors -- the conflict is
+      DETECTED, and the cost is a failed task.
+    - `"write"` sends `Write`, a whole-file overwrite with no precondition. Both
+      writers succeed and the first one's text is simply gone, with nothing
+      anywhere reporting a problem.
+
+    `values` is the list of texts the writers race to install, one writer each,
+    so a one-element tuple is the control: the same machinery with nobody to
+    collide with.
+    """
+
+    workspace: Path
+    shape: str = "edit"
+    values: tuple[str, ...] = ("alpha", "beta")
+    target: str = "shared.py"
+    anchor: str = 'VALUE = "original"'

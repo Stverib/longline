@@ -37,7 +37,7 @@ import asyncio
 import contextlib
 import os
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
     from longline.eval.collab_cases import (
         CollabCase,
+        ConflictCase,
         DurabilityCase,
         OrphanCase,
         WorktreeCase,
@@ -663,3 +664,140 @@ def _running_task(task_id: str) -> asyncio.Task[str]:
     if task is None:
         raise RuntimeError(f"spawn returned {task_id} but registered no task for it")
     return task
+
+
+# --- conflicting writers -----------------------------------------------------
+
+_CONFLICT_HEADER = '"""Shared module two writers both want to change."""\n\n'
+_CONFLICT_FOOTER = "\n\ndef read() -> str:\n    return VALUE\n"
+
+
+def _conflict_body(value: str) -> str:
+    """The whole-file content a `Write`-shaped writer installs."""
+    return f'{_CONFLICT_HEADER}VALUE = "{value}"{_CONFLICT_FOOTER}'
+
+
+@dataclass
+class WriterOutcome:
+    """One writer's belief and one writer's fate, kept apart on purpose.
+
+    `reported_success` is what the tool call returned, which is the whole of
+    what the writer learns -- neither tool reads the file back afterwards, and a
+    teammate would not either. `survived` is whether that writer's text is the
+    text that ended up in the file. `silent_overwrite` is exactly the writers
+    where the first is true and the second is not, so collapsing these two into
+    one field would make the headline number uncomputable from the result.
+    """
+
+    name: str
+    value: str
+    reported_success: bool
+    survived: bool
+    error: str = ""
+
+
+@dataclass
+class ConflictResult:
+    """Four numbers, because "happened" and "handled" are different facts.
+
+    `injected` is a fact about the CASE, not a measurement: it says how many
+    writers were aimed at the same anchor, which is what the other three are
+    read against. The three that ARE measurements:
+
+    - `detected`: writers whose call returned an error, so somebody found out.
+    - `silent_overwrite`: writers whose call returned SUCCESS whose text is not
+      in the file. Nobody found out, and the writer has no way to.
+    - `final_integration_success`: the file holds one writer's complete intended
+      content, or it holds something neither writer asked for -- a mixture, a
+      half-file, a body composed from a stale read.
+
+    `final_integration_success` is TRUE in both shapes this suite runs, and by
+    construction rather than by luck: both tools write through `os.replace`, so
+    a half-file cannot survive a crash, and every writer installs a complete
+    body. It is reported anyway, and the reason is that "somebody detected the
+    conflict" and "the workspace is still coherent" are different claims. A
+    reader given only `detected` cannot tell which claim the run supports, and a
+    shape that DID produce partial writes -- a writer composing its full body
+    from a file another writer has since changed -- would separate them. That
+    shape is not implemented here, so this field is a guard rather than a
+    finding, and the report says so.
+    """
+
+    injected: int
+    detected: int
+    silent_overwrite: int
+    final_integration_success: bool
+    shape: str = "edit"
+    writers: list[WriterOutcome] = field(default_factory=list)
+    final_content: str = ""
+
+
+def run_conflict(case: ConflictCase) -> ConflictResult:
+    """Aim `values` writers at one line through the REAL tools, then look.
+
+    The writers run one after the other, in declared order. That is the honest
+    realisation of a fan-out here rather than a simplification: neither
+    `FileEditTool.execute` nor `FileWriteTool.execute` awaits between reading
+    the file and writing it, so on one event loop two of them could not
+    interleave even if they were started together. What is measured is a LOST
+    UPDATE from a stale read -- the second writer decides what to write from a
+    view of the file the first writer already changed -- and that is the
+    failure a real fan-out actually produces.
+
+    Concurrency would not change the answer either way: the `Edit` writer's
+    precondition fails on the bytes, not on the timing, and the `Write` writer
+    has no precondition at all.
+    """
+    from longline.tools.file_edit.file_edit_tool import FileEditTool
+    from longline.tools.file_write.file_write_tool import FileWriteTool
+
+    workspace = Path(case.workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    path = workspace / case.target
+    path.write_text(_conflict_body("original"), encoding="utf-8")
+    anchor = case.anchor
+
+    async def _run() -> list[WriterOutcome]:
+        outcomes: list[WriterOutcome] = []
+        for index, value in enumerate(case.values):
+            name = f"writer{index}"
+            if case.shape == "edit":
+                result = await FileEditTool().execute({
+                    "file_path": str(path),
+                    "old_string": anchor,
+                    "new_string": f'VALUE = "{value}"',
+                })
+            else:
+                result = await FileWriteTool().execute({
+                    "file_path": str(path),
+                    "content": _conflict_body(value),
+                })
+            outcomes.append(
+                WriterOutcome(
+                    name=name,
+                    value=value,
+                    reported_success=not result.is_error,
+                    survived=False,
+                    error="" if not result.is_error else result.text,
+                )
+            )
+        return outcomes
+
+    written = asyncio.run(_run())
+    final_content = path.read_text(encoding="utf-8")
+    writers = [
+        replace(outcome, survived=f'VALUE = "{outcome.value}"' in final_content)
+        for outcome in written
+    ]
+    return ConflictResult(
+        injected=len(case.values),
+        detected=sum(1 for writer in writers if not writer.reported_success),
+        silent_overwrite=sum(
+            1 for writer in writers if writer.reported_success and not writer.survived
+        ),
+        final_integration_success=final_content
+        in {_conflict_body(value) for value in case.values},
+        shape=case.shape,
+        writers=writers,
+        final_content=final_content,
+    )
