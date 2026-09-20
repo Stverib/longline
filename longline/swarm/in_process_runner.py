@@ -219,7 +219,7 @@ class InProcessTeammate:
         Called between turns to inject received messages into the
         teammate's conversation context.
         """
-        from longline.swarm.mailbox import TeammateMailbox
+        from longline.swarm.mailbox import InboxCorruptError, TeammateMailbox
 
         try:
             mailbox = TeammateMailbox(self.team_name, claude_dir=self._claude_dir)
@@ -230,6 +230,19 @@ class InProcessTeammate:
                 mailbox.mark_all_read(self.agent_name)
                 # 返回格式化后的消息文本，包含发件人信息便于 agent 理解来源
                 return [f"[From {m.from_name}]: {m.text}" for m in messages]
+        except InboxCorruptError as e:
+            # 收件箱存在但读不出来, 意味着消息丢了。落到下面的宽泛处理器上会返回
+            # `[]`, 而那与「没有邮件」无法区分: teammate 会照常干完活并报成功,
+            # leader 收到一份没提丢失交接的回复。
+            #
+            # 这里不抛异常: 抛出去会连带杀掉 teammate, 那比丢消息丢得更多。
+            # 改成把损失**送进对话** —— 之后 teammate 说的任何话, 都是一个
+            # 知道发生过什么的 agent 说的。
+            logger.error("Teammate %s lost its inbox: %s", self.agent_id, e)
+            return [
+                "[system] your inbox was unreadable and has been quarantined to "
+                f"{e.quarantine_path}; any messages it held are lost"
+            ]
         except Exception as e:
             logger.debug("Inbox check failed: %s", e)
         return []

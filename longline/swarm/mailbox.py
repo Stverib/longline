@@ -13,8 +13,11 @@ Corresponds to TS: utils/teammateMailbox.ts.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +27,30 @@ logger = logging.getLogger(__name__)
 
 # 默认的 claude 配置目录，所有团队数据存储在其下的 teams/ 子目录中
 _DEFAULT_CLAUDE_DIR = Path.home() / ".longline"
+
+
+class InboxCorruptError(RuntimeError):
+    """An inbox file held bytes that are not a message list.
+
+    Raised instead of returning an empty list. The previous behaviour made a
+    lost inbox and an empty inbox the same observable, so a truncation caused by
+    a crash mid-write cost every message in the file while both the reader and
+    the writer reported success -- a failure with no symptom, which is strictly
+    worse than one with a loud one.
+
+    `quarantine_path` names where the unreadable bytes were moved. They are kept
+    rather than deleted because the number of messages lost is not recoverable
+    from the error alone: a human, or a later repair, needs the original bytes
+    to say how many died.
+    """
+
+    def __init__(self, agent_name: str, quarantine_path: Path) -> None:
+        super().__init__(
+            f"inbox for {agent_name!r} was not valid JSON and has been "
+            f"quarantined to {quarantine_path}; its messages are lost"
+        )
+        self.agent_name = agent_name
+        self.quarantine_path = quarantine_path
 
 
 @dataclass
@@ -77,8 +104,25 @@ class TeammateMailbox:
     发送消息 = 读取收件人的 JSON 文件 → 追加消息 → 写回文件。
     这是一种简单的"追加式"队列实现。
 
-    注意：当前实现没有文件锁，在高并发写入同一收件箱时可能丢失消息。
-    对于 agent swarm 场景（低频消息），这种简化是可接受的。
+    === 关于"没有文件锁" ===
+
+    这里没有文件锁, 而且**不要加**。理由是被测过的, 不是想当然的:
+
+    - `send()` 从 `_read_inbox` 到 `_write_inbox` 全程同步 I/O, 中间没有
+      `await`, 而单线程事件循环里同步函数体不可被抢占;
+    - teammate 由 `spawn.py` 用 `asyncio.create_task` 起在**同一个事件循环**
+      上, 全仓库没有 Thread / multiprocessing / run_in_executor。
+
+    两条合起来, 读-改-写在这个运行时里是构造上原子的。并发压测跑出来的是
+    lost=0 / dup=0 的**阴性结果** —— 它确认一个设计假设, 不是抓到一个 bug。
+    给一个够不着的竞态加锁, 是拿复杂度换一个没有失败模式的东西。
+
+    真正会丢消息的是崩溃持久性, 两处都已处理:
+    - `_write_inbox` 用 temp + `os.replace`, 写一半被杀不会留下半份文件;
+    - `_read_inbox` 遇到解析失败**隔离并抛错**, 不再 `return []` 把「收件箱
+      丢了」与「收件箱是空的」变成同一个可观察量。
+
+    若将来 teammate 改跑在多进程或多线程上, 上面第一条前提就没了, 那时再加锁。
 
     Corresponds to TS: utils/teammateMailbox.ts (readMailbox, writeToMailbox, markAllAsRead).
     """
@@ -103,27 +147,82 @@ class TeammateMailbox:
         self._inbox_dir.mkdir(parents=True, exist_ok=True)
 
     def _read_inbox(self, agent_name: str) -> list[TeammateMessage]:
-        """Read all messages from an agent's inbox file."""
+        """Read all messages from an agent's inbox file.
+
+        A MISSING file is an empty inbox -- a normal state, not a fault.
+        Unreadable BYTES are a fault: the file exists and something wrote it, so
+        a parse failure means messages were lost, and the caller has to be told.
+
+        `OSError` still degrades to a warning and an empty list. A transient
+        read error is not evidence of loss the way a parse failure is, and
+        turning it into an exception would let an unrelated filesystem hiccup
+        take down a teammate.
+        """
         path = self._inbox_path(agent_name)
         # 收件箱文件不存在说明该 agent 从未收到过消息，返回空列表
         if not path.exists():
             return []
+
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return [TeammateMessage.from_dict(m) for m in data]
-        except (json.JSONDecodeError, OSError) as e:
-            # JSON 损坏或文件不可读时，记录警告但不抛异常
-            # 因为 mailbox 读取失败不应阻断 agent 的核心执行流程
+            raw = path.read_text(encoding="utf-8")
+        except OSError as e:
             logger.warning("Failed to read inbox for %s: %s", agent_name, e)
             return []
 
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            quarantine = path.with_name(f"{path.name}.corrupt")
+            # 后缀递增而不是直接覆盖: 第二次损坏若发生在第一次被处理之前,
+            # 覆盖会连同第一次的字节一起丢掉, 而那些字节是「丢了几条」的唯一证据
+            counter = 1
+            while quarantine.exists():
+                quarantine = path.with_name(f"{path.name}.corrupt{counter}")
+                counter += 1
+            with contextlib.suppress(OSError):
+                os.replace(path, quarantine)
+            logger.error(
+                "Inbox for %s was corrupt (%s); quarantined to %s",
+                agent_name, e, quarantine,
+            )
+            raise InboxCorruptError(agent_name, quarantine) from e
+
+        return [TeammateMessage.from_dict(m) for m in data]
+
     def _write_inbox(self, agent_name: str, messages: list[TeammateMessage]) -> None:
-        """Write messages to an agent's inbox file."""
+        """Write the inbox atomically: either the old bytes or the new ones.
+
+        `Path.write_text` truncates and then writes, so a crash in between
+        leaves a file that is neither the old inbox nor the new one. That costs
+        the WHOLE inbox rather than the newest message, because `_read_inbox`
+        cannot tell a truncated file from an empty one.
+
+        The temp file is created in the DESTINATION directory, not the system
+        temp dir: `os.replace` is only atomic within one filesystem, and across
+        a mount it degrades to copy-then-delete -- silently reopening the window
+        it was meant to close, and only on machines where the temp dir is a
+        separate volume.
+
+        A failed write removes its own temp file. Leaving it behind would put
+        one stale file in the inbox directory per failure, and nothing ever
+        looks at those names again.
+        """
         self._ensure_inbox_dir()
         path = self._inbox_path(agent_name)
-        # 每次写入都是全量覆盖（非增量追加），因此需要先读取再追加再写回
+        # 每次写入都是全量覆盖 (非增量追加), 因此需要先读取再追加再写回
         data = [m.to_dict() for m in messages]
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            os.replace(tmp_name, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
 
     def send(self, to: str, message: TeammateMessage) -> None:
         """Write a message to a teammate's inbox.

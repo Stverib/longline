@@ -108,3 +108,51 @@ async def test_uses_non_interactive_permissions(tmp_path: Path) -> None:
     result = await teammate.run("test permissions")
     assert teammate.is_completed
     assert len(result) > 0
+
+
+class TestCheckInboxDoesNotSwallowALoss:
+    """A lost inbox has to reach the conversation, not just a log file.
+
+    `check_inbox` used to catch every exception and return `[]`, which made "my
+    inbox was unreadable" indistinguishable from "I have no mail": the teammate
+    would finish its work and report success, and the leader would receive a
+    reply that never mentioned the lost handoff. Both parties report success
+    while the messages are gone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_inbox_becomes_a_message_the_teammate_sees(
+        self, tmp_path: Path
+    ) -> None:
+        from longline.swarm.mailbox import TeammateMailbox
+
+        teammate = InProcessTeammate(
+            agent_id="worker@test",
+            team_name="test",
+            agent_name="worker",
+            call_model_factory=_mock_call_model_factory,
+            parent_registry=ToolRegistry(),
+            claude_dir=tmp_path,
+        )
+        box = TeammateMailbox("test", claude_dir=tmp_path)
+        box._ensure_inbox_dir()
+        box._inbox_path("worker").write_text("[not json", encoding="utf-8")
+
+        messages = await teammate.check_inbox()
+
+        assert messages, "a lost inbox must not read as an absent one"
+        assert any("unreadable" in m for m in messages), messages
+
+    @pytest.mark.asyncio
+    async def test_an_absent_inbox_is_still_silence(self, tmp_path: Path) -> None:
+        """The distinction the fix rests on: nothing to read is not a fault."""
+        teammate = InProcessTeammate(
+            agent_id="worker@test",
+            team_name="test",
+            agent_name="worker",
+            call_model_factory=_mock_call_model_factory,
+            parent_registry=ToolRegistry(),
+            claude_dir=tmp_path,
+        )
+
+        assert await teammate.check_inbox() == []
