@@ -30,6 +30,28 @@ from longline.prompts.builder import build_system_prompt
 # Tools the model under evaluation may use during eval runs (default profile).
 EVAL_TOOL_NAMES = ("Bash", "Read", "Write", "Edit", "Glob", "Grep")
 
+# The sampling temperature every eval engine is pinned to.
+#
+# The spec's premise for this was wrong in an interesting way, and the correction
+# is worth keeping. It claimed `temperature` appeared nowhere in the repository.
+# It appears in exactly one place -- `stream_response` in `longline/api/claude.py`
+# -- as a literal `1.0` assigned to every request. So the value was never unset,
+# and both arms were already getting the same one.
+#
+# The real defects were the two that follow from it being a LITERAL:
+#
+# - it could not be pinned, so an eval run sampled at 1.0 while a repeated run
+#   of the same case had no way to ask for anything else. Three repeats exist to
+#   measure variance under ONE configuration, and this made the sampling
+#   parameter the one part of the configuration the harness did not control.
+# - it was not recorded. A change to that literal would move every number in
+#   every batch, and nothing in the data would say so.
+#
+# 0.0 rather than the production 1.0, deliberately: this is the EVAL factory, and
+# a repeated run should be a repetition of the same question. `None` opts back
+# into production behaviour and sends the literal 1.0 from `stream_response`.
+EVAL_TEMPERATURE = 0.0
+
 # The client identity this harness presents to the gateway.
 #
 # The OpenCode gateway (`opencode.ai/zen/go`) refuses a request that looks like a
@@ -67,6 +89,7 @@ def build_engine(
     session_id: str | None = None,
     prompt_variant: str = "baseline",
     tool_desc_variant: str = "baseline",
+    temperature: float | None = EVAL_TEMPERATURE,
 ) -> QueryEngine:
     """Build a QueryEngine wired for evaluation.
 
@@ -90,6 +113,11 @@ def build_engine(
     - tool_desc_variant: which tool DESCRIPTIONS to serve (see
       `longline/eval/tool_desc_variants.py`). It changes the schema text only,
       never which tools exist, for the same reason.
+    - temperature: the sampling temperature to pin. Defaults to
+      `EVAL_TEMPERATURE`; pass `None` to send no override and let
+      `stream_response` apply production's literal 1.0. The value is recorded on
+      every row by callers that report one, so a batch run under one setting
+      stays readable after this default is changed.
     """
     import anthropic
 
@@ -113,4 +141,5 @@ def build_engine(
         system_prompt=system,
         permission_ctx=permission_ctx,
         max_turns=50,
+        temperature=temperature,
     )

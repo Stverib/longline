@@ -91,6 +91,9 @@ from longline.eval.metrics import Ratio
 from longline.eval.multi_agent import (
     CATEGORY_DEPENDENT,
     CONTROLLED,
+    DEPENDENT_WORKERS,
+    MAX_WORKERS,
+    MIN_WORKERS,
     MULTI,
     SINGLE,
     MultiAgentCase,
@@ -121,6 +124,14 @@ REASON_ACCOUNTING_INCOMPLETE = "accounting_incomplete"
 # because the two mean different things: a crashed variant measured nothing,
 # an unreconciled one measured something it cannot vouch for.
 REASON_VARIANT_ERROR = "variant_error"
+
+# Reason recorded when a variant was cut off by the wall-clock ceiling. Kept
+# apart from `variant_error` for the same kind of reason: a timed-out variant
+# measured nothing because the work was stopped, while a crashed one measured
+# something it cannot vouch for. The two have different fixes -- a ceiling that
+# is too low, versus a bug -- so folding them into one reason would leave the
+# report unable to say which one to go and look at.
+REASON_TIMEOUT = "timeout"
 
 
 def leader_prompt(case: MultiAgentCase) -> str:
@@ -192,6 +203,40 @@ class VariantRun:
     # Filled when `accounts["accounting_complete"]` is False, so the reason
     # survives into raw.jsonl rather than only into a raised exception.
     accounting_error: str = ""
+    # A fact about the run, not a substring of `errors`. The report has to
+    # exclude a timed-out case for a different reason than a crashed one, and
+    # matching on the error TEXT would stop working the first time the wording
+    # changed -- silently, by putting the case back in the crash bucket.
+    timed_out: bool = False
+    # What the run actually used. Read from the module constants at
+    # construction, not at report time: a reader has to be able to tell that a
+    # row was cut off by the ceiling in force THEN, which a later edit to
+    # `VARIANT_TIMEOUT_S` would otherwise rewrite retroactively.
+    model: str = ""
+    temperature: float | None = None
+    max_turns: int = 0
+    variant_timeout_s: float = VARIANT_TIMEOUT_S
+    workers: int = 0
+
+    def exclusion_reason(self) -> str | None:
+        """Why this variant leaves the ratio denominators, or None if it stays.
+
+        Ordered by which claim the run invalidates. An unreconciled ledger means
+        the COST is untrustworthy, which disqualifies the row regardless of how
+        the clock behaved, so it is checked first: reporting a timeout ahead of
+        it would hide a broken ledger behind an honest-looking clock reading.
+
+        A plain crash and a timeout are both `errors`, so the timeout flag is
+        consulted before falling through to `REASON_VARIANT_ERROR` -- that
+        ordering is the whole point of keeping the flag.
+        """
+        if self.accounting_error:
+            return REASON_ACCOUNTING_INCOMPLETE
+        if self.timed_out:
+            return REASON_TIMEOUT
+        if self.errors and not self.passed:
+            return REASON_VARIANT_ERROR
+        return None
 
     @property
     def input_tokens(self) -> int:
@@ -234,6 +279,12 @@ class VariantRun:
             "errors": self.errors,
             "accounting_error": self.accounting_error,
             "offline": self.offline,
+            "timed_out": self.timed_out,
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_turns": self.max_turns,
+            "variant_timeout_s": self.variant_timeout_s,
+            "workers": self.workers,
             "usage": self.ledger.to_dict(),
             "accounts": self.accounts,
         }
@@ -581,10 +632,19 @@ async def _drive(
     prompt: str,
     *,
     max_turns: int,
-) -> tuple[list[Any], list[str]]:
-    """Run one agent to completion, returning its events and any error text."""
+) -> tuple[list[Any], list[str], bool]:
+    """Run one agent to completion, returning its events, errors and timeout flag.
+
+    The timeout is reported as a flag rather than only as an error string. Both
+    facts are kept because they answer different questions: the string is what a
+    human reads in the row, and the flag is what the report excludes on. Reading
+    the exclusion back out of the string would work until somebody reworded it,
+    and the failure would be silent -- the case would quietly rejoin the crash
+    bucket, which is a different diagnosis with a different fix.
+    """
     events: list[Any] = []
     errors: list[str] = []
+    timed_out = False
     try:
         await asyncio.wait_for(
             drain(engine.submit(prompt, max_turns=max_turns), events),
@@ -592,9 +652,10 @@ async def _drive(
         )
     except TimeoutError:
         errors.append(f"variant exceeded the {VARIANT_TIMEOUT_S}s wall-clock ceiling")
+        timed_out = True
     except Exception as exc:  # a crashed variant is a recorded failure, not an abort
         errors.append(f"{type(exc).__name__}: {exc}")
-    return events, errors
+    return events, errors, timed_out
 
 
 def _install_hidden_test(
@@ -674,7 +735,7 @@ async def run_single_variant(
     comparison of two different measurements, and any bias in either one
     would land entirely on the ratio.
     """
-    from longline.eval.engine_factory import build_engine
+    from longline.eval.engine_factory import EVAL_TEMPERATURE, build_engine
 
     ledger = UsageLedger()
     ledger.note_spawned(LEADER)
@@ -705,7 +766,7 @@ async def run_single_variant(
 
         with _in_sandbox(sandbox):
             started = time.perf_counter()
-            _events, errors = await _drive(
+            _events, errors, timed_out = await _drive(
                 engine, leader_prompt(case), max_turns=case.max_turns,
             )
             duration_ms = (time.perf_counter() - started) * 1000.0
@@ -729,6 +790,12 @@ async def run_single_variant(
         errors=errors,
         offline=offline,
         accounting_error=accounting_error,
+        timed_out=timed_out,
+        model=model or "offline-multi-agent",
+        temperature=EVAL_TEMPERATURE,
+        max_turns=case.max_turns,
+        variant_timeout_s=VARIANT_TIMEOUT_S,
+        workers=1,
     )
 
 
@@ -742,6 +809,7 @@ async def run_multi_variant(
     usage: Any,
     claude_dir: Path | None = None,
     fixtures_dir: Path | None = None,
+    workers_override: int | None = None,
 ) -> VariantRun:
     """`workers` teammates in parallel, then the leader's declared merge step.
 
@@ -760,7 +828,7 @@ async def run_multi_variant(
     `spawn_teammate` returned a task id for, awaited one at a time. Agreement
     between them is what `reconcile` records.
     """
-    from longline.eval.engine_factory import build_engine
+    from longline.eval.engine_factory import EVAL_TEMPERATURE, build_engine
     from longline.session.task_registry import TaskRegistry
 
     ledger = UsageLedger()
@@ -819,20 +887,29 @@ async def run_multi_variant(
             # a `dependent` case driven concurrently would race on the one file
             # its steps share, and a concurrent case driven serially would stop
             # measuring parallelism while still reporting a Speedup for it.
-            spawn = (
-                _spawn_workers_serial
-                if case.category == CATEGORY_DEPENDENT
-                else _spawn_workers
-            )
-            await spawn(
-                case, counted=counted, ledger=ledger, registry=registry,
-                claude_dir=claude_dir, spawned_ids=spawned_ids, sandbox=Path(sandbox),
-                failures=worker_outcomes,
-            )
+            # Two branches rather than one call through a variable, because the
+            # serial scheduler takes no concurrency argument: it is serial by
+            # construction, and `workers` would only be a number it ignores.
+            spawn_kwargs: dict[str, Any] = {
+                "counted": counted,
+                "ledger": ledger,
+                "registry": registry,
+                "claude_dir": claude_dir,
+                "spawned_ids": spawned_ids,
+                "sandbox": Path(sandbox),
+                "failures": worker_outcomes,
+            }
+            if case.category == CATEGORY_DEPENDENT:
+                await _spawn_workers_serial(case, **spawn_kwargs)
+            else:
+                await _spawn_workers(
+                    case, workers=effective_workers(case, workers_override),
+                    **spawn_kwargs,
+                )
             for agent_name, exc in sorted(worker_outcomes.items()):
                 errors.append(f"{agent_name}: {type(exc).__name__}: {exc}")
 
-            _events, leader_errors = await _drive(
+            _events, leader_errors, leader_timed_out = await _drive(
                 engine, merge_instruction(case), max_turns=case.max_turns,
             )
             errors.extend(leader_errors)
@@ -857,6 +934,18 @@ async def run_multi_variant(
         errors=errors,
         offline=offline,
         accounting_error=accounting_error,
+        # Only the leader's drive is bounded by the ceiling; a worker is awaited
+        # without one, so `_drive` is the sole possible source of a timeout in
+        # this variant. Named for where it came from rather than aliased, so a
+        # later change that gives workers their own ceiling has to decide what
+        # to do with it here instead of inheriting a value that stopped meaning
+        # what it said.
+        timed_out=leader_timed_out,
+        model=model or "offline-multi-agent",
+        temperature=EVAL_TEMPERATURE,
+        max_turns=case.max_turns,
+        variant_timeout_s=VARIANT_TIMEOUT_S,
+        workers=effective_workers(case, workers_override),
     )
 
 
@@ -877,6 +966,47 @@ def _accounting_error(accounts: AccountedAgents, *, case_id: str, variant: str) 
     return ""
 
 
+def effective_workers(case: MultiAgentCase, override: int | None) -> int:
+    """The concurrency a run uses, resolving an override without touching the case.
+
+    Group 3 varies `workers` across runs of the SAME case, so the override has
+    to travel as a parameter rather than as an assignment to `case.workers`.
+    Assigning would make the two points of the curve different cases -- the
+    fixture, the prompt and the judges would all be free to drift with it --
+    and it would also let the two variants of one run disagree about
+    concurrency, which is a confound inside a single row rather than between
+    two.
+
+    The override is validated here rather than at the CLI edge because the
+    runner is reachable from tests and scripts too, and a `workers=99` that only
+    the CLI rejects is a `workers=99` that runs from a notebook. The symptom
+    would not be an error either: it would be a case that quietly stopped
+    measuring parallelism, because every subtask would land in the first wave.
+
+    A `dependent` case is the other half of the same guard. Its concurrency is
+    fixed at `DEPENDENT_WORKERS` by the contract, and the serial scheduler
+    ignores the number entirely -- so an override accepted here would be a
+    concurrency the ROW reports and the RUN never used, which is worse than
+    refusing it. One function decides what "the concurrency this run uses"
+    means, and both the scheduler and the row read it from here.
+    """
+    if case.category == CATEGORY_DEPENDENT:
+        if override not in (None, DEPENDENT_WORKERS):
+            raise ValueError(
+                f"a dependent case is serial by contract, so its concurrency is "
+                f"fixed at {DEPENDENT_WORKERS}; got override {override}"
+            )
+        return DEPENDENT_WORKERS
+    if override is None:
+        return case.workers
+    if not MIN_WORKERS <= override <= MAX_WORKERS:
+        raise ValueError(
+            f"workers override must be in [{MIN_WORKERS}, {MAX_WORKERS}] "
+            f"per contract §5.6, got {override}"
+        )
+    return override
+
+
 async def _spawn_workers(
     case: MultiAgentCase,
     *,
@@ -887,8 +1017,9 @@ async def _spawn_workers(
     spawned_ids: list[str],
     sandbox: Path,
     failures: dict[str, BaseException],
+    workers: int | None = None,
 ) -> None:
-    """Spawn one teammate per SUBTASK, up to `case.workers` at a time.
+    """Spawn one teammate per SUBTASK, up to `workers` at a time.
 
     Every subtask must be executed, in either variant -- that is what "the same
     work both ways" means and it is the precondition of the whole comparison.
@@ -899,6 +1030,13 @@ async def _spawn_workers(
     dropped subtask's file would then be missing from the artifact set both
     variants are judged against -- a failure that looks like the model's.
 
+    `workers` defaults to the case's own value and is passed in only when
+    Group 3 is varying concurrency across runs of one case. It arrives as a
+    PARAMETER rather than as an assignment to `case.workers`, because the case
+    is a shared object: rewriting it would make the two points of the scaling
+    curve different cases, and would let the two variants of one run disagree
+    about concurrency -- a confound inside a single row.
+
     `failures` is keyed by AGENT NAME, which is what makes a raised exception
     attributable: awaiting a wave with `return_exceptions=True` returns the
     exceptions in wave order, and pairing them positionally against a global
@@ -908,9 +1046,10 @@ async def _spawn_workers(
     """
     from longline.swarm.spawn import spawn_teammate
 
+    concurrency = effective_workers(case, workers)
     waves = [
-        case.subtasks[start : start + case.workers]
-        for start in range(0, len(case.subtasks), case.workers)
+        case.subtasks[start : start + concurrency]
+        for start in range(0, len(case.subtasks), concurrency)
     ]
     worker_index = 0
     for wave in waves:
@@ -1213,6 +1352,7 @@ async def run_multi_agent_case(
     model: str | None = None,
     claude_dir: Path | None = None,
     usage: Any = None,
+    workers_override: int | None = None,
 ) -> MultiAgentRun:
     """Run one case's single and multi variants, each in its own sandbox.
 
@@ -1234,33 +1374,56 @@ async def run_multi_agent_case(
     multi = await _run_variant_in_sandbox(
         case, variant=MULTI, api_key=api_key, fixtures_dir=fixtures_dir,
         fixture=case.fixture_multi, model=model, claude_dir=claude_dir, usage=usage,
+        workers_override=workers_override,
     )
 
     run = MultiAgentRun(
         case_id=case.id,
         group=case.group,
-        workers=case.workers if case.group == CONTROLLED else 0,
+        workers=(
+            effective_workers(case, workers_override)
+            if case.group == CONTROLLED
+            else 0
+        ),
         num_subtasks=case.num_subtasks,
         single=single,
         multi=multi,
         expected_paths=case.expected_paths(),
     )
-    if single.errors:
+    # Both arms are asked, in that order, and the first reason wins. A broken
+    # BASELINE is reported ahead of a broken fan-out because the ratio is
+    # meaningless either way, but the baseline is the side a reader would not
+    # think to suspect -- and a fan-out compared against it would produce a
+    # speedup that is really a wiring bug in `_drive`'s own accounting.
+    for variant, arm in ((single, "single-agent"), (multi, "multi-agent")):
+        reason = variant.exclusion_reason()
+        if reason is None:
+            continue
         run.excluded_from_denominator = True
-        run.exclusion_reason = REASON_VARIANT_ERROR
-        run.note = "the single-agent arm did not complete; Speedup is not reported"
-    elif multi.errors:
-        run.excluded_from_denominator = True
-        run.exclusion_reason = REASON_VARIANT_ERROR
-        run.note = "the multi-agent arm did not complete; Speedup is not reported"
-    elif multi.accounting_error:
-        run.excluded_from_denominator = True
-        run.exclusion_reason = REASON_ACCOUNTING_INCOMPLETE
-        run.note = (
-            "the fan-out's token accounting did not reconcile, so its cost cannot "
-            "be compared with the single-agent arm (contract §5.6 red line)"
-        )
+        run.exclusion_reason = reason
+        run.note = _exclusion_note(reason, arm)
+        break
     return run
+
+
+def _exclusion_note(reason: str, arm: str) -> str:
+    """The sentence a reader sees next to an excluded row.
+
+    Keyed on the REASON, not written inline at the exclusion site: the reason is
+    the thing that is checked against the contract, and two copies of "what
+    `timeout` means" would drift the moment one of them was reworded.
+    """
+    if reason == REASON_ACCOUNTING_INCOMPLETE:
+        return (
+            f"the {arm} arm's token accounting did not reconcile, so its cost "
+            "cannot be compared (contract §5.6 red line)"
+        )
+    if reason == REASON_TIMEOUT:
+        return (
+            f"the {arm} arm was cut off by the {VARIANT_TIMEOUT_S}s ceiling, so "
+            "it measured nothing; Speedup is not reported"
+        )
+    return f"the {arm} arm did not complete; Speedup is not reported"
 
 
 async def _run_variant_in_sandbox(
@@ -1273,6 +1436,7 @@ async def _run_variant_in_sandbox(
     model: str | None,
     claude_dir: Path | None,
     usage: Any,
+    workers_override: int | None = None,
 ) -> VariantRun:
     """One variant, in its own freshly copied sandbox, judged before cleanup."""
     offline = model is None
@@ -1286,7 +1450,7 @@ async def _run_variant_in_sandbox(
         return await run_multi_variant(
             case, sandbox=sandbox, model=model, api_key=api_key,
             offline=offline, usage=usage, claude_dir=claude_dir,
-            fixtures_dir=fixtures_dir,
+            fixtures_dir=fixtures_dir, workers_override=workers_override,
         )
     except Exception as exc:  # a crashed variant is recorded, never propagated
         return VariantRun(

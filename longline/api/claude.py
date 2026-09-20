@@ -78,6 +78,7 @@ async def stream_response(
     model: str = "claude-sonnet-4-20250514",
     max_tokens: int = 16384,
     thinking: dict[str, Any] | None = None,
+    temperature: float | None = None,
 ) -> AsyncIterator[QueryEvent]:
     """Stream a response from the Claude API and yield QueryEvents.
 
@@ -104,7 +105,17 @@ async def stream_response(
     # 启用 thinking 时 API 不允许设置 temperature，否则会报错
     if thinking:
         params["thinking"] = thinking
+    elif temperature is not None:
+        # The caller's explicit value. The eval harness pins one here (see
+        # `engine_factory.EVAL_TEMPERATURE`): it compares two arms against each
+        # other and repeats every case, so the sampling temperature is part of
+        # the configuration under test, and an unpinned one turns a
+        # parameter change into what reads as model variance.
+        params["temperature"] = temperature
     else:
+        # Production's default, unchanged. Until now this literal was the ONLY
+        # way temperature was ever set -- not overridable from outside, so the
+        # eval layer could neither pin it nor record which value a batch used.
         params["temperature"] = 1.0  # Claude 默认 temperature=1.0，显式设置以保持一致性
 
     # === 流式响应的累积状态 ===

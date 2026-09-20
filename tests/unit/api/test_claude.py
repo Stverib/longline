@@ -417,3 +417,63 @@ class TestGatewayWrappedUpstreamFailures:
 
         errors = [e for e in events if isinstance(e, ErrorEvent)]
         assert errors[0].is_recoverable is False
+
+
+class TestSamplingTemperature:
+    """The one place the sampling temperature was decided, and it was a literal.
+
+    `stream_response` assigned `1.0` to every request it built. That is a
+    defensible production default and a bad eval parameter: the harness compares
+    two arms against each other and repeats each case, so the sampling
+    temperature is part of the configuration under test -- and a value the
+    caller cannot set is a value the harness can neither pin nor record. A later
+    edit to that literal would move every number in every batch with nothing in
+    the data to say so.
+    """
+
+    async def test_no_argument_keeps_production_exactly_as_it_was(self) -> None:
+        """The default must not move. Every existing caller passes no value."""
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            return_value=MockStream(make_text_stream_events())
+        )
+
+        _ = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+        )]
+
+        assert mock_client.messages.create.call_args.kwargs["temperature"] == 1.0
+
+    async def test_an_explicit_value_is_what_goes_on_the_wire(self) -> None:
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            return_value=MockStream(make_text_stream_events())
+        )
+
+        _ = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+            temperature=0.0,
+        )]
+
+        assert mock_client.messages.create.call_args.kwargs["temperature"] == 0.0
+
+    async def test_thinking_still_suppresses_temperature(self) -> None:
+        """The mutual exclusion with `thinking` outranks the new parameter.
+
+        The API rejects a request carrying both, so the ordering of these two
+        branches is load-bearing rather than a matter of taste -- an override
+        that won here would turn every extended-thinking eval run into a 400.
+        """
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            return_value=MockStream(make_text_stream_events())
+        )
+
+        _ = [e async for e in stream_response(
+            mock_client, messages=[{"role": "user", "content": "hi"}], system="t",
+            thinking={"type": "enabled", "budget_tokens": 1024}, temperature=0.0,
+        )]
+
+        params = mock_client.messages.create.call_args.kwargs
+        assert "temperature" not in params
+        assert params["thinking"] == {"type": "enabled", "budget_tokens": 1024}

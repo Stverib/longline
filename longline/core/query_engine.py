@@ -94,6 +94,7 @@ class QueryEngine:
         context_window: int = 200_000,
         tool_journal: Any | None = None,
         on_step: Callable[[str], None] | None = None,
+        temperature: float | None = None,
     ) -> None:
         # 所有参数使用 keyword-only（*）强制命名传参，防止位置参数错乱
         self._client = client
@@ -114,6 +115,13 @@ class QueryEngine:
         # resumed (tests, sub-agents, the eval harness's own in-process engines).
         self._tool_journal = tool_journal
         self._on_step = on_step
+        # Sampling temperature for every request this engine makes. None means
+        # "do not override", which leaves `stream_response` applying its own
+        # literal 1.0 -- production behaviour, unchanged. The eval harness pins
+        # a value (see `engine_factory.EVAL_TEMPERATURE`) because it compares
+        # two arms and repeats each case: while the value was a literal in the
+        # API layer, the harness could neither pin it nor record it.
+        self._temperature = temperature
         # Fault-injection handles (see `longline/eval/faults.py`). Declared here
         # rather than poked on from outside so the harness has a real attribute
         # to set, and so a reader can see at a glance that the engine carries
@@ -209,10 +217,17 @@ class QueryEngine:
         """
         effective_model = model or self._model
         client = self._client
+        temperature = self._temperature
 
         async def call_model(**kwargs: Any) -> AsyncIterator[QueryEvent]:
             # pop 而非 get：避免 max_tokens 同时出现在 kwargs 和显式参数中导致 SDK 报错
             effective_max: Any = kwargs.pop("max_tokens", max_tokens)
+            # Only overrides when the engine was given a value. A caller that
+            # passed None asked for `stream_response`'s own default, and
+            # forwarding a literal None would be a different request -- None is
+            # a value the field cannot carry, not the absence of the field.
+            if temperature is not None:
+                kwargs.setdefault("temperature", temperature)
             async for event in stream_response(
                 client, model=effective_model, max_tokens=effective_max, **kwargs
             ):

@@ -35,9 +35,12 @@ import asyncio
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 from longline.eval.child_usage import (
     LEADER,
@@ -70,11 +73,15 @@ from longline.eval.multi_agent import (
 )
 from longline.eval.multi_agent_runner import (
     REASON_ACCOUNTING_INCOMPLETE,
+    REASON_TIMEOUT,
+    VariantRun,
     _apply_live_counting,
+    _drive,
     _in_sandbox,
     _judge,
     _spawn_workers_serial,
     aggregate_multi_agent,
+    effective_workers,
     leader_prompt,
     merge_instruction,
     run_multi_agent_case,
@@ -1406,6 +1413,178 @@ class TestHiddenTestInstallation:
 
         with pytest.raises(ValueError, match="fixtures_dir"):
             _judge(case, sandbox)
+
+
+class _StallingEngine:
+    """An engine whose `submit` never yields, so `_drive` hits its ceiling.
+
+    Pairs with a patched-down `VARIANT_TIMEOUT_S`: the production 300s value
+    would make this test either slow or -- if it really waited -- pointless.
+    `wait_for` cancels the sleep, so the test costs one scheduling round trip.
+    """
+
+    async def submit(self, prompt: str, *, max_turns: int) -> AsyncIterator[Any]:
+        _ = prompt, max_turns
+        await asyncio.sleep(3600)
+        yield  # pragma: no cover - unreachable; this is what makes it a generator
+
+
+class TestRunMetadata:
+    """Three facts a row has to carry, each an assumption the ratios rest on.
+
+    `temperature` was not unset -- the spec's premise for this task said it was,
+    and that was wrong. It is a literal `1.0` inside `stream_response`, applied
+    to every request. The defects that follow from its being a LITERAL are what
+    this fixes: the harness could not pin it (so three repeats could not be
+    three samples of one configuration), and no row recorded it (so a change to
+    that literal would move every number with nothing in the data to say so).
+
+    `timed_out` exists because `_drive` used to put the timeout into the same
+    `errors` list a crash goes into, so the report could not say which happened.
+    The two have different fixes: a ceiling that is too low, versus a bug.
+
+    `workers` is the concurrency actually used, which is not always
+    `case.workers` once an override is in play.
+    """
+
+    def test_timeout_is_its_own_reason_not_a_variant_error(self) -> None:
+        run = VariantRun(
+            variant=SINGLE, passed=False, duration_ms=1.0, ledger=UsageLedger(),
+            accounts={}, subtask_verdicts={}, errors=[], timed_out=True,
+        )
+
+        assert run.exclusion_reason() == REASON_TIMEOUT
+
+    def test_accounting_error_outranks_timeout(self) -> None:
+        """Both can be true, so the order is a decision, not an accident.
+
+        An unreconciled ledger means the COST is untrustworthy, which
+        disqualifies the row no matter how the clock behaved. Reporting the
+        timeout first would hide a broken ledger behind an honest-looking
+        clock reading.
+        """
+        run = VariantRun(
+            variant=MULTI, passed=False, duration_ms=1.0, ledger=UsageLedger(),
+            accounts={}, subtask_verdicts={},
+            errors=["variant exceeded the ceiling"], timed_out=True,
+            accounting_error=REASON_ACCOUNTING_INCOMPLETE,
+        )
+
+        assert run.exclusion_reason() == REASON_ACCOUNTING_INCOMPLETE
+
+    def test_a_clean_run_has_no_exclusion_reason(self) -> None:
+        run = VariantRun(
+            variant=MULTI, passed=True, duration_ms=1.0, ledger=UsageLedger(),
+            accounts={}, subtask_verdicts={},
+        )
+
+        assert run.exclusion_reason() is None
+
+    def test_the_row_carries_what_the_run_actually_used(self) -> None:
+        """Reported from the run, not re-read from a module constant later.
+
+        `variant_timeout_s` in particular: a reader has to be able to tell that
+        a row was cut off by a 300s ceiling and not by today's value, which a
+        test or a future edit may already have changed.
+        """
+        run = VariantRun(
+            variant=MULTI, passed=True, duration_ms=1.0, ledger=UsageLedger(),
+            accounts={}, subtask_verdicts={}, model="claude-sonnet-5",
+            temperature=0.0, max_turns=7, variant_timeout_s=42.0, workers=4,
+        )
+
+        row = run.to_row()
+
+        assert row["model"] == "claude-sonnet-5"
+        assert row["temperature"] == 0.0
+        assert row["max_turns"] == 7
+        assert row["variant_timeout_s"] == 42.0
+        assert row["workers"] == 4
+
+    async def test_drive_marks_a_timeout_rather_than_only_appending_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A timeout must be a fact about the run, not a substring of `errors`.
+
+        Matching on the message text would break silently the first time the
+        wording changes, and the failure mode is invisible: the case would go
+        back to being reported as a crash, which is a different fix.
+        """
+        monkeypatch.setattr(
+            "longline.eval.multi_agent_runner.VARIANT_TIMEOUT_S", 0.01,
+        )
+
+        _events, errors, timed_out = await _drive(
+            _StallingEngine(), "prompt", max_turns=1,
+        )
+
+        assert timed_out is True
+        assert errors, "the reason must still be human-readable in the row"
+
+    async def test_a_crash_is_not_a_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The distinction has to survive in both directions."""
+        monkeypatch.setattr(
+            "longline.eval.multi_agent_runner.VARIANT_TIMEOUT_S", 30.0,
+        )
+
+        _events, errors, timed_out = await _drive(
+            _CrashingEngine(), "prompt", max_turns=1,
+        )
+
+        assert timed_out is False
+        assert any("boom" in error for error in errors)
+
+
+class _CrashingEngine:
+    """The other half of the pair: raises immediately, never times out."""
+
+    async def submit(self, prompt: str, *, max_turns: int) -> AsyncIterator[Any]:
+        _ = prompt, max_turns
+        raise RuntimeError("boom")
+        yield  # pragma: no cover - unreachable; this is what makes it a generator
+
+
+class TestWorkersOverride:
+    def test_override_changes_concurrency_without_touching_the_case(self) -> None:
+        """Group 3 varies `workers` on ONE case, so the case object is untouched.
+
+        Rewriting `case.workers` in place would make the two points of the curve
+        different cases -- the fixture, the prompt and the judges would be free
+        to drift with it -- and, worse, both variants of the SAME run would see
+        different concurrency, which is a confound inside a single row.
+        """
+        case = make_case(workers=2)
+
+        assert effective_workers(case, None) == 2
+        assert effective_workers(case, 4) == 4
+        assert case.workers == 2, "the shared case object must not be mutated"
+
+    def test_an_out_of_range_override_is_refused_here_not_only_at_the_cli(self) -> None:
+        """The runner is reachable from tests and notebooks too.
+
+        An override only the CLI validates is an override that runs unvalidated
+        from everywhere else, and the symptom of `workers=99` is not an error --
+        it is a case that quietly stops measuring parallelism.
+        """
+        case = make_case(workers=2)
+
+        with pytest.raises(ValueError, match=r"workers override"):
+            effective_workers(case, 99)
+
+    def test_a_dependent_case_refuses_a_parallelism_override(self) -> None:
+        """The serial scheduler ignores `workers`, so accepting one would lie.
+
+        A dependent case's concurrency is fixed at `DEPENDENT_WORKERS` by the
+        contract. An override taken at face value here would be a concurrency
+        the ROW reports and the RUN never used -- a wrong number in the data,
+        which is worse than a refusal.
+        """
+        case = make_case(workers=DEPENDENT_WORKERS)
+        case.category = CATEGORY_DEPENDENT
+
+        assert effective_workers(case, None) == DEPENDENT_WORKERS
+        with pytest.raises(ValueError, match="serial by contract"):
+            effective_workers(case, 4)
 
 
 __all__: list[str] = []
