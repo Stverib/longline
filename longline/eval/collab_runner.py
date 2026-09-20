@@ -46,7 +46,12 @@ from longline.swarm.mailbox import InboxCorruptError, TeammateMailbox, TeammateM
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from longline.eval.collab_cases import CollabCase, DurabilityCase, WorktreeCase
+    from longline.eval.collab_cases import (
+        CollabCase,
+        DurabilityCase,
+        OrphanCase,
+        WorktreeCase,
+    )
 
 
 def _message(text: str, *, from_name: str) -> TeammateMessage:
@@ -467,3 +472,194 @@ def _worktree_paths(porcelain: str) -> list[str]:
         for line in porcelain.splitlines()
         if line.startswith(prefix)
     ]
+
+
+# --- orphan tasks ------------------------------------------------------------
+
+
+def _teammate_factory(agent_name: str, *, fails: bool) -> Any:
+    """A `call_model_factory` for one teammate: report, or fail on the way in.
+
+    The failing variant raises when the FACTORY is called rather than when the
+    model is. That placement is deliberate: `InProcessTeammate` calls the
+    factory OUTSIDE its own `try`, so the exception reaches the task itself and
+    the spawn path's done-callback marks the record FAILED. Raising from inside
+    the model would instead be swallowed -- `_execute_with_query_loop` catches
+    it, turns it into an "(Error: ...)" reply, and the teammate still reports
+    COMPLETED, which is exactly the ambiguity this case has to avoid.
+    """
+
+    def factory(model: str | None = None, max_tokens: int = 16384) -> Any:
+        _ = model, max_tokens
+        if fails:
+            raise RuntimeError(f"scripted failure for {agent_name}")
+
+        async def call_model(**_: Any) -> AsyncIterator[Any]:
+            from longline.core.events import TextDelta, TurnComplete
+            from longline.models.messages import Usage
+
+            yield TextDelta(text=f"{agent_name} finished its share")
+            yield TurnComplete(stop_reason="end_turn", usage=Usage())
+
+        return call_model
+
+    return factory
+
+
+@dataclass
+class OrphanResult:
+    """How many teammates finished, and how many the leader actually took up.
+
+    `spawned`, `completed` and `delivered` are kept separately because each
+    collapse hides a different failure. `spawned - completed` is work that never
+    finished; `completed - delivered` is a reply the runtime never posted;
+    `delivered - consumed` is the orphan -- a finished teammate whose result is
+    sitting unread, which is the one nobody notices, because every component
+    reported success.
+    """
+
+    spawned: int
+    completed: int
+    delivered: int
+    consumed: int
+    drain: bool = True
+    states: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def orphan_rate(self) -> float | None:
+        """(completed - consumed) / completed, or None when none completed.
+
+        The denominator is COMPLETED rather than SPAWNED. A teammate that never
+        produced a reply cannot have an orphaned one, and counting it would make
+        a crash look like an orphan -- two different faults with two different
+        fixes, added together into one number that names neither.
+        """
+        if self.completed == 0:
+            return None
+        return (self.completed - self.consumed) / self.completed
+
+
+def run_orphan_task_rate(case: OrphanCase) -> OrphanResult:
+    """Spawn `teammates`, optionally drain the leader's inbox, and count the gap.
+
+    The teammates are real: `spawn_teammate` builds the identity, registers the
+    record, starts `InProcessTeammate` as an `asyncio` task on this loop, and
+    the runner's own done-callback moves the record to a terminal state.
+
+    The tool registry handed to `spawn_teammate` is EMPTY, which is a choice
+    rather than an oversight. This case measures the coordination channel -- did
+    a finished teammate's result reach the leader -- and giving the teammates
+    tools would add side effects that the accounting then has to see past. The
+    reply is text because the channel carries text.
+
+    The inbox is read with the mailbox's own `receive` + `mark_all_read`, so
+    "consumed" means the same thing here as it does in production: the leader
+    looked, and the message stopped being unread.
+    """
+    from longline.session.task_registry import TaskRegistry, TaskState
+    from longline.swarm.identity import TEAM_LEAD_NAME, format_agent_id
+    from longline.swarm.spawn import spawn_teammate
+    from longline.swarm.team_file import TeamFile, save_team_file
+
+    names = [f"worker{index}" for index in range(case.teammates)]
+
+    async def _drive() -> OrphanResult:
+        from longline.tools.base import ToolRegistry
+
+        registry = TaskRegistry()
+        parent_tools = ToolRegistry()
+        mailbox = TeammateMailbox(case.team_name, claude_dir=case.claude_dir)
+
+        # `spawn_teammate`'s `add_member` is best-effort and only warns when the
+        # team is missing, so a fan-out against a nonexistent team would run to
+        # completion while silently skipping one of its three registration
+        # steps. Creating the team costs one call and leaves nothing about the
+        # spawn path unexercised -- and no warnings for a reader to explain away.
+        save_team_file(
+            TeamFile(
+                name=case.team_name,
+                description="scratch team for the collaboration-reliability suite",
+                created_at=0.0,
+                lead_agent_id=format_agent_id(TEAM_LEAD_NAME, case.team_name),
+            ),
+            case.claude_dir,
+        )
+
+        tasks: list[asyncio.Task[str]] = []
+        for name in names:
+            task_id = await spawn_teammate(
+                case.team_name,
+                name,
+                f"Report your share of the work, {name}.",
+                _teammate_factory(name, fails=name in case.failing),
+                parent_tools,
+                claude_dir=case.claude_dir,
+                task_registry=registry,
+            )
+            # Captured now, not later: the done-callback POPS the task out of
+            # `_running_tasks`, so looking the task up after it finishes finds
+            # nothing and would silently await an empty list.
+            tasks.append(_running_task(task_id))
+
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # The done-callbacks that write the terminal state are scheduled with
+        # `call_soon`, so they run after `gather` returns, not during it. This
+        # yields until they have all landed rather than sleeping a fixed time:
+        # bounded, and if the bound is ever hit the records are visibly still
+        # non-terminal instead of a number quietly reading as zero.
+        wanted = set(names)
+        records = [
+            record
+            for record in registry.list_all()
+            if record.metadata.get("agent_name") in wanted
+        ]
+        for _ in range(100):
+            if all(record.is_terminal for record in records):
+                break
+            await asyncio.sleep(0)
+
+        states = {
+            str(record.metadata.get("agent_name")): record.state.value
+            for record in records
+        }
+        # The reason comes from the TASK, not from the record: the registry
+        # stores a state and nothing else, and "worker1: failed" is a restatement
+        # of `states` rather than something a reader can act on.
+        errors = [
+            f"{name}: {type(outcome).__name__}: {outcome}"
+            for name, outcome in zip(names, outcomes, strict=True)
+            if isinstance(outcome, BaseException)
+        ]
+
+        delivered = [
+            message
+            for message in mailbox.receive_all(TEAM_LEAD_NAME)
+            if message.from_name in wanted
+        ]
+        consumed = 0
+        if case.drain:
+            consumed = len(mailbox.receive(TEAM_LEAD_NAME))
+            mailbox.mark_all_read(TEAM_LEAD_NAME)
+
+        return OrphanResult(
+            spawned=case.teammates,
+            completed=sum(1 for s in states.values() if s == TaskState.COMPLETED.value),
+            delivered=len(delivered),
+            consumed=consumed,
+            drain=case.drain,
+            states=states,
+            errors=errors,
+        )
+
+    return asyncio.run(_drive())
+
+
+def _running_task(task_id: str) -> asyncio.Task[str]:
+    from longline.swarm.spawn import get_running_tasks
+
+    task = get_running_tasks().get(task_id)
+    if task is None:
+        raise RuntimeError(f"spawn returned {task_id} but registered no task for it")
+    return task

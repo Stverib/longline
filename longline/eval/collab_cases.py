@@ -58,3 +58,25 @@ class WorktreeCase:
     repo: Path
     agents: int
     marker: str
+
+
+@dataclass(frozen=True)
+class OrphanCase:
+    """One coordination scenario: N teammates fan out, the leader may read back.
+
+    `drain` is the control, for the same reason `DurabilityCase.truncate` is: a
+    suite that only ever drained its inbox would report an orphan rate of 0.0
+    forever and could not distinguish "the delivery chain closes" from "the
+    metric cannot see a gap". Withholding the drain has to move the number, or
+    the number is not measuring the gap.
+
+    `failing` names the teammates whose model factory raises. It exists so the
+    write side can be shown to be READ rather than assumed: if `completed` were
+    really just `teammates`, a failure injected here would not change it.
+    """
+
+    teammates: int
+    claude_dir: Path
+    drain: bool = True
+    failing: tuple[str, ...] = ()
+    team_name: str = "collab-orphan"

@@ -26,10 +26,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from longline.eval.collab_cases import CollabCase, DurabilityCase, WorktreeCase
+from longline.eval.collab_cases import (
+    CollabCase,
+    DurabilityCase,
+    OrphanCase,
+    WorktreeCase,
+)
 from longline.eval.collab_runner import (
     run_inbox_durability,
     run_mailbox_integrity,
+    run_orphan_task_rate,
     run_worktree_isolation,
 )
 
@@ -220,3 +226,72 @@ class TestWorktreeIsolation:
 
         assert result.writes == 0
         assert result.leak_rate is None
+
+
+class TestOrphanTaskRate:
+    """A task that finished but whose result the leader never took up.
+
+    Two witnesses from different mechanisms, which is the only reason the
+    number means anything:
+
+    - the WRITE side is `TaskRegistry`: `spawn_teammate` registers each task and
+      its done-callback sets `COMPLETED` (`spawn.py`). That is a fact about the
+      runtime, produced by the spawn path rather than by this suite.
+    - the READ side is the leader: whether the teammate's reply was delivered to
+      its inbox and drained from it.
+
+    A teammate can be COMPLETED and still be an orphan, and that gap is the
+    metric. Measuring one side alone gives either "everything finished" or "I
+    saw what I saw"; neither can see the gap.
+
+    `drain` is the control, and it is not decoration. A suite that only ever
+    drained would report 0.0 forever and could not tell "the delivery chain
+    closes" from "this metric is incapable of seeing a gap".
+    """
+
+    def test_a_drained_reply_is_not_an_orphan(self, tmp_path: Path) -> None:
+        result = run_orphan_task_rate(OrphanCase(teammates=3, claude_dir=tmp_path))
+
+        assert result.spawned == 3
+        assert result.completed == 3
+        assert result.delivered == 3
+        assert result.consumed == 3
+        assert result.orphan_rate == 0.0
+
+    def test_an_undrained_reply_is_an_orphan(self, tmp_path: Path) -> None:
+        """The control: the same run, minus the leader's read.
+
+        Everything that produces the reply still happens -- the teammates run,
+        finish, and post to the inbox. Only the drain is withheld, so anything
+        this measures is the gap and nothing else.
+        """
+        result = run_orphan_task_rate(
+            OrphanCase(teammates=3, claude_dir=tmp_path, drain=False)
+        )
+
+        assert result.completed == 3
+        assert result.delivered == 3, "delivery is not what draining controls"
+        assert result.consumed == 0
+        assert result.orphan_rate == 1.0
+
+    def test_a_failed_teammate_is_not_counted_as_completed(self, tmp_path: Path) -> None:
+        """`completed` is read from the registry, not assumed to be `spawned`.
+
+        Without this the write side could be a constant equal to the fan-out
+        size and every orphan rate would be computed against a number that
+        never moved. The failing teammate fails in its model factory, which
+        `InProcessTeammate` calls OUTSIDE its own try -- so the failure reaches
+        the task itself and the done-callback marks it FAILED.
+        """
+        result = run_orphan_task_rate(
+            OrphanCase(teammates=3, claude_dir=tmp_path, failing=("worker1",))
+        )
+
+        assert result.spawned == 3
+        assert result.completed == 2
+        assert result.states["worker1"] == "failed"
+        assert result.errors, "a failed teammate has to leave a reason behind"
+        assert result.orphan_rate == 0.0, (
+            "the denominator is COMPLETED, not SPAWNED: the failed teammate "
+            "never produced a reply to orphan"
+        )
